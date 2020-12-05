@@ -12,6 +12,7 @@ import android.os.Bundle;
 import android.os.SystemClock;
 import android.util.Pair;
 import android.view.MotionEvent;
+import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
 import android.webkit.JavascriptInterface;
@@ -22,8 +23,9 @@ import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 import androidx.annotation.NonNull;
 import androidx.fragment.app.DialogFragment;
-import androidx.fragment.app.Fragment;
-import chan.content.ChanLocator;
+import androidx.lifecycle.ViewModel;
+import androidx.lifecycle.ViewModelProvider;
+import chan.content.Chan;
 import chan.http.HttpException;
 import chan.http.HttpHolder;
 import chan.http.HttpRequest;
@@ -32,16 +34,17 @@ import chan.util.StringUtils;
 import com.mishiranu.dashchan.C;
 import com.mishiranu.dashchan.R;
 import com.mishiranu.dashchan.content.AdvancedPreferences;
+import com.mishiranu.dashchan.content.MainApplication;
 import com.mishiranu.dashchan.content.model.ErrorItem;
 import com.mishiranu.dashchan.text.HtmlParser;
 import com.mishiranu.dashchan.ui.ForegroundManager;
+import com.mishiranu.dashchan.util.ConcurrentUtils;
 import com.mishiranu.dashchan.util.GraphicsUtils;
 import com.mishiranu.dashchan.util.IOUtils;
 import com.mishiranu.dashchan.util.Log;
 import com.mishiranu.dashchan.util.ResourceUtils;
 import com.mishiranu.dashchan.widget.ScaledWebView;
 import java.util.Arrays;
-import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -63,107 +66,201 @@ public class RecaptchaReader {
 			"</div>.*?)?value=\"(.{20,}?)\"");
 	private static final Pattern RECAPTCHA_RESULT_PATTERN = Pattern.compile("<textarea.*?>(.*?)</textarea>");
 
-	public String getResponse2(HttpHolder holder, String apiKey, boolean invisible,
-			String referer, boolean useJavaScript) throws CancelException, HttpException {
-		if (useJavaScript && C.API_KITKAT) {
-			if (referer == null) {
-				referer = "https://www.google.com/";
+	public static class ChallengeExtra {
+		private interface ForegroundSolver {
+			String solve(HttpHolder holder, ChallengeExtra challengeExtra)
+					throws CancelException, HttpException, InterruptedException;
+		}
+
+		private final ForegroundSolver solver;
+		public final String response;
+		private WebViewHolder holder;
+
+		public ChallengeExtra(ForegroundSolver solver, String response, WebViewHolder holder) {
+			this.solver = solver;
+			this.response = response;
+			this.holder = holder;
+		}
+
+		public String getResponse(HttpHolder holder) throws CancelException, HttpException, InterruptedException {
+			if (response != null) {
+				return response;
+			} else {
+				return solver.solve(holder, this);
 			}
+		}
+
+		public void cleanup() {
+			if (holder != null) {
+				ConcurrentUtils.HANDLER.post(() -> {
+					if (holder != null) {
+						holder.destroy();
+						holder = null;
+					}
+				});
+			}
+		}
+	}
+
+	private static Pair<String, String> parseResponse2(String responseText) {
+		Matcher matcher = RECAPTCHA_FALLBACK_PATTERN.matcher(responseText);
+		if (matcher.find()) {
+			String imageSelectorDescription = matcher.group(1);
+			String challenge = matcher.group(2);
+			return new Pair<>(imageSelectorDescription, challenge);
+		}
+		return null;
+	}
+
+	public ChallengeExtra getChallenge2(HttpHolder initialHolder, String apiKey, boolean invisible,
+			String referer, boolean useJavaScript, boolean solveInBackground, boolean solveAutomatically)
+			throws CancelException, HttpException {
+		String refererFinal = referer != null ? referer : "https://www.google.com/";
+		if (solveAutomatically) {
+			String autoResponse = CaptchaSolving.getInstance().solveCaptcha(initialHolder,
+					invisible ? CaptchaSolving.CaptchaType.RECAPTCHA_2_INVISIBLE :
+							CaptchaSolving.CaptchaType.RECAPTCHA_2, apiKey, refererFinal);
+			if (autoResponse != null) {
+				return new ChallengeExtra(null, autoResponse, null);
+			}
+		}
+		if (useJavaScript && C.API_KITKAT) {
+			ChallengeExtra.ForegroundSolver solver = (newHolder, challengeExtra) -> {
+				synchronized (accessLock) {
+					String response = ForegroundManager.getInstance()
+							.requireUserRecaptchaV2(refererFinal, apiKey, invisible, false, challengeExtra);
+					if (response == null) {
+						throw new CancelException();
+					}
+					return response;
+				}
+			};
+			synchronized (accessLock) {
+				if (solveInBackground) {
+					return new BackgroundSolver(solver, refererFinal, apiKey, invisible, false).await();
+				} else {
+					return new ChallengeExtra(solver, null, null);
+				}
+			}
+		} else {
+			Chan chan = Chan.getFallback();
+			Uri uri = chan.locator.buildQueryWithHost("www.google.com", "recaptcha/api/fallback", "k", apiKey);
+			String acceptLanguage = "en-US,en;q=0.5";
+			String initialResponseText = new HttpRequest(uri, initialHolder)
+					.addCookie(AdvancedPreferences.getGoogleCookie())
+					.addHeader("Accept-Language", acceptLanguage)
+					.addHeader("Referer", refererFinal)
+					.perform().readString();
+			if (initialResponseText == null) {
+				throw new HttpException(ErrorItem.Type.INVALID_RESPONSE, false, false);
+			}
+			Pair<String, String> initialResponse = parseResponse2(initialResponseText);
+			if (initialResponse == null) {
+				if (initialResponseText
+						.contains("Please enable JavaScript to get a reCAPTCHA challenge")) {
+					if (C.API_KITKAT) {
+						return getChallenge2(initialHolder, apiKey, invisible, refererFinal,
+								true, solveInBackground, false);
+					} else {
+						throw new HttpException(ErrorItem.Type.UNSUPPORTED_RECAPTCHA, false, false);
+					}
+				} else {
+					throw new HttpException(ErrorItem.Type.INVALID_RESPONSE, false, false);
+				}
+			}
+			boolean[] consumed = {false};
+			ChallengeExtra.ForegroundSolver solver = (holder, challengeExtra) -> {
+				Bitmap captchaImage = null;
+				Pair<String, String> response;
+				if (consumed[0]) {
+					String responseText = new HttpRequest(uri, holder)
+							.addCookie(AdvancedPreferences.getGoogleCookie())
+							.addHeader("Accept-Language", acceptLanguage)
+							.addHeader("Referer", refererFinal)
+							.perform().readString();
+					response = parseResponse2(responseText);
+				} else {
+					consumed[0] = true;
+					response = initialResponse;
+				}
+				while (true) {
+					if (response != null) {
+						if (captchaImage != null) {
+							captchaImage.recycle();
+						}
+						captchaImage = getImage2(holder, apiKey, response.second, null, false).first;
+						boolean[] result = ForegroundManager.getInstance().requireUserImageMultipleChoice(3, null,
+								splitImages(captchaImage, 3, 3), HtmlParser.clear(response.first), null);
+						if (result != null) {
+							boolean hasSelected = false;
+							UrlEncodedEntity entity = new UrlEncodedEntity("c", response.second);
+							for (int i = 0; i < result.length; i++) {
+								if (result[i]) {
+									entity.add("response", Integer.toString(i));
+									hasSelected = true;
+								}
+							}
+							if (!hasSelected) {
+								continue;
+							}
+							String responseText = new HttpRequest(uri, holder).setPostMethod(entity)
+									.addCookie(AdvancedPreferences.getGoogleCookie())
+									.setRedirectHandler(HttpRequest.RedirectHandler.STRICT)
+									.addHeader("Accept-Language", acceptLanguage)
+									.addHeader("Referer", referer)
+									.perform().readString();
+							Matcher matcher = RECAPTCHA_RESULT_PATTERN.matcher(responseText);
+							if (matcher.find()) {
+								return matcher.group(1);
+							}
+							response = parseResponse2(responseText);
+							continue;
+						}
+						throw new CancelException();
+					} else {
+						throw new HttpException(ErrorItem.Type.INVALID_RESPONSE, false, false);
+					}
+				}
+			};
+			return new ChallengeExtra(solver, null, null);
+		}
+	}
+
+	public ChallengeExtra getChallengeHcaptcha(HttpHolder initialHolder, String apiKey, String referer,
+			boolean solveInBackground, boolean solveAutomatically) throws CancelException, HttpException {
+		String refererFinal = referer != null ? referer : "https://www.hcaptcha.com/";
+		if (solveAutomatically) {
+			String autoResponse = CaptchaSolving.getInstance().solveCaptcha(initialHolder,
+					CaptchaSolving.CaptchaType.HCAPTCHA, apiKey, refererFinal);
+			if (autoResponse != null) {
+				return new ChallengeExtra(null, autoResponse, null);
+			}
+		}
+		ChallengeExtra.ForegroundSolver solver = (holder, challengeExtra) -> {
 			synchronized (accessLock) {
 				String response = ForegroundManager.getInstance()
-						.requireUserRecaptchaV2(referer, apiKey, invisible, false);
+						.requireUserRecaptchaV2(refererFinal, apiKey, false, true, challengeExtra);
 				if (response == null) {
 					throw new CancelException();
 				}
 				return response;
 			}
-		} else {
-			ChanLocator locator = ChanLocator.getDefault();
-			Uri uri = locator.buildQueryWithHost("www.google.com", "recaptcha/api/fallback", "k", apiKey);
-			if (referer == null) {
-				referer = uri.toString();
-			}
-			String acceptLanguage = "en-US,en;q=0.5";
-			Bitmap captchaImage = null;
-			String responseText = new HttpRequest(uri, holder)
-					.addCookie(AdvancedPreferences.getGoogleCookie())
-					.addHeader("Accept-Language", acceptLanguage)
-					.addHeader("Referer", referer)
-					.read().getString();
-			while (true) {
-				String imageSelectorDescription = null;
-				String challenge = null;
-				Matcher matcher = RECAPTCHA_FALLBACK_PATTERN.matcher(responseText);
-				if (matcher.find()) {
-					imageSelectorDescription = matcher.group(1);
-					challenge = matcher.group(2);
-				}
-				if (imageSelectorDescription != null && challenge != null) {
-					if (captchaImage != null) {
-						captchaImage.recycle();
-					}
-					captchaImage = getImage2(holder, apiKey, challenge, null, false).first;
-					boolean[] result = ForegroundManager.getInstance().requireUserImageMultipleChoice(3, null,
-							splitImages(captchaImage, 3, 3), HtmlParser.clear(imageSelectorDescription), null);
-					if (result != null) {
-						boolean hasSelected = false;
-						UrlEncodedEntity entity = new UrlEncodedEntity("c", challenge);
-						for (int i = 0; i < result.length; i++) {
-							if (result[i]) {
-								entity.add("response", Integer.toString(i));
-								hasSelected = true;
-							}
-						}
-						if (!hasSelected) {
-							continue;
-						}
-						responseText = new HttpRequest(uri, holder).setPostMethod(entity)
-								.addCookie(AdvancedPreferences.getGoogleCookie())
-								.setRedirectHandler(HttpRequest.RedirectHandler.STRICT)
-								.addHeader("Accept-Language", acceptLanguage)
-								.addHeader("Referer", referer)
-								.read().getString();
-						matcher = RECAPTCHA_RESULT_PATTERN.matcher(responseText);
-						if (matcher.find()) {
-							return matcher.group(1);
-						}
-						continue;
-					}
-					throw new CancelException();
-				} else {
-					if (responseText.contains("Please enable JavaScript to get a reCAPTCHA challenge")) {
-						if (C.API_KITKAT) {
-							return getResponse2(holder, apiKey, invisible, referer, true);
-						} else {
-							throw new HttpException(ErrorItem.Type.UNSUPPORTED_RECAPTCHA, false, false);
-						}
-					} else {
-						throw new HttpException(ErrorItem.Type.INVALID_RESPONSE, false, false);
-					}
-				}
-			}
-		}
-	}
-
-	public String getResponseHcaptcha(String apiKey, String referer) throws CancelException, HttpException {
-		if (referer == null) {
-			referer = "https://www.hcaptcha.com/";
-		}
+		};
 		synchronized (accessLock) {
-			String response = ForegroundManager.getInstance().requireUserRecaptchaV2(referer, apiKey, false, true);
-			if (response == null) {
-				throw new CancelException();
+			if (solveInBackground) {
+				return new BackgroundSolver(solver, refererFinal, apiKey, false, true).await();
+			} else {
+				return new ChallengeExtra(solver, null, null);
 			}
-			return response;
 		}
 	}
 
 	private Pair<Bitmap, Boolean> getImage2(HttpHolder holder, String apiKey, String challenge, String id,
 			boolean transformBlackAndWhite) throws HttpException {
-		ChanLocator locator = ChanLocator.getDefault();
-		Uri uri = locator.buildQueryWithHost("www.google.com", "recaptcha/api2/payload", "c", challenge, "k", apiKey,
-				"id", StringUtils.emptyIfNull(id));
-		Bitmap image = new HttpRequest(uri, holder).read().getBitmap();
+		Chan chan = Chan.getFallback();
+		Uri uri = chan.locator.buildQueryWithHost("www.google.com", "recaptcha/api2/payload",
+				"c", challenge, "k", apiKey, "id", StringUtils.emptyIfNull(id));
+		Bitmap image = new HttpRequest(uri, holder).perform().readBitmap();
 		if (transformBlackAndWhite) {
 			transformBlackAndWhite = GraphicsUtils.isBlackAndWhiteCaptchaImage(image);
 		}
@@ -188,14 +285,32 @@ public class RecaptchaReader {
 		public CancelException() {}
 	}
 
-	private interface DialogCallback {
-		void onLoad();
-		void onCancel();
-		void onResponse(String response);
-		void onError(HttpException exception);
-	}
+	private static class WebViewHolder {
+		public static class Arguments {
+			public final String referer;
+			public final String apiKey;
+			public final boolean invisible;
+			public final boolean hcaptcha;
 
-	public static class WebViewHolder extends Fragment {
+			public Arguments(String referer, String apiKey, boolean invisible, boolean hcaptcha) {
+				this.referer = referer;
+				this.apiKey = apiKey;
+				this.invisible = invisible;
+				this.hcaptcha = hcaptcha;
+			}
+		}
+
+		public interface ArgumentsProvider {
+			Arguments create();
+		}
+
+		public interface Callback {
+			void onLoad();
+			void onCancel();
+			void onResponse(String response);
+			void onError(HttpException exception);
+		}
+
 		private ScaledWebView webView;
 
 		private float scale = 1f;
@@ -203,22 +318,13 @@ public class RecaptchaReader {
 		public int lastWidthUnscaled = 0;
 		public int lastHeightUnscaled = 0;
 
-		private DialogCallback dialogCallback;
+		private WebViewHolder.Callback callback;
 		private boolean loaded = false;
 		private boolean cancel = false;
 		private String response;
 		private HttpException exception;
 
-		@Override
-		public void onCreate(Bundle savedInstanceState) {
-			super.onCreate(savedInstanceState);
-			setRetainInstance(true);
-		}
-
-		@Override
-		public void onDestroy() {
-			super.onDestroy();
-
+		private void destroy() {
 			if (webView != null) {
 				webView.destroy();
 				webView = null;
@@ -226,10 +332,32 @@ public class RecaptchaReader {
 		}
 
 		@SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
-		public WebView obtainWebView(Context context, float minScale, float scale) {
+		private WebView obtainWebView(Context context,
+				ViewGroup newParent, int index, ArgumentsProvider argumentsProvider) {
+			context = context.getApplicationContext();
+			int widthUnscaled = 300;
+			int maxHeightUnscaled = 580;
+			int minHeightUnscaled = 250;
+			Configuration configuration = context.getResources().getConfiguration();
+			float density = ResourceUtils.obtainDensity(context);
+			int dialogPaddingDp = 16;
+			int screenWidthDp = configuration.screenWidthDp - 2 * dialogPaddingDp;
+			int screenHeightDp = configuration.screenHeightDp - 2 * dialogPaddingDp;
+			float minScaleMultiplier = Float.MAX_VALUE;
+			for (float size : Arrays.asList(screenWidthDp, screenHeightDp)) {
+				for (float max : Arrays.asList(widthUnscaled, maxHeightUnscaled)) {
+					minScaleMultiplier = Math.min(minScaleMultiplier, size / max);
+				}
+			}
+			float scaleMultiplier = Math.min((float) screenWidthDp / widthUnscaled,
+					(float) screenHeightDp / maxHeightUnscaled);
+			float minScale = density * minScaleMultiplier;
+			float scale = density * scaleMultiplier;
+
+			boolean load = false;
 			if (webView == null) {
-				webView = new ScaledWebView(context.getApplicationContext(),
-						minScale, EXTRA_SCALE_FOR_SYSTEM_PADDING);
+				load = true;
+				webView = new ScaledWebView(context, minScale, EXTRA_SCALE_FOR_SYSTEM_PADDING);
 				webView.getSettings().setJavaScriptEnabled(true);
 				webView.getSettings().setBuiltInZoomControls(false);
 				webView.setHorizontalScrollBarEnabled(false);
@@ -250,16 +378,43 @@ public class RecaptchaReader {
 			if (webView.getParent() != null) {
 				((ViewGroup) webView.getParent()).removeView(webView);
 			}
+
+			int defaultWidth = (int) ((lastWidthUnscaled > 0
+					? lastWidthUnscaled : widthUnscaled) * getTotalScale());
+			int defaultHeight = (int) ((lastHeightUnscaled > 0
+					? lastHeightUnscaled : minHeightUnscaled) * getTotalScale());
+			webView.setLayoutParams(new FrameLayout.LayoutParams(defaultWidth, defaultHeight));
+			if (newParent == null) {
+				layout(webView);
+			} else {
+				newParent.addView(webView, index);
+			}
+
+			if (load) {
+				Arguments arguments = argumentsProvider.create();
+				String data = IOUtils.readRawResourceString(webView.getResources(), R.raw.web_recaptcha_v2)
+						.replace("__REPLACE_API_KEY__", arguments.apiKey)
+						.replace("__REPLACE_INVISIBLE__", arguments.invisible ? "true" : "false")
+						.replace("__REPLACE_HCAPTCHA__", arguments.hcaptcha ? "true" : "false");
+				webView.loadDataWithBaseURL(arguments.referer, data, "text/html", "UTF-8", null);
+			}
 			return webView;
 		}
 
-		public float getTotalScale() {
+		private static void layout(WebView webView) {
+			ViewGroup.LayoutParams layoutParams = webView.getLayoutParams();
+			webView.measure(View.MeasureSpec.makeMeasureSpec(layoutParams.width, View.MeasureSpec.EXACTLY),
+					View.MeasureSpec.makeMeasureSpec(layoutParams.height, View.MeasureSpec.EXACTLY));
+			webView.layout(0, 0, webView.getMeasuredWidth(), webView.getMeasuredHeight());
+		}
+
+		private float getTotalScale() {
 			return scale * extraScale;
 		}
 
-		public void setDialogCallback(DialogCallback dialogCallback) {
-			this.dialogCallback = dialogCallback;
-			if (dialogCallback != null) {
+		private void setCallback(WebViewHolder.Callback callback) {
+			this.callback = callback;
+			if (callback != null) {
 				boolean cancel = this.cancel;
 				String response = this.response;
 				HttpException exception = this.exception;
@@ -267,35 +422,28 @@ public class RecaptchaReader {
 				this.response = null;
 				this.exception = null;
 				if (cancel) {
-					dialogCallback.onCancel();
+					callback.onCancel();
 				} else if (response != null) {
-					dialogCallback.onResponse(response);
+					callback.onResponse(response);
 				} else if (exception != null) {
-					dialogCallback.onError(exception);
+					callback.onError(exception);
 				}
 			}
 		}
 
-		private void postEvent(Runnable runnable) {
-			WebView webView = this.webView;
-			if (webView != null) {
-				webView.post(runnable);
-			}
-		}
-
-		@SuppressWarnings({"unused", "RedundantSuppression"})
+		@SuppressWarnings("unused")
 		private final Object javascriptInterface = new Object() {
 			@JavascriptInterface
 			public void onResponse(String response) {
-				postEvent(() -> {
+				ConcurrentUtils.HANDLER.post(() -> {
 					if (webView != null) {
 						HttpException exception = !StringUtils.isEmpty(response) ? null :
 								new HttpException(ErrorItem.Type.INVALID_RESPONSE, false, false);
-						if (dialogCallback != null) {
+						if (callback != null) {
 							if (exception != null) {
-								dialogCallback.onError(exception);
+								callback.onError(exception);
 							} else {
-								dialogCallback.onResponse(response);
+								callback.onResponse(response);
 							}
 						} else {
 							WebViewHolder.this.response = StringUtils.nullIfEmpty(response);
@@ -309,11 +457,11 @@ public class RecaptchaReader {
 
 			@JavascriptInterface
 			public void onError() {
-				postEvent(() -> {
+				ConcurrentUtils.HANDLER.post(() -> {
 					if (webView != null) {
 						HttpException exception = new HttpException(ErrorItem.Type.UNKNOWN, false, false);
-						if (dialogCallback != null) {
-							dialogCallback.onError(exception);
+						if (callback != null) {
+							callback.onError(exception);
 						} else {
 							WebViewHolder.this.exception = exception;
 						}
@@ -323,14 +471,14 @@ public class RecaptchaReader {
 
 			@JavascriptInterface
 			public void onSizeChanged(int width, int height) {
-				postEvent(() -> {
+				ConcurrentUtils.HANDLER.post(() -> {
 					if (webView != null) {
 						boolean hasContent = width > 0 && height > 0;
 						if (hasContent) {
 							boolean wasLoaded = loaded;
 							loaded = true;
-							if (!wasLoaded && dialogCallback != null) {
-								dialogCallback.onLoad();
+							if (!wasLoaded && callback != null) {
+								callback.onLoad();
 							}
 							lastWidthUnscaled = width;
 							lastHeightUnscaled = height;
@@ -342,11 +490,15 @@ public class RecaptchaReader {
 							if (layoutParams.width != newWidth || layoutParams.height != newHeight) {
 								layoutParams.width = newWidth;
 								layoutParams.height = newHeight;
-								webView.requestLayout();
+								if (webView.getParent() != null) {
+									webView.requestLayout();
+								} else {
+									layout(webView);
+								}
 							}
 						} else if ((lastWidthUnscaled > 0 && lastHeightUnscaled > 0) && !hasContent) {
-							if (dialogCallback != null) {
-								dialogCallback.onCancel();
+							if (callback != null) {
+								callback.onCancel();
 							} else {
 								cancel = true;
 							}
@@ -389,11 +541,11 @@ public class RecaptchaReader {
 				if (failingUrl != null) {
 					Uri uri = Uri.parse(failingUrl);
 					if ("google.com".equals(uri.getHost()) || "www.google.com".equals(uri.getHost())) {
-						postEvent(() -> {
+						ConcurrentUtils.HANDLER.post(() -> {
 							if (webView != null) {
 								HttpException exception = new HttpException(ErrorItem.Type.DOWNLOAD, false, false);
-								if (dialogCallback != null) {
-									dialogCallback.onError(exception);
+								if (callback != null) {
+									callback.onError(exception);
 								} else {
 									WebViewHolder.this.exception = exception;
 								}
@@ -405,52 +557,130 @@ public class RecaptchaReader {
 		};
 	}
 
+	private static class BackgroundSolver implements WebViewHolder.Callback {
+		private final ChallengeExtra.ForegroundSolver solver;
+		private final WebViewHolder holder;
+
+		private ChallengeExtra challengeExtra;
+		private boolean error;
+		private boolean cancel;
+
+		private BackgroundSolver(ChallengeExtra.ForegroundSolver solver,
+				String referer, String apiKey, boolean invisible, boolean hcaptcha) {
+			this.solver = solver;
+			holder = ConcurrentUtils.mainGet(() -> {
+				WebViewHolder holder = new WebViewHolder();
+				holder.obtainWebView(MainApplication.getInstance(), null, 0, () -> new WebViewHolder
+						.Arguments(referer, apiKey, invisible, hcaptcha));
+				holder.callback = BackgroundSolver.this;
+				return holder;
+			});
+		}
+
+		@Override
+		public void onLoad() {
+			synchronized (this) {
+				challengeExtra = new ChallengeExtra(solver, null, holder);
+				notifyAll();
+			}
+		}
+
+		@Override
+		public void onCancel() {
+			synchronized (this) {
+				cancel = true;
+				notifyAll();
+			}
+		}
+
+		@Override
+		public void onResponse(String response) {
+			synchronized (this) {
+				holder.destroy();
+				challengeExtra = new ChallengeExtra(solver, response, null);
+				notifyAll();
+			}
+		}
+
+		@Override
+		public void onError(HttpException exception) {
+			synchronized (this) {
+				error = true;
+				notifyAll();
+			}
+		}
+
+		public ChallengeExtra await() throws CancelException, HttpException {
+			synchronized (this) {
+				while (challengeExtra == null && !error && !cancel) {
+					try {
+						wait();
+					} catch (InterruptedException e) {
+						ConcurrentUtils.HANDLER.post(holder::destroy);
+						Thread.currentThread().interrupt();
+						throw new CancelException();
+					}
+				}
+				if (error) {
+					throw new HttpException(ErrorItem.Type.UNKNOWN, false, false);
+				}
+				if (cancel) {
+					throw new CancelException();
+				}
+				return challengeExtra;
+			}
+		}
+	}
+
+	public static class WebViewViewModel extends ViewModel {
+		private WebViewHolder holder;
+		private boolean clicked = false;
+		private Runnable destroyCallback;
+		private boolean published = false;
+
+		public void initHolder(WebViewHolder holder) {
+			this.holder = holder != null ? holder : new WebViewHolder();
+		}
+
+		@Override
+		protected void onCleared() {
+			holder.destroy();
+			if (destroyCallback != null) {
+				destroyCallback.run();
+			}
+		}
+	}
+
 	public static abstract class V2Dialog extends DialogFragment {
 		private static final String EXTRA_REFERER = "referer";
 		private static final String EXTRA_API_KEY = "apiKey";
 		private static final String EXTRA_INVISIBLE = "invisible";
 		private static final String EXTRA_HCAPTCHA = "hcaptcha";
 
-		private static final String EXTRA_WEB_VIEW_ID = "webViewId";
-
 		public V2Dialog() {}
 
-		public V2Dialog(String referer, String apiKey, boolean invisible, boolean hcaptcha) {
+		public V2Dialog(String referer, String apiKey, boolean invisible, boolean hcaptcha,
+				ChallengeExtra challengeExtra) {
 			Bundle args = new Bundle();
 			args.putString(EXTRA_REFERER, referer);
 			args.putString(EXTRA_API_KEY, apiKey);
 			args.putBoolean(EXTRA_INVISIBLE, invisible);
 			args.putBoolean(EXTRA_HCAPTCHA, hcaptcha);
 			setArguments(args);
+			this.challengeExtra = challengeExtra;
 		}
 
-		private String webViewId;
-		private WebViewHolder webViewHolder;
+		private WebViewViewModel webView;
+		private ChallengeExtra challengeExtra;
 
 		private boolean started = false;
 		private boolean shown = false;
 
-		private final DialogCallback dialogCallback = new DialogCallback() {
+		private final WebViewHolder.Callback callback = new WebViewHolder.Callback() {
 			@Override
 			public void onLoad() {
 				showDialog();
-				if (!requireArguments().getBoolean(EXTRA_INVISIBLE)) {
-					getDialog().getWindow().getDecorView().postDelayed(() -> {
-						if (webViewHolder != null) {
-							int x = (int) (webViewHolder.getTotalScale() * (Math.random() * 100 + 10));
-							int y = (int) (webViewHolder.getTotalScale() * (Math.random() * 30 + 20));
-							MotionEvent motionEvent;
-							motionEvent = MotionEvent.obtain(0, SystemClock.uptimeMillis(),
-									MotionEvent.ACTION_DOWN, x, y, 0);
-							webViewHolder.webView.onTouchEvent(motionEvent);
-							motionEvent.recycle();
-							motionEvent = MotionEvent.obtain(0, SystemClock.uptimeMillis(),
-									MotionEvent.ACTION_UP, x, y, 0);
-							webViewHolder.webView.onTouchEvent(motionEvent);
-							motionEvent.recycle();
-						}
-					}, 500);
-				}
+				performClick();
 			}
 
 			@Override
@@ -475,69 +705,30 @@ public class RecaptchaReader {
 		@NonNull
 		@Override
 		public Dialog onCreateDialog(Bundle savedInstanceState) {
-			if (savedInstanceState == null) {
-				webViewId = UUID.randomUUID().toString();
-				webViewHolder = new WebViewHolder();
-				getParentFragmentManager().beginTransaction()
-						.add(webViewHolder, webViewId).commit();
-			} else {
-				webViewId = savedInstanceState.getString(EXTRA_WEB_VIEW_ID);
-				webViewHolder = (WebViewHolder) getParentFragmentManager().findFragmentByTag(webViewId);
+			webView = new ViewModelProvider(this).get(WebViewViewModel.class);
+			if (webView.holder == null) {
+				webView.initHolder(challengeExtra.holder);
+				if (challengeExtra != null) {
+					challengeExtra.holder = null;
+					challengeExtra = null;
+				}
 			}
 
 			Dialog dialog = new Dialog(requireActivity());
 			dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
-			float density = ResourceUtils.obtainDensity(dialog.getContext());
 			FrameLayout layout = new FrameLayout(dialog.getContext());
 			dialog.setContentView(layout, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
 					ViewGroup.LayoutParams.WRAP_CONTENT));
-			if (webViewHolder.loaded) {
+			if (webView.holder.loaded) {
 				showDialog();
+				performClick();
 			}
 
-			int widthUnscaled = 300;
-			int maxHeightUnscaled = 580;
-			int minHeightUnscaled = 250;
-			Configuration configuration = getResources().getConfiguration();
-			int dialogPaddingDp = 16;
-			int screenWidthDp = configuration.screenWidthDp - 2 * dialogPaddingDp;
-			int screenHeightDp = configuration.screenHeightDp - 2 * dialogPaddingDp;
-			float minScaleMultiplier = Float.MAX_VALUE;
-			for (float size : Arrays.asList(screenWidthDp, screenHeightDp)) {
-				for (float max : Arrays.asList(widthUnscaled, maxHeightUnscaled)) {
-					minScaleMultiplier = Math.min(minScaleMultiplier, size / max);
-				}
-			}
-			float scaleMultiplier = Math.min((float) screenWidthDp / widthUnscaled,
-					(float) screenHeightDp / maxHeightUnscaled);
-			float minScale = density * minScaleMultiplier;
-			float scale = density * scaleMultiplier;
-			boolean load = webViewHolder.webView == null;
-			WebView webView = webViewHolder.obtainWebView(requireContext(), minScale, scale);
-			int defaultWidth = (int) ((webViewHolder.lastWidthUnscaled > 0
-					? webViewHolder.lastWidthUnscaled : widthUnscaled) * webViewHolder.getTotalScale());
-			int defaultHeight = (int) ((webViewHolder.lastHeightUnscaled > 0
-					? webViewHolder.lastHeightUnscaled : minHeightUnscaled) * webViewHolder.getTotalScale());
-			layout.addView(webView, 0, new FrameLayout.LayoutParams(defaultWidth, defaultHeight));
-
-			if (load) {
-				String data = IOUtils.readRawResourceString(getResources(), R.raw.web_recaptcha_v2)
-						.replace("__REPLACE_HCAPTCHA__", requireArguments().getBoolean(EXTRA_HCAPTCHA)
-								? "true" : "false")
-						.replace("__REPLACE_API_KEY__", requireArguments().getString(EXTRA_API_KEY))
-						.replace("__REPLACE_INVISIBLE__", requireArguments().getBoolean(EXTRA_INVISIBLE)
-								? "true" : "false");
-				webView.loadDataWithBaseURL(requireArguments().getString(EXTRA_REFERER),
-						data, "text/html", "UTF-8", null);
-			}
-
+			webView.destroyCallback = this::publishDestroyInternal;
+			webView.holder.obtainWebView(requireContext().getApplicationContext(), layout, 0, () -> new WebViewHolder
+					.Arguments(requireArguments().getString(EXTRA_REFERER), requireArguments().getString(EXTRA_API_KEY),
+					requireArguments().getBoolean(EXTRA_INVISIBLE), requireArguments().getBoolean(EXTRA_HCAPTCHA)));
 			return dialog;
-		}
-
-		@Override
-		public void onSaveInstanceState(@NonNull Bundle outState) {
-			super.onSaveInstanceState(outState);
-			outState.putString(EXTRA_WEB_VIEW_ID, webViewId);
 		}
 
 		@Override
@@ -555,8 +746,12 @@ public class RecaptchaReader {
 		public void onResume() {
 			super.onResume();
 
-			if (webViewHolder != null) {
-				webViewHolder.setDialogCallback(dialogCallback);
+			if (webView != null) {
+				webView.holder.setCallback(callback);
+				if (!shown && webView.holder.loaded) {
+					showDialog();
+					performClick();
+				}
 			}
 		}
 
@@ -564,8 +759,8 @@ public class RecaptchaReader {
 		public void onPause() {
 			super.onPause();
 
-			if (webViewHolder != null) {
-				webViewHolder.setDialogCallback(null);
+			if (webView != null) {
+				webView.holder.setCallback(null);
 			}
 		}
 
@@ -584,6 +779,29 @@ public class RecaptchaReader {
 			}
 		}
 
+		private void performClick() {
+			if (!webView.clicked) {
+				webView.clicked = true;
+				if (!requireArguments().getBoolean(EXTRA_INVISIBLE)) {
+					ConcurrentUtils.HANDLER.postDelayed(() -> {
+						if (webView != null) {
+							int x = (int) (webView.holder.getTotalScale() * (Math.random() * 100 + 10));
+							int y = (int) (webView.holder.getTotalScale() * (Math.random() * 30 + 20));
+							MotionEvent motionEvent;
+							motionEvent = MotionEvent.obtain(0, SystemClock.uptimeMillis(),
+									MotionEvent.ACTION_DOWN, x, y, 0);
+							webView.holder.webView.onTouchEvent(motionEvent);
+							motionEvent.recycle();
+							motionEvent = MotionEvent.obtain(0, SystemClock.uptimeMillis(),
+									MotionEvent.ACTION_UP, x, y, 0);
+							webView.holder.webView.onTouchEvent(motionEvent);
+							motionEvent.recycle();
+						}
+					}, 500);
+				}
+			}
+		}
+
 		@Override
 		public void onCancel(@NonNull DialogInterface dialog) {
 			super.onCancel(dialog);
@@ -591,14 +809,21 @@ public class RecaptchaReader {
 		}
 
 		private void publishResponseInternal(String response, HttpException exception) {
-			if (webViewHolder != null) {
-				getParentFragmentManager().beginTransaction().remove(webViewHolder).commit();
-				webViewHolder.setDialogCallback(null);
-				webViewHolder = null;
-				publishResponse(response, exception);
+			if (webView != null && !webView.published) {
+				webView.published = true;
+				webView.holder.setCallback(null);
+				webView = null;
+				publishResult(response, exception);
 			}
 		}
 
-		public abstract void publishResponse(String response, HttpException exception);
+		private void publishDestroyInternal() {
+			if (webView != null && !webView.published) {
+				webView.published = true;
+				publishResult(null, null);
+			}
+		}
+
+		public abstract void publishResult(String response, HttpException exception);
 	}
 }

@@ -1,27 +1,31 @@
 package com.mishiranu.dashchan.content.async;
 
 import chan.content.ApiException;
+import chan.content.Chan;
 import chan.content.ChanConfiguration;
-import chan.content.ChanMarkup;
 import chan.content.ChanPerformer;
 import chan.content.ExtensionException;
 import chan.content.InvalidResponseException;
 import chan.content.RedirectException;
-import chan.content.model.Post;
-import chan.content.model.Posts;
 import chan.http.HttpException;
 import chan.http.HttpHolder;
 import chan.http.MultipartEntity;
 import chan.text.CommentEditor;
 import com.mishiranu.dashchan.content.model.ErrorItem;
+import com.mishiranu.dashchan.content.model.Post;
+import com.mishiranu.dashchan.content.model.PostNumber;
 import com.mishiranu.dashchan.text.HtmlParser;
 import com.mishiranu.dashchan.text.SimilarTextEstimator;
 import java.util.ArrayList;
+import java.util.List;
 
-public class SendPostTask<Key> extends HttpHolderTask<Void, Long, Boolean> {
+public class SendPostTask<Key> extends ExecutorTask<long[], Boolean> {
+	private final HttpHolder chanHolder;
+	private final HttpHolder fallbackHolder = new HttpHolder(Chan.getFallback());
+
 	private final Key key;
-	private final String chanName;
 	private final Callback<Key> callback;
+	private final Chan chan;
 	private final ChanPerformer.SendPostData data;
 
 	private final boolean progressMode;
@@ -36,7 +40,7 @@ public class SendPostTask<Key> extends HttpHolderTask<Void, Long, Boolean> {
 		@Override
 		public void onProgressChange(long progress, long progressMax) {
 			if (!progressMode) {
-				publishProgress(0L, progress, progressMax);
+				notifyProgress(new long[] {0L, progress, progressMax});
 			}
 		}
 
@@ -55,25 +59,26 @@ public class SendPostTask<Key> extends HttpHolderTask<Void, Long, Boolean> {
 					}
 					lastOpenable = openable;
 				}
-				publishProgress((long) completeOpenables.size(), progress, progressMax);
+				notifyProgress(new long[] {completeOpenables.size(), progress, progressMax});
 			}
 		}
 	};
 
 	public interface Callback<Key> {
-		public void onSendPostChangeProgressState(Key key, ProgressState progressState,
+		void onSendPostChangeProgressState(Key key, ProgressState progressState,
 				int attachmentIndex, int attachmentsCount);
-		public void onSendPostChangeProgressValue(Key key, long progress, long progressMax);
-		public void onSendPostSuccess(Key key, ChanPerformer.SendPostData data,
-				String chanName, String threadNumber, String postNumber);
-		public void onSendPostFail(Key key, ChanPerformer.SendPostData data, String chanName, ErrorItem errorItem,
+		void onSendPostChangeProgressValue(Key key, long progress, long progressMax);
+		void onSendPostSuccess(Key key, ChanPerformer.SendPostData data,
+				String chanName, String threadNumber, PostNumber postNumber);
+		void onSendPostFail(Key key, ChanPerformer.SendPostData data, String chanName, ErrorItem errorItem,
 				ApiException.Extra extra, boolean captchaError, boolean keepCaptcha);
 	}
 
-	public SendPostTask(Key key, String chanName, Callback<Key> callback, ChanPerformer.SendPostData data) {
+	public SendPostTask(Key key, Callback<Key> callback, Chan chan, ChanPerformer.SendPostData data) {
+		chanHolder = new HttpHolder(chan);
 		this.key = key;
-		this.chanName = chanName;
 		this.callback = callback;
+		this.chan = chan;
 		this.data = data;
 		progressMode = data.attachments != null;
 		if (progressMode) {
@@ -113,51 +118,69 @@ public class SendPostTask<Key> extends HttpHolderTask<Void, Long, Boolean> {
 	}
 
 	@Override
-	protected Boolean doInBackground(HttpHolder holder, Void... params) {
-		try {
+	protected Boolean run() {
+		try (HttpHolder.Use ignore1 = chanHolder.use()) {
 			ChanPerformer.SendPostData data = this.data;
-			if (data.captchaData != null && (ChanConfiguration.CAPTCHA_TYPE_RECAPTCHA_2.equals(data.captchaType) ||
-					ChanConfiguration.CAPTCHA_TYPE_RECAPTCHA_2_INVISIBLE.equals(data.captchaType) ||
-					ChanConfiguration.CAPTCHA_TYPE_HCAPTCHA.equals(data.captchaType))) {
+			if (data.captchaNeedLoad) {
+				boolean success = false;
+				if (data.captchaData != null) {
+					try (HttpHolder.Use ignore2 = fallbackHolder.use()) {
+						String response = ReadCaptchaTask.readForegroundCaptcha(fallbackHolder,
+							chan.name, data.captchaData, data.captchaType);
+						if (response != null) {
+							data.captchaData.put(ChanPerformer.CaptchaData.INPUT, response);
+							success = true;
+						}
+					} catch (InterruptedException e) {
+						errorItem = new ErrorItem(ErrorItem.Type.UNKNOWN);
+						return false;
+					}
+				}
+				if (!success) {
+					// Don't switch captchaError
+					errorItem = new ErrorItem(ErrorItem.Type.API, ApiException.SEND_ERROR_CAPTCHA);
+					return false;
+				}
+			} else if (data.captchaData != null &&
+					(ChanConfiguration.CAPTCHA_TYPE_RECAPTCHA_2.equals(data.captchaType) ||
+							ChanConfiguration.CAPTCHA_TYPE_RECAPTCHA_2_INVISIBLE.equals(data.captchaType) ||
+							ChanConfiguration.CAPTCHA_TYPE_HCAPTCHA.equals(data.captchaType))) {
 				data.captchaData.put(ChanPerformer.CaptchaData.INPUT,
 						data.captchaData.get(ReadCaptchaTask.RECAPTCHA_SKIP_RESPONSE));
 			}
 			if (isCancelled()) {
 				return false;
 			}
-			data.holder = holder;
+			data.holder = chanHolder;
 			data.listener = progressHandler;
-			ChanPerformer performer = ChanPerformer.get(chanName);
-			ChanPerformer.SendPostResult result = performer.safe().onSendPost(data);
+			ChanPerformer.SendPostResult result = chan.performer.safe().onSendPost(data);
 			if (data.threadNumber == null && (result == null || result.threadNumber == null)) {
 				// New thread created with undefined number
 				ChanPerformer.ReadThreadsResult readThreadsResult;
 				try {
-					readThreadsResult = performer.safe().onReadThreads(new ChanPerformer
+					readThreadsResult = chan.performer.safe().onReadThreads(new ChanPerformer
 							.ReadThreadsData(data.boardName, 0, data.holder, null));
 				} catch (RedirectException e) {
 					readThreadsResult = null;
 				}
-				Posts[] threads = readThreadsResult != null ? readThreadsResult.threads : null;
-				if (threads != null && threads.length > 0) {
+				List<ChanPerformer.ReadThreadsResult.Thread> threads = readThreadsResult != null
+						? readThreadsResult.threads : null;
+				if (threads != null && !threads.isEmpty()) {
 					String postComment = data.comment;
-					CommentEditor commentEditor = ChanMarkup.get(chanName).safe().obtainCommentEditor(data.boardName);
+					CommentEditor commentEditor = chan.markup.safe().obtainCommentEditor(data.boardName);
 					if (commentEditor != null && postComment != null) {
 						postComment = commentEditor.removeTags(postComment);
 					}
 					SimilarTextEstimator estimator = new SimilarTextEstimator(Integer.MAX_VALUE, true);
-					SimilarTextEstimator.WordsData wordsData1 = estimator.getWords(postComment);
-					for (Posts thread : threads) {
-						Post[] posts = thread.getPosts();
-						if (posts != null && posts.length > 0) {
-							Post post = posts[0];
-							String comment = HtmlParser.clear(post.getComment());
-							SimilarTextEstimator.WordsData wordsData2 = estimator.getWords(comment);
-							if (estimator.checkSimiliar(wordsData1, wordsData2)
-									|| wordsData1 == null && wordsData2 == null) {
-								result = new ChanPerformer.SendPostResult(thread.getThreadNumber(), null);
-								break;
-							}
+					SimilarTextEstimator.WordsData<Void> wordsData1 = estimator.getWords(postComment);
+					for (ChanPerformer.ReadThreadsResult.Thread thread : threads) {
+						Post post = thread.posts.get(0);
+						String comment = HtmlParser.clear(post.comment);
+						SimilarTextEstimator.WordsData<Void> wordsData2 = estimator.getWords(comment);
+						if (estimator.checkSimiliar(wordsData1, wordsData2)
+								|| wordsData1 == null && wordsData2 == null) {
+							result = new ChanPerformer.SendPostResult(thread.threadNumber, null);
+							break;
 						}
 					}
 				}
@@ -175,26 +198,34 @@ public class SendPostTask<Key> extends HttpHolderTask<Void, Long, Boolean> {
 			keepCaptcha = !captchaError && e.checkFlag(ApiException.FLAG_KEEP_CAPTCHA);
 			return false;
 		} finally {
-			ChanConfiguration.get(chanName).commit();
+			chan.configuration.commit();
 		}
 	}
 
 	@Override
-	protected void onProgressUpdate(Long... values) {
-		int index = values[0].intValue();
+	public void cancel() {
+		super.cancel();
+		chanHolder.interrupt();
+		fallbackHolder.interrupt();
+	}
+
+	@Override
+	protected void onProgress(long[] values) {
+		int index = (int) values[0];
 		long progress = values[1];
 		long progressMax = values[2];
 		updateProgressValue(index, progress, progressMax);
 	}
 
 	@Override
-	protected void onPostExecute(final Boolean result) {
+	protected void onComplete(Boolean success) {
 		if (callback != null) {
-			if (result) {
-				callback.onSendPostSuccess(key, data, chanName, this.result != null ? this.result.threadNumber : null,
+			if (success) {
+				callback.onSendPostSuccess(key, data, chan.name,
+						this.result != null ? this.result.threadNumber : null,
 						this.result != null ? this.result.postNumber : null);
 			} else {
-				callback.onSendPostFail(key, data, chanName, errorItem, extra, captchaError, keepCaptcha);
+				callback.onSendPostFail(key, data, chan.name, errorItem, extra, captchaError, keepCaptcha);
 			}
 		}
 	}

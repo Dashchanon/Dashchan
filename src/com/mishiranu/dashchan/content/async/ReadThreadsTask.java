@@ -1,25 +1,25 @@
 package com.mishiranu.dashchan.content.async;
 
-import chan.content.ChanConfiguration;
+import chan.content.Chan;
 import chan.content.ChanPerformer;
 import chan.content.ExtensionException;
 import chan.content.InvalidResponseException;
 import chan.content.RedirectException;
-import chan.content.model.Post;
-import chan.content.model.Posts;
 import chan.http.HttpException;
 import chan.http.HttpHolder;
 import chan.http.HttpValidator;
-import chan.util.StringUtils;
+import chan.util.CommonUtils;
+import com.mishiranu.dashchan.content.database.CommonDatabase;
 import com.mishiranu.dashchan.content.model.ErrorItem;
 import com.mishiranu.dashchan.content.model.PostItem;
 import com.mishiranu.dashchan.util.Log;
 import java.net.HttpURLConnection;
 import java.util.ArrayList;
+import java.util.List;
 
-public class ReadThreadsTask extends HttpHolderTask<Void, Void, Boolean> {
+public class ReadThreadsTask extends HttpHolderTask<Void, Boolean> {
 	private final Callback callback;
-	private final String chanName;
+	private final Chan chan;
 	private final String boardName;
 	private final int pageNumber;
 	private final HttpValidator validator;
@@ -28,36 +28,43 @@ public class ReadThreadsTask extends HttpHolderTask<Void, Void, Boolean> {
 	private ArrayList<PostItem> postItems;
 	private int boardSpeed = 0;
 	private HttpValidator resultValidator;
+	private PostItem.HideState.Map<String> hiddenThreads;
 
 	private RedirectException.Target target;
 	private ErrorItem errorItem;
 
 	public interface Callback {
-		public void onReadThreadsSuccess(ArrayList<PostItem> postItems, int pageNumber,
-				int boardSpeed, boolean append, boolean checkModified, HttpValidator validator);
-		public void onReadThreadsRedirect(RedirectException.Target target);
-		public void onReadThreadsFail(ErrorItem errorItem, int pageNumber);
+		void onReadThreadsSuccess(List<PostItem> postItems, int pageNumber,
+				int boardSpeed, boolean append, boolean checkModified, HttpValidator validator,
+				PostItem.HideState.Map<String> hiddenThreads);
+		void onReadThreadsRedirect(RedirectException.Target target);
+		void onReadThreadsFail(ErrorItem errorItem, int pageNumber);
 	}
 
-	public ReadThreadsTask(Callback callback, String chanName, String boardName, int pageNumber,
+	public ReadThreadsTask(Callback callback, Chan chan, String boardName, int pageNumber,
 			HttpValidator validator, boolean append) {
+		super(chan);
 		this.callback = callback;
-		this.chanName = chanName;
+		this.chan = chan;
 		this.boardName = boardName;
 		this.pageNumber = pageNumber;
 		this.validator = validator;
 		this.append = append;
 	}
 
+	public int getPageNumber() {
+		return pageNumber;
+	}
+
 	@Override
-	protected Boolean doInBackground(HttpHolder holder, Void... params) {
+	protected Boolean run(HttpHolder holder) {
 		try {
 			ChanPerformer.ReadThreadsResult result;
 			try {
-				result = ChanPerformer.get(chanName).safe().onReadThreads(new ChanPerformer.ReadThreadsData(boardName,
+				result = chan.performer.safe().onReadThreads(new ChanPerformer.ReadThreadsData(boardName,
 						pageNumber, holder, validator));
 			} catch (RedirectException e) {
-				RedirectException.Target target = e.obtainTarget(chanName);
+				RedirectException.Target target = e.obtainTarget(chan.name);
 				if (target == null) {
 					throw HttpException.createNotFoundException();
 				}
@@ -65,34 +72,28 @@ public class ReadThreadsTask extends HttpHolderTask<Void, Void, Boolean> {
 					Log.persistent().write(Log.TYPE_ERROR, Log.DISABLE_QUOTES, "Only board redirects available there");
 					errorItem = new ErrorItem(ErrorItem.Type.INVALID_DATA_FORMAT);
 					return false;
-				} else if (chanName.equals(target.chanName) && StringUtils.equals(boardName, target.boardName)) {
+				} else if (chan.name.equals(target.chanName) && CommonUtils.equals(boardName, target.boardName)) {
 					throw HttpException.createNotFoundException();
 				} else {
 					this.target = target;
 					return true;
 				}
 			}
-			Posts[] threadsArray = result != null ? result.threads : null;
-			ArrayList<PostItem> postItems = null;
-			int boardSpeed = result != null ? result.boardSpeed : 0;
-			HttpValidator validator = result != null ? result.validator : null;
-			if (threadsArray != null && threadsArray.length > 0) {
-				for (Posts thread : threadsArray) {
-					Post[] postsArray = thread.getPosts();
-					if (postsArray != null && postsArray.length > 0) {
-						if (postItems == null) {
-							postItems = new ArrayList<>();
-						}
-						postItems.add(PostItem.createThread(thread, chanName, boardName));
-					}
-				}
+			if (result == null) {
+				throw HttpException.createNotFoundException();
 			}
-			if (validator == null) {
-				validator = holder.getValidator();
+			ArrayList<PostItem> postItems = new ArrayList<>(result.threads.size());
+			ArrayList<String> threadNumbers = new ArrayList<>(result.threads.size());
+			for (ChanPerformer.ReadThreadsResult.Thread thread : result.threads) {
+				postItems.add(PostItem.createThread(thread.posts, thread.postsCount, thread.filesCount,
+						thread.postsWithFilesCount, chan, boardName, thread.threadNumber));
+				threadNumbers.add(thread.threadNumber);
 			}
 			this.postItems = postItems;
-			this.boardSpeed = boardSpeed;
-			this.resultValidator = validator;
+			this.boardSpeed = result.boardSpeed;
+			this.resultValidator = result.validator != null ? result.validator : holder.extractValidator();
+			hiddenThreads = CommonDatabase.getInstance().getThreads()
+					.getFlags(chan.name, boardName, threadNumbers);
 			return true;
 		} catch (HttpException e) {
 			int responseCode = e.getResponseCode();
@@ -110,18 +111,18 @@ public class ReadThreadsTask extends HttpHolderTask<Void, Void, Boolean> {
 			errorItem = e.getErrorItemAndHandle();
 			return false;
 		} finally {
-			ChanConfiguration.get(chanName).commit();
+			chan.configuration.commit();
 		}
 	}
 
 	@Override
-	public void onPostExecute(Boolean success) {
+	public void onComplete(Boolean success) {
 		if (success) {
 			if (target != null) {
 				callback.onReadThreadsRedirect(target);
 			} else {
 				callback.onReadThreadsSuccess(postItems, pageNumber, boardSpeed, append,
-						validator != null, resultValidator);
+						validator != null, resultValidator, hiddenThreads);
 			}
 		} else {
 			callback.onReadThreadsFail(errorItem, pageNumber);

@@ -1,20 +1,16 @@
 package com.mishiranu.dashchan.ui.gallery;
 
-import android.annotation.SuppressLint;
 import android.app.AlertDialog;
 import android.content.Context;
 import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
-import android.graphics.ColorFilter;
 import android.graphics.Paint;
 import android.graphics.PixelFormat;
 import android.graphics.Point;
 import android.graphics.Rect;
-import android.graphics.drawable.Drawable;
 import android.net.Uri;
-import android.os.AsyncTask;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.FrameLayout;
@@ -24,29 +20,29 @@ import android.widget.LinearLayout;
 import android.widget.SeekBar;
 import android.widget.TextView;
 import androidx.annotation.NonNull;
+import androidx.fragment.app.FragmentManager;
+import chan.content.Chan;
 import chan.util.StringUtils;
 import com.mishiranu.dashchan.C;
 import com.mishiranu.dashchan.R;
-import com.mishiranu.dashchan.content.CacheManager;
+import com.mishiranu.dashchan.content.AdvancedPreferences;
 import com.mishiranu.dashchan.content.Preferences;
 import com.mishiranu.dashchan.content.async.ReadVideoTask;
 import com.mishiranu.dashchan.content.model.ErrorItem;
-import com.mishiranu.dashchan.media.CachingInputStream;
+import com.mishiranu.dashchan.graphics.BaseDrawable;
 import com.mishiranu.dashchan.media.VideoPlayer;
+import com.mishiranu.dashchan.ui.InstanceDialog;
 import com.mishiranu.dashchan.util.AnimationUtils;
 import com.mishiranu.dashchan.util.AudioFocus;
 import com.mishiranu.dashchan.util.ConcurrentUtils;
-import com.mishiranu.dashchan.util.GraphicsUtils;
-import com.mishiranu.dashchan.util.IOUtils;
 import com.mishiranu.dashchan.util.Log;
 import com.mishiranu.dashchan.util.ResourceUtils;
-import com.mishiranu.dashchan.util.StringBlockBuilder;
 import com.mishiranu.dashchan.util.ViewUtils;
+import com.mishiranu.dashchan.widget.SummaryLayout;
 import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
-import java.util.HashMap;
 import java.util.Locale;
+import java.util.Map;
 
 public class VideoUnit {
 	private final PagerInstance instance;
@@ -69,7 +65,7 @@ public class VideoUnit {
 	private boolean trackingNow;
 	private boolean hideSurfaceOnInit;
 
-	private ReadVideoTask readVideoTask;
+	private ReadVideoCallback readVideoCallback;
 
 	public VideoUnit(PagerInstance instance) {
 		this.instance = instance;
@@ -134,9 +130,9 @@ public class VideoUnit {
 		}
 	}
 
-	public void onApplyWindowPaddings(Rect rect) {
+	public void onApplyWindowInsets(int left, int right, int bottom) {
 		if (C.API_LOLLIPOP) {
-			controlsView.setPadding(rect.left, 0, rect.right, rect.bottom);
+			controlsView.setPadding(left, 0, right, bottom);
 		}
 	}
 
@@ -149,9 +145,9 @@ public class VideoUnit {
 	}
 
 	public void interrupt() {
-		if (readVideoTask != null) {
-			readVideoTask.cancel();
-			readVideoTask = null;
+		if (readVideoCallback != null) {
+			readVideoCallback.cancel();
+			readVideoCallback = null;
 		}
 		if (initialized) {
 			audioFocus.release();
@@ -159,7 +155,7 @@ public class VideoUnit {
 		}
 		invalidateControlsVisibility();
 		if (player != null) {
-			player.free();
+			player.destroy();
 			player = null;
 			instance.currentHolder.progressBar.setVisible(false, false);
 		}
@@ -189,74 +185,32 @@ public class VideoUnit {
 		wasPlaying = true;
 		finishedPlayback = false;
 		hideSurfaceOnInit = false;
-		VideoPlayer player = new VideoPlayer(Preferences.isVideoSeekAnyFrame());
-		player.setListener(playerListener);
+		boolean seekAnyFrame = Preferences.isVideoSeekAnyFrame();
+		VideoPlayer player = new VideoPlayer(playerListener, seekAnyFrame);
 		boolean loadedFromFile = false;
 		if (!reload && file.exists()) {
 			try {
-				player.init(file);
+				player.init(file, null);
 				loadedFromFile = true;
 			} catch (IOException e) {
 				// Player was consumed, create a new one and try to download a new video file
-				player = new VideoPlayer(Preferences.isVideoSeekAnyFrame());
+				player = new VideoPlayer(playerListener, seekAnyFrame);
 			}
 		}
 		this.player = player;
 		if (loadedFromFile) {
 			initializePlayer();
 			seekBar.setSecondaryProgress(seekBar.getMax());
-			instance.currentHolder.fullLoaded = true;
+			if (instance.currentHolder.mediaSummary.updateSize(file.length())) {
+				instance.galleryInstance.callback.updateTitle();
+			}
+			instance.currentHolder.loadState = PagerInstance.LoadState.COMPLETE;
 			instance.galleryInstance.callback.invalidateOptionsMenu();
 		} else {
-			VideoPlayer finalPlayer = player;
-			PagerInstance.ViewHolder holder = instance.currentHolder;
-			holder.progressBar.setIndeterminate(true);
-			holder.progressBar.setVisible(true, false);
-			final CachingInputStream inputStream = new CachingInputStream();
-			new AsyncTask<Void, Void, Boolean>() {
-				@Override
-				protected Boolean doInBackground(Void... params) {
-					try {
-						finalPlayer.init(inputStream);
-						return true;
-					} catch (VideoPlayer.InitializationException e) {
-						Log.persistent().stack(e);
-						return false;
-					} catch (IOException e) {
-						return false;
-					}
-				}
-
-				@Override
-				protected void onPostExecute(Boolean result) {
-					if (VideoUnit.this.player != finalPlayer) {
-						return;
-					}
-					PagerInstance.ViewHolder holder = instance.currentHolder;
-					holder.progressBar.setVisible(false, false);
-					if (result) {
-						initializePlayer();
-						instance.galleryInstance.callback.invalidateOptionsMenu();
-						if (readVideoTask == null) {
-							seekBar.setSecondaryProgress(seekBar.getMax());
-						}
-					} else {
-						if (readVideoTask != null) {
-							if (!readVideoTask.isError()) {
-								readVideoTask.cancel();
-								readVideoTask = null;
-							} else {
-								return;
-							}
-						}
-						instance.callback.showError(holder, instance.galleryInstance.context
-								.getString(R.string.playback_error));
-					}
-				}
-			}.executeOnExecutor(ConcurrentUtils.SEPARATE_EXECUTOR);
-			readVideoTask = new ReadVideoTask(instance.galleryInstance.chanName, uri, inputStream,
-					new ReadVideoCallback(player, holder));
-			readVideoTask.executeOnExecutor(ReadVideoTask.THREAD_POOL_EXECUTOR);
+			instance.currentHolder.progressBar.setIndeterminate(true);
+			instance.currentHolder.progressBar.setVisible(true, false);
+			readVideoCallback = new ReadVideoCallback(player, instance.currentHolder,
+					instance.galleryInstance.chanName, uri);
 		}
 	}
 
@@ -281,6 +235,9 @@ public class VideoUnit {
 		PagerInstance.ViewHolder holder = instance.currentHolder;
 		holder.progressBar.setVisible(false, false);
 		Point dimensions = player.getDimensions();
+		if (holder.mediaSummary.updateDimensions(dimensions.x, dimensions.y)) {
+			instance.galleryInstance.callback.updateTitle();
+		}
 		backgroundDrawable = new BackgroundDrawable();
 		backgroundDrawable.width = dimensions.x;
 		backgroundDrawable.height = dimensions.y;
@@ -302,7 +259,6 @@ public class VideoUnit {
 		updatePlayState();
 	}
 
-	@SuppressLint("RtlHardcoded")
 	private void recreateVideoControls() {
 		Context context = instance.galleryInstance.context;
 		float density = ResourceUtils.obtainDensity(context);
@@ -321,7 +277,7 @@ public class VideoUnit {
 
 			configurationView = new LinearLayout(context);
 			configurationView.setOrientation(LinearLayout.HORIZONTAL);
-			configurationView.setGravity(Gravity.RIGHT);
+			configurationView.setGravity(Gravity.END);
 			configurationView.setPadding((int) (8f * density), 0, (int) (8f * density), 0);
 			controlsView.addView(configurationView, LinearLayout.LayoutParams.MATCH_PARENT,
 					LinearLayout.LayoutParams.WRAP_CONTENT);
@@ -339,7 +295,7 @@ public class VideoUnit {
 			ViewUtils.setTextSizeScaled(timeTextView, 14);
 			timeTextView.setGravity(Gravity.CENTER_HORIZONTAL);
 			if (C.API_LOLLIPOP) {
-				timeTextView.setTypeface(GraphicsUtils.TYPEFACE_MEDIUM);
+				timeTextView.setTypeface(ResourceUtils.TYPEFACE_MEDIUM);
 			}
 			if (oldTimeText != null) {
 				timeTextView.setText(oldTimeText);
@@ -349,7 +305,7 @@ public class VideoUnit {
 			ViewUtils.setTextSizeScaled(totalTimeTextView, 14);
 			totalTimeTextView.setGravity(Gravity.CENTER_HORIZONTAL);
 			if (C.API_LOLLIPOP) {
-				totalTimeTextView.setTypeface(GraphicsUtils.TYPEFACE_MEDIUM);
+				totalTimeTextView.setTypeface(ResourceUtils.TYPEFACE_MEDIUM);
 			}
 
 			int oldSecondaryProgress = seekBar != null ? seekBar.getSecondaryProgress() : -1;
@@ -408,8 +364,9 @@ public class VideoUnit {
 				}
 				configurationView.addView(imageView, (int) (48f * density), (int) (48f * density));
 			}
-			totalTimeTextView.setText(formatVideoTime(player.getDuration()));
-			seekBar.setMax((int) player.getDuration());
+			long duration = player.getDuration();
+			totalTimeTextView.setText(formatVideoTime(duration));
+			seekBar.setMax((int) duration);
 		}
 		seekBar.removeCallbacks(progressRunnable);
 		seekBar.post(progressRunnable);
@@ -504,69 +461,68 @@ public class VideoUnit {
 
 	public void viewTechnicalInfo() {
 		if (initialized) {
-			HashMap<String, String> technicalInfo = player.getTechnicalInfo();
-			StringBlockBuilder builder = new StringBlockBuilder();
+			Map<String, String> technicalInfo = player.getTechnicalInfo();
+			showTechnicalInfo(instance.galleryInstance.callback.getChildFragmentManager(), technicalInfo);
+		}
+	}
+
+	private static void showTechnicalInfo(FragmentManager fragmentManager, Map<String, String> technicalInfo) {
+		new InstanceDialog(fragmentManager, null, provider -> {
+			Context context = GalleryInstance.getCallback(provider).getWindow().getContext();
+			AlertDialog dialog = new AlertDialog.Builder(context)
+					.setTitle(R.string.technical_info)
+					.setPositiveButton(android.R.string.ok, null)
+					.create();
+			SummaryLayout layout = new SummaryLayout(dialog);
 			String videoFormat = technicalInfo.get("video_format");
 			String width = technicalInfo.get("width");
 			String height = technicalInfo.get("height");
 			String frameRate = technicalInfo.get("frame_rate");
 			String pixelFormat = technicalInfo.get("pixel_format");
 			String surfaceFormat = technicalInfo.get("surface_format");
-			String useLibyuv = technicalInfo.get("use_libyuv");
+			String frameConversion = technicalInfo.get("frame_conversion");
 			String audioFormat = technicalInfo.get("audio_format");
 			String channels = technicalInfo.get("channels");
 			String sampleRate = technicalInfo.get("sample_rate");
 			String encoder = technicalInfo.get("encoder");
 			String title = technicalInfo.get("title");
 			if (videoFormat != null) {
-				builder.appendLine("Video: " + videoFormat);
+				layout.add("Video", videoFormat);
 			}
 			if (width != null && height != null) {
-				builder.appendLine("Resolution: " + width + '×' + height);
+				layout.add("Resolution", width + '×' + height);
 			}
 			if (frameRate != null) {
-				builder.appendLine("Frame rate: " + frameRate);
+				layout.add("Frame rate", StringUtils.stripTrailingZeros(frameRate) + " FPS");
 			}
 			if (pixelFormat != null) {
-				builder.appendLine("Pixels: " + pixelFormat);
+				layout.add("Pixels", pixelFormat);
 			}
 			if (surfaceFormat != null) {
-				builder.appendLine("Surface: " + surfaceFormat);
+				layout.add("Surface", surfaceFormat);
 			}
-			if ("1".equals(useLibyuv)) {
-				builder.appendLine("Use libyuv: true");
-			} else if ("0".equals(useLibyuv)) {
-				builder.appendLine("Use libyuv: false");
+			if (frameConversion != null) {
+				layout.add("Frame conversion", frameConversion);
 			}
-			builder.appendEmptyLine();
+			layout.addDivider();
 			if (audioFormat != null) {
-				builder.appendLine("Audio: " + audioFormat);
+				layout.add("Audio", audioFormat);
 			}
 			if (channels != null) {
-				builder.appendLine("Channels: " + channels);
+				layout.add("Channels", channels);
 			}
 			if (sampleRate != null) {
-				builder.appendLine("Sample rate: " + sampleRate + " Hz");
+				layout.add("Sample rate", sampleRate + " Hz");
 			}
-			builder.appendEmptyLine();
+			layout.addDivider();
 			if (encoder != null) {
-				builder.appendLine("Encoder: " + encoder);
+				layout.add("Encoder", encoder);
 			}
 			if (!StringUtils.isEmptyOrWhitespace(title)) {
-				builder.appendLine("Title: " + title);
+				layout.add("Title", title);
 			}
-			String message = builder.toString();
-			if (message.length() > 0) {
-				AlertDialog dialog = new AlertDialog
-						.Builder(instance.galleryInstance.callback.getWindow().getContext())
-						.setTitle(R.string.technical_info).setMessage(message)
-						.setPositiveButton(android.R.string.ok, null)
-						.create();
-				dialog.setOnShowListener(ViewUtils.ALERT_DIALOG_MESSAGE_SELECTABLE);
-				instance.galleryInstance.callback.getConfigurationLock().lockConfiguration(dialog);
-				dialog.show();
-			}
-		}
+			return dialog;
+		});
 	}
 
 	private boolean controlsVisible = false;
@@ -593,14 +549,17 @@ public class VideoUnit {
 		@Override
 		public void onComplete(VideoPlayer player) {
 			switch (Preferences.getVideoCompletionMode()) {
-				case Preferences.VIDEO_COMPLETION_MODE_NOTHING: {
+				case NOTHING: {
 					finishedPlayback = true;
 					updatePlayState();
 					break;
 				}
-				case Preferences.VIDEO_COMPLETION_MODE_LOOP: {
+				case LOOP: {
 					player.setPosition(0L);
 					break;
+				}
+				default: {
+					throw new IllegalStateException();
 				}
 			}
 		}
@@ -664,90 +623,159 @@ public class VideoUnit {
 		}
 	}
 
-	private class ReadVideoCallback implements ReadVideoTask.Callback {
+	private class ReadVideoCallback implements ReadVideoTask.Callback, VideoPlayer.RangeCallback {
 		private final VideoPlayer workPlayer;
 		private final PagerInstance.ViewHolder holder;
+		private final String chanName;
+		private final Uri uri;
 
-		public ReadVideoCallback(VideoPlayer player, PagerInstance.ViewHolder holder) {
+		private ReadVideoTask downloadTask;
+		private ReadVideoTask rangeTask;
+		private boolean allowRangeRequests;
+
+		public ReadVideoCallback(VideoPlayer player, PagerInstance.ViewHolder holder, String chanName, Uri uri) {
 			this.workPlayer = player;
 			this.holder = holder;
+			this.chanName = chanName;
+			this.uri = uri;
+			allowRangeRequests = !AdvancedPreferences.isSingleConnection(chanName);
+			Chan chan = Chan.getPreferred(chanName, uri);
+			downloadTask = new ReadVideoTask(this, chan, uri, 0);
+			downloadTask.execute(ConcurrentUtils.PARALLEL_EXECUTOR);
+		}
+
+		public void cancel() {
+			if (downloadTask != null) {
+				downloadTask.cancel();
+				downloadTask = null;
+			}
+			if (rangeTask != null) {
+				rangeTask.cancel();
+				rangeTask = null;
+			}
+		}
+
+		@Override
+		public void onReadVideoInit(File partialFile) {
+			if (workPlayer == player) {
+				new Thread(() -> {
+					boolean success;
+					try {
+						workPlayer.init(partialFile, ReadVideoCallback.this);
+						success = true;
+					} catch (VideoPlayer.InitializationException e) {
+						Log.persistent().stack(e);
+						success = false;
+					} catch (IOException e) {
+						success = false;
+					}
+					boolean successFinal = success;
+					ConcurrentUtils.HANDLER.post(() -> {
+						if (workPlayer == player) {
+							holder.progressBar.setVisible(false, false);
+							if (successFinal) {
+								initializePlayer();
+								instance.galleryInstance.callback.invalidateOptionsMenu();
+								if (downloadTask == null) {
+									seekBar.setSecondaryProgress(seekBar.getMax());
+								}
+							} else {
+								if (downloadTask != null) {
+									if (!downloadTask.isError()) {
+										downloadTask.cancel();
+										downloadTask = null;
+									} else {
+										return;
+									}
+								}
+								if (rangeTask != null) {
+									rangeTask.cancel();
+									rangeTask = null;
+								}
+								instance.callback.showError(holder, instance.galleryInstance.context
+										.getString(R.string.playback_error));
+							}
+						}
+					});
+				}).start();
+			}
 		}
 
 		@Override
 		public void onReadVideoProgressUpdate(long progress, long progressMax) {
-			if (initialized && workPlayer == player) {
-				int max = seekBar.getMax();
-				if (max > 0 && progressMax > 0) {
-					int newProgress = (int) (max * progress / progressMax);
-					seekBar.setSecondaryProgress(newProgress);
+			if (workPlayer == player) {
+				workPlayer.setDownloadRange(progress, progressMax);
+				if (instance.currentHolder.mediaSummary.updateSize(progressMax)) {
+					instance.galleryInstance.callback.updateTitle();
+				}
+				if (initialized) {
+					int max = seekBar.getMax();
+					if (max > 0 && progressMax > 0) {
+						int newProgress = (int) (max * progress / progressMax);
+						seekBar.setSecondaryProgress(newProgress);
+					}
 				}
 			}
 		}
 
 		@Override
-		public void onReadVideoSuccess(final CachingInputStream inputStream) {
-			if (workPlayer != player) {
-				return;
+		public void onReadVideoRangeUpdate(long start, long end) {
+			if (workPlayer == player) {
+				workPlayer.setPartRange(start, end);
 			}
-			readVideoTask = null;
-			if (initialized) {
-				seekBar.setSecondaryProgress(seekBar.getMax());
-			}
-			new AsyncTask<Void, Void, Boolean>() {
-				private File file;
+		}
 
-				@Override
-				protected Boolean doInBackground(Void... params) {
-					file = CacheManager.getInstance().getMediaFile(holder.galleryItem
-							.getFileUri(instance.galleryInstance.locator), false);
-					if (file == null) {
-						return false;
+		@Override
+		public void onReadVideoSuccess(boolean partial, File file) {
+			if (workPlayer == player) {
+				if (partial) {
+					rangeTask = null;
+				} else {
+					downloadTask = null;
+					long length = file.length();
+					workPlayer.setDownloadRange(length, length);
+					if (instance.currentHolder.mediaSummary.updateSize(length)) {
+						instance.galleryInstance.callback.updateTitle();
 					}
-					boolean success;
-					FileOutputStream output = null;
-					try {
-						output = new FileOutputStream(file);
-						inputStream.writeTo(output);
-						success = true;
-					} catch (IOException e) {
-						success = false;
-						e.printStackTrace();
-					} finally {
-						IOUtils.close(output);
-					}
-					CacheManager.getInstance().handleDownloadedFile(file, success);
-					return success;
-				}
-
-				@Override
-				protected void onPostExecute(Boolean result) {
-					if (result && workPlayer == player) {
-						holder.fullLoaded = true;
+					if (initialized) {
+						seekBar.setSecondaryProgress(seekBar.getMax());
+						holder.loadState = PagerInstance.LoadState.COMPLETE;
 						instance.galleryInstance.callback.invalidateOptionsMenu();
-						try {
-							player.replaceStream(file);
-						} catch (IOException e) {
-							// Ignore exception
-						}
-						if (holder.galleryItem.size <= 0) {
-							holder.galleryItem.size = (int) file.length();
-							instance.galleryInstance.callback.updateTitle();
-						}
 					}
 				}
-			}.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+			}
 		}
 
 		@Override
-		public void onReadVideoFail(ErrorItem errorItem) {
-			readVideoTask = null;
-			holder.progressBar.setVisible(false, false);
-			instance.callback.showError(holder, errorItem.toString());
-			instance.galleryInstance.callback.invalidateOptionsMenu();
+		public void onReadVideoFail(boolean partial, ErrorItem errorItem, boolean disallowRangeRequests) {
+			if (workPlayer == player) {
+				if (partial) {
+					rangeTask = null;
+					if (disallowRangeRequests) {
+						allowRangeRequests = false;
+					}
+				} else {
+					holder.progressBar.setVisible(false, false);
+					instance.callback.showError(holder, errorItem.toString());
+				}
+			}
+		}
+
+		@Override
+		public void requestPartFromPosition(long start) {
+			if (rangeTask != null) {
+				rangeTask.cancel();
+				rangeTask = null;
+			}
+			if (allowRangeRequests && start > 0) {
+				Chan chan = Chan.getPreferred(chanName, uri);
+				rangeTask = new ReadVideoTask(this, chan, uri, start);
+				rangeTask.execute(ConcurrentUtils.PARALLEL_EXECUTOR);
+			}
 		}
 	}
 
-	private static class BackgroundDrawable extends Drawable {
+	private static class BackgroundDrawable extends BaseDrawable {
 		public int width;
 		public int height;
 
@@ -794,12 +822,6 @@ public class VideoUnit {
 		public int getOpacity() {
 			return PixelFormat.TRANSPARENT;
 		}
-
-		@Override
-		public void setAlpha(int alpha) {}
-
-		@Override
-		public void setColorFilter(ColorFilter colorFilter) {}
 
 		@Override
 		public int getIntrinsicWidth() {

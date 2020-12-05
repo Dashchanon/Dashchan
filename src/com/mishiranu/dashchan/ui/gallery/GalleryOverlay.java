@@ -5,7 +5,6 @@ import android.content.Context;
 import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
-import android.graphics.Rect;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.net.Uri;
@@ -20,6 +19,8 @@ import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.FrameLayout;
@@ -28,8 +29,8 @@ import android.widget.TextView;
 import androidx.annotation.NonNull;
 import androidx.core.view.ViewCompat;
 import androidx.fragment.app.DialogFragment;
-import chan.content.ChanLocator;
-import chan.content.ChanManager;
+import chan.content.Chan;
+import chan.util.CommonUtils;
 import chan.util.StringUtils;
 import com.mishiranu.dashchan.C;
 import com.mishiranu.dashchan.R;
@@ -38,23 +39,21 @@ import com.mishiranu.dashchan.content.Preferences;
 import com.mishiranu.dashchan.content.model.GalleryItem;
 import com.mishiranu.dashchan.content.service.DownloadService;
 import com.mishiranu.dashchan.graphics.GalleryBackgroundDrawable;
-import com.mishiranu.dashchan.ui.ActivityHandler;
 import com.mishiranu.dashchan.ui.FragmentHandler;
 import com.mishiranu.dashchan.util.AnimationUtils;
-import com.mishiranu.dashchan.util.ConfigurationLock;
+import com.mishiranu.dashchan.util.ConcurrentUtils;
 import com.mishiranu.dashchan.util.FlagUtils;
-import com.mishiranu.dashchan.util.GraphicsUtils;
 import com.mishiranu.dashchan.util.ResourceUtils;
 import com.mishiranu.dashchan.util.ViewUtils;
+import com.mishiranu.dashchan.widget.InsetsLayout;
 import com.mishiranu.dashchan.widget.ThemeEngine;
-import com.mishiranu.dashchan.widget.WindowControlFrameLayout;
+import com.mishiranu.dashchan.widget.ViewFactory;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
-public class GalleryOverlay extends DialogFragment implements ActivityHandler, GalleryInstance.Callback,
-		WindowControlFrameLayout.OnApplyWindowPaddingsListener {
+public class GalleryOverlay extends DialogFragment implements GalleryDialog.Callback, GalleryInstance.Callback {
 	public enum NavigatePostMode {DISABLED, MANUALLY, ENABLED}
 
 	private static final String EXTRA_URI = "uri";
@@ -68,12 +67,12 @@ public class GalleryOverlay extends DialogFragment implements ActivityHandler, G
 	private static final String EXTRA_SELECTED = "selected";
 	private static final String EXTRA_GALLERY_WINDOW = "galleryWindow";
 	private static final String EXTRA_GALLERY_MODE = "galleryMode";
-	private static final String EXTRA_SYSTEM_UI_VISIBILITY = "systemUIVisibility";
+	private static final String EXTRA_SYSTEM_UI_VISIBILITY = "systemUiVisibility";
 
 	private List<GalleryItem> queuedGalleryItems;
 	private WeakReference<View> queuedFromView;
 
-	private WindowControlFrameLayout rootView;
+	private InsetsLayout rootView;
 	private GalleryInstance instance;
 	private PagerUnit pagerUnit;
 	private ListUnit listUnit;
@@ -84,7 +83,7 @@ public class GalleryOverlay extends DialogFragment implements ActivityHandler, G
 
 	private Pair<CharSequence, CharSequence> titleSubtitle;
 	private boolean screenOnFixed = false;
-	private int systemUiVisibilityFlags = GalleryInstance.FLAG_LOCKED_USER;
+	private int systemUiVisibilityFlags = GalleryInstance.Flags.LOCKED_USER;
 
 	private static final int ACTION_BAR_COLOR = 0xaa202020;
 	private static final int BACKGROUND_COLOR = 0xf0101010;
@@ -99,6 +98,10 @@ public class GalleryOverlay extends DialogFragment implements ActivityHandler, G
 			View fromView, NavigatePostMode navigatePostMode, boolean initialGalleryMode) {
 		this(null, chanName, galleryItems, imageIndex, threadTitle, fromView,
 				navigatePostMode, initialGalleryMode);
+	}
+
+	public String getChanName() {
+		return requireArguments().getString(EXTRA_CHAN_NAME);
 	}
 
 	private GalleryOverlay(Uri uri, String chanName, List<GalleryItem> galleryItems, int imageIndex, String threadTitle,
@@ -146,7 +149,8 @@ public class GalleryOverlay extends DialogFragment implements ActivityHandler, G
 		super.onDestroyView();
 
 		if (showcaseDestroy != null) {
-			showcaseDestroy.destroy(false);
+			showcaseDestroy.run();
+			showcaseDestroy = null;
 		}
 	}
 
@@ -174,16 +178,30 @@ public class GalleryOverlay extends DialogFragment implements ActivityHandler, G
 		if (rootView == null) {
 			Context context = ThemeEngine.attach(new ContextThemeWrapper
 					(MainApplication.getInstance().getLocalizedContext(), R.style.Theme_Gallery));
-			rootView = new WindowControlFrameLayout(context) {
+			rootView = new InsetsLayout(context);
+			rootView.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
 				@Override
-				protected void onAttachedToWindow() {
-					super.onAttachedToWindow();
+				public void onViewAttachedToWindow(View v) {
 					if (!galleryMode) {
 						displayShowcase();
 					}
 				}
-			};
-			rootView.setOnApplyWindowPaddingsListener(this);
+
+				@Override
+				public void onViewDetachedFromWindow(View v) {}
+			});
+			rootView.setOnApplyInsetsListener(apply -> {
+				InsetsLayout.Insets insets = apply.get();
+				if (listUnit != null) {
+					boolean invalidate = listUnit.onApplyWindowInsets(insets);
+					if (invalidate) {
+						postInvalidateSystemUIVisibility();
+					}
+				}
+				if (pagerUnit != null) {
+					pagerUnit.onApplyWindowInsets(insets);
+				}
+			});
 			rootView.setLayoutParams(new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
 					ViewGroup.LayoutParams.MATCH_PARENT));
 			rootView.setBackground(new GalleryBackgroundDrawable(rootView, imageViewPosition, BACKGROUND_COLOR));
@@ -193,26 +211,30 @@ public class GalleryOverlay extends DialogFragment implements ActivityHandler, G
 		dialog.setContentView(rootView);
 		dialog.show();
 		dialog.getActionBar().setDisplayHomeAsUpEnabled(true);
+		Runnable invalidateSystemUiFlags = () -> {
+			if (dialog.isShowing()) {
+				invalidateSystemUiFlags();
+			}
+		};
 		dialog.setOnFocusChangeListener(hasFocus -> {
 			if (pagerUnit != null) {
 				// Block touch events when dialogs are opened
 				pagerUnit.setHasFocus(hasFocus);
+			}
+			ConcurrentUtils.HANDLER.removeCallbacks(invalidateSystemUiFlags);
+			if (hasFocus) {
+				// Re-apply visibility flags after dialogs closed
+				ConcurrentUtils.HANDLER.postDelayed(invalidateSystemUiFlags, 100);
 			}
 		});
 
 		Integer newImagePosition = null;
 		if (instance == null) {
 			Uri uri = requireArguments().getParcelable(EXTRA_URI);
-			String chanName = requireArguments().getString(EXTRA_CHAN_NAME);
-			if (uri != null && chanName == null) {
-				chanName = ChanManager.getInstance().getChanNameByHost(uri.getAuthority());
-			}
-			ChanLocator locator = chanName != null ? ChanLocator.get(chanName) : null;
-			boolean defaultLocator = false;
-			if (locator == null) {
-				locator = ChanLocator.getDefault();
-				defaultLocator = true;
-			}
+			String chanNameFromArguments = requireArguments().getString(EXTRA_CHAN_NAME);
+			Chan chan = chanNameFromArguments == null && uri != null
+					? Chan.getPreferred(null, uri) : Chan.get(chanNameFromArguments);
+			boolean defaultLocator = chan.name == null;
 
 			List<GalleryItem> galleryItems;
 			int imagePosition;
@@ -220,8 +242,8 @@ public class GalleryOverlay extends DialogFragment implements ActivityHandler, G
 				String boardName = null;
 				String threadNumber = null;
 				if (!defaultLocator) {
-					boardName = locator.safe(true).getBoardName(uri);
-					threadNumber = locator.safe(true).getThreadNumber(uri);
+					boardName = chan.locator.safe(true).getBoardName(uri);
+					threadNumber = chan.locator.safe(true).getThreadNumber(uri);
 				}
 				galleryItems = Collections.singletonList(new GalleryItem(uri, boardName, threadNumber));
 				imagePosition = 0;
@@ -231,31 +253,30 @@ public class GalleryOverlay extends DialogFragment implements ActivityHandler, G
 				imagePosition = savedInstanceState != null ? savedInstanceState.getInt(EXTRA_POSITION)
 						: requireArguments().getInt(EXTRA_IMAGE_INDEX);
 			}
-			instance = new GalleryInstance(rootView.getContext(), this, ACTION_BAR_COLOR, chanName, locator,
+			instance = new GalleryInstance(rootView.getContext(), this, ACTION_BAR_COLOR, chan.name,
 					galleryItems != null ? galleryItems : Collections.emptyList());
 			if (!instance.galleryItems.isEmpty()) {
 				listUnit = new ListUnit(instance);
 				pagerUnit = new PagerUnit(instance);
-				rootView.addView(listUnit.getRecyclerView(), FrameLayout.LayoutParams.MATCH_PARENT,
-						FrameLayout.LayoutParams.MATCH_PARENT);
-				rootView.addView(pagerUnit.getView(), FrameLayout.LayoutParams.MATCH_PARENT,
-						FrameLayout.LayoutParams.MATCH_PARENT);
+				rootView.addView(listUnit.getRecyclerView(), InsetsLayout.LayoutParams.MATCH_PARENT,
+						InsetsLayout.LayoutParams.MATCH_PARENT);
+				rootView.addView(pagerUnit.getView(), InsetsLayout.LayoutParams.MATCH_PARENT,
+						InsetsLayout.LayoutParams.MATCH_PARENT);
 				pagerUnit.addAndInitViews(rootView, imagePosition);
 			}
 			newImagePosition = imagePosition;
 		}
 
 		if (instance.galleryItems.isEmpty()) {
-			View errorView = getLayoutInflater().inflate(R.layout.widget_error, rootView, false);
-			TextView textView = errorView.findViewById(R.id.error_text);
-			textView.setText(R.string.gallery_is_empty);
-			rootView.addView(errorView);
+			ViewFactory.ErrorHolder errorHolder = ViewFactory.createErrorLayout(rootView);
+			errorHolder.text.setText(R.string.gallery_is_empty);
+			rootView.addView(errorHolder.layout);
 		} else {
 			if (savedInstanceState != null && savedInstanceState.containsKey(EXTRA_GALLERY_MODE)) {
 				galleryMode = savedInstanceState.getBoolean(EXTRA_GALLERY_MODE);
 				galleryWindow = savedInstanceState.getBoolean(EXTRA_GALLERY_WINDOW);
 				switchMode(galleryMode, false);
-				modifySystemUiVisibility(GalleryInstance.FLAG_LOCKED_USER,
+				modifySystemUiVisibility(GalleryInstance.Flags.LOCKED_USER,
 						savedInstanceState.getBoolean(EXTRA_SYSTEM_UI_VISIBILITY));
 			} else if (newImagePosition != null) {
 				int imagePosition = newImagePosition;
@@ -289,8 +310,16 @@ public class GalleryOverlay extends DialogFragment implements ActivityHandler, G
 		if (titleSubtitle != null) {
 			dialog.setTitleSubtitle(titleSubtitle.first, titleSubtitle.second);
 		}
+		if (C.API_LOLLIPOP) {
+			Window window = getWindow();
+			if (window != null) {
+				int color = ACTION_BAR_COLOR;
+				window.setStatusBarColor(color);
+				window.setNavigationBarColor(color);
+				ViewUtils.setWindowLayoutFullscreen(window);
+			}
+		}
 		setScreenOnFixed(screenOnFixed);
-		applyStatusNavigationTranslucency();
 		invalidateSystemUiVisibility();
 	}
 
@@ -342,7 +371,8 @@ public class GalleryOverlay extends DialogFragment implements ActivityHandler, G
 	@Override
 	public boolean onBackPressed() {
 		if (showcaseDestroy != null) {
-			showcaseDestroy.destroy(true);
+			showcaseDestroy.run();
+			showcaseDestroy = null;
 			return true;
 		}
 		return returnToGallery();
@@ -383,14 +413,14 @@ public class GalleryOverlay extends DialogFragment implements ActivityHandler, G
 
 	@Override
 	public boolean onOptionsItemSelected(@NonNull MenuItem item) {
-		GalleryItem galleryItem = pagerUnit != null ? pagerUnit.getCurrentGalleryItem() : null;
+		PagerInstance.ViewHolder holder = pagerUnit != null ? pagerUnit.getCurrentHolder() : null;
 		switch (item.getItemId()) {
 			case android.R.id.home: {
 				dismiss();
 				break;
 			}
 			case R.id.menu_save: {
-				downloadGalleryItem(galleryItem);
+				downloadGalleryItem(holder.galleryItem);
 				break;
 			}
 			case R.id.menu_refresh: {
@@ -412,15 +442,10 @@ public class GalleryOverlay extends DialogFragment implements ActivityHandler, G
 	}
 
 	@Override
-	public ConfigurationLock getConfigurationLock() {
-		return ((FragmentHandler) requireActivity()).getConfigurationLock();
-	}
-
-	@Override
 	public void downloadGalleryItem(GalleryItem galleryItem) {
 		DownloadService.Binder binder = ((FragmentHandler) requireActivity()).getDownloadBinder();
 		if (binder != null) {
-			galleryItem.downloadStorage(binder, instance.locator, getThreadTitle());
+			galleryItem.downloadStorage(binder, Chan.get(instance.chanName), getThreadTitle());
 		}
 	}
 
@@ -428,21 +453,22 @@ public class GalleryOverlay extends DialogFragment implements ActivityHandler, G
 	public void downloadGalleryItems(List<GalleryItem> galleryItems) {
 		String boardName = null;
 		String threadNumber = null;
+		Chan chan = Chan.get(instance.chanName);
 		ArrayList<DownloadService.RequestItem> requestItems = new ArrayList<>();
 		for (GalleryItem galleryItem : galleryItems) {
 			if (requestItems.size() == 0) {
 				boardName = galleryItem.boardName;
 				threadNumber = galleryItem.threadNumber;
 			} else if (boardName != null || threadNumber != null) {
-				if (!StringUtils.equals(boardName, galleryItem.boardName) ||
-						!StringUtils.equals(threadNumber, galleryItem.threadNumber)) {
+				if (!CommonUtils.equals(boardName, galleryItem.boardName) ||
+						!CommonUtils.equals(threadNumber, galleryItem.threadNumber)) {
 					// Images from different threads, so don't use them to mark files and folders
 					boardName = null;
 					threadNumber = null;
 				}
 			}
-			requestItems.add(new DownloadService.RequestItem(galleryItem.getFileUri(instance.locator),
-					galleryItem.getFileName(instance.locator), galleryItem.originalName));
+			requestItems.add(new DownloadService.RequestItem(galleryItem.getFileUri(chan),
+					galleryItem.getFileName(chan), galleryItem.originalName));
 		}
 		if (requestItems.size() > 0) {
 			DownloadService.Binder binder = ((FragmentHandler) requireActivity()).getDownloadBinder();
@@ -466,7 +492,7 @@ public class GalleryOverlay extends DialogFragment implements ActivityHandler, G
 		outState.putBoolean(EXTRA_GALLERY_WINDOW, galleryWindow);
 		outState.putBoolean(EXTRA_GALLERY_MODE, galleryMode);
 		outState.putBoolean(EXTRA_SYSTEM_UI_VISIBILITY,
-				FlagUtils.get(systemUiVisibilityFlags, GalleryInstance.FLAG_LOCKED_USER));
+				FlagUtils.get(systemUiVisibilityFlags, GalleryInstance.Flags.LOCKED_USER));
 	}
 
 	private static final int GALLERY_TRANSITION_DURATION = 150;
@@ -481,7 +507,7 @@ public class GalleryOverlay extends DialogFragment implements ActivityHandler, G
 					.getQuantityString(R.plurals.number_files__format, count, count));
 			titleSubtitle = null;
 		}
-		modifySystemUiVisibility(GalleryInstance.FLAG_LOCKED_GRID, galleryMode);
+		modifySystemUiVisibility(GalleryInstance.Flags.LOCKED_GRID, galleryMode);
 		this.galleryMode = galleryMode;
 		if (galleryMode) {
 			new CornerAnimator(0xa0, 0xc0);
@@ -552,22 +578,24 @@ public class GalleryOverlay extends DialogFragment implements ActivityHandler, G
 
 	@Override
 	public void updateTitle() {
-		GalleryItem galleryItem = pagerUnit.getCurrentGalleryItem();
-		if (galleryItem != null) {
-			setTitle(galleryItem, pagerUnit.getCurrentIndex(), galleryItem.size);
+		PagerInstance.ViewHolder holder = pagerUnit.getCurrentHolder();
+		if (holder != null && holder.galleryItem != null) {
+			setTitle(holder.galleryItem, holder.mediaSummary, pagerUnit.getCurrentIndex());
 		}
 	}
 
-	private void setTitle(GalleryItem galleryItem, int position, int size) {
-		String fileName = galleryItem.getFileName(instance.locator);
-		String originalName = galleryItem.originalName;
-		if (originalName != null) {
-			fileName = originalName;
+	private void setTitle(GalleryItem galleryItem, PagerInstance.MediaSummary mediaSummary, int position) {
+		String fileName = galleryItem.getFileName(Chan.get(instance.chanName));
+		if (!StringUtils.isEmpty(galleryItem.originalName)) {
+			fileName = galleryItem.originalName;
 		}
 		int count = instance.galleryItems.size();
 		StringBuilder builder = new StringBuilder().append(position + 1).append('/').append(count);
-		if (size > 0) {
-			builder.append(", ").append(StringUtils.formatFileSize(size, false));
+		if (mediaSummary.width > 0 && mediaSummary.height > 0) {
+			builder.append(", ").append(mediaSummary.width).append('×').append(mediaSummary.height);
+		}
+		if (mediaSummary.size > 0) {
+			builder.append(", ").append(StringUtils.formatFileSize(mediaSummary.size, false));
 		}
 		titleSubtitle = new Pair<>(fileName, builder);
 		GalleryDialog dialog = getDialog();
@@ -647,17 +675,8 @@ public class GalleryOverlay extends DialogFragment implements ActivityHandler, G
 		return galleryMode;
 	}
 
-	private void applyStatusNavigationTranslucency() {
-		if (C.API_LOLLIPOP) {
-			Window window = getWindow();
-			if (window != null) {
-				int color = ACTION_BAR_COLOR;
-				window.setStatusBarColor(color);
-				window.setNavigationBarColor(color);
-				window.getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-						| View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
-			}
-		}
+	private void postInvalidateSystemUIVisibility() {
+		rootView.post(this::invalidateSystemUiVisibility);
 	}
 
 	private void invalidateSystemUiVisibility() {
@@ -671,13 +690,7 @@ public class GalleryOverlay extends DialogFragment implements ActivityHandler, G
 			} else {
 				actionBar.hide();
 			}
-			if (C.API_LOLLIPOP) {
-				View decorView = getWindow().getDecorView();
-				int visibility = decorView.getSystemUiVisibility();
-				visibility = FlagUtils.set(visibility, View.SYSTEM_UI_FLAG_FULLSCREEN |
-						View.SYSTEM_UI_FLAG_IMMERSIVE | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION, !visible);
-				decorView.setSystemUiVisibility(visibility);
-			}
+			invalidateSystemUiFlags();
 			if (pagerUnit != null) {
 				pagerUnit.invalidateControlsVisibility();
 				if (changed) {
@@ -687,8 +700,31 @@ public class GalleryOverlay extends DialogFragment implements ActivityHandler, G
 		}
 	}
 
-	private void postInvalidateSystemUIVisibility() {
-		rootView.post(this::invalidateSystemUiVisibility);
+	private void invalidateSystemUiFlags() {
+		if (C.API_LOLLIPOP) {
+			boolean visible = isSystemUiVisible();
+			Window window = getWindow();
+			if (C.API_R) {
+				WindowInsetsController controller = window.getInsetsController();
+				controller.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+				if (visible) {
+					controller.show(WindowInsets.Type.systemBars());
+				} else {
+					controller.hide(WindowInsets.Type.systemBars());
+				}
+			} else {
+				View decorView = window.getDecorView();
+				@SuppressWarnings("deprecation")
+				Runnable runnable = () -> {
+					@SuppressWarnings("deprecation")
+					int visibility = decorView.getSystemUiVisibility();
+					visibility = FlagUtils.set(visibility, View.SYSTEM_UI_FLAG_FULLSCREEN |
+							View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION, !visible);
+					decorView.setSystemUiVisibility(visibility);
+				};
+				runnable.run();
+			}
+		}
 	}
 
 	@Override
@@ -707,24 +743,7 @@ public class GalleryOverlay extends DialogFragment implements ActivityHandler, G
 		modifySystemUiVisibility(flag, !FlagUtils.get(systemUiVisibilityFlags, flag));
 	}
 
-	@Override
-	public void onApplyWindowPaddings(WindowControlFrameLayout view, Rect rect) {
-		if (listUnit != null) {
-			boolean invalidate = listUnit.onApplyWindowPaddings(rect);
-			if (invalidate) {
-				postInvalidateSystemUIVisibility();
-			}
-		}
-		if (pagerUnit != null) {
-			pagerUnit.onApplyWindowPaddings(rect);
-		}
-	}
-
-	private interface ShowcaseDestroy {
-		void destroy(boolean consume);
-	}
-
-	private ShowcaseDestroy showcaseDestroy;
+	private Runnable showcaseDestroy;
 
 	private void displayShowcase() {
 		if (showcaseDestroy != null || !Preferences.isShowcaseGalleryEnabled() ||
@@ -757,7 +776,7 @@ public class GalleryOverlay extends DialogFragment implements ActivityHandler, G
 		for (int i = 0; i < titles.length; i++) {
 			TextView textView1 = new TextView(context, null, android.R.attr.textAppearanceLarge);
 			textView1.setText(titles[i]);
-			textView1.setTypeface(GraphicsUtils.TYPEFACE_LIGHT);
+			textView1.setTypeface(ResourceUtils.TYPEFACE_LIGHT);
 			textView1.setPadding(paddingLeft, paddingTop, paddingRight, (int) (4f * density));
 			TextView textView2 = new TextView(context, null, android.R.attr.textAppearanceSmall);
 			textView2.setText(messages[i]);
@@ -783,14 +802,11 @@ public class GalleryOverlay extends DialogFragment implements ActivityHandler, G
 		}
 		windowManager.addView(frameLayout, layoutParams);
 
-		showcaseDestroy = consume -> {
+		showcaseDestroy = () -> windowManager.removeView(frameLayout);
+		button.setOnClickListener(v -> {
+			Preferences.consumeShowcaseGallery();
+			showcaseDestroy.run();
 			showcaseDestroy = null;
-			if (consume) {
-				Preferences.consumeShowcaseGallery();
-			}
-			windowManager.removeView(frameLayout);
-		};
-
-		button.setOnClickListener(v -> showcaseDestroy.destroy(true));
+		});
 	}
 }

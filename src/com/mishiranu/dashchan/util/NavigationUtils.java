@@ -13,6 +13,7 @@ import android.net.Uri;
 import android.os.SystemClock;
 import android.provider.Browser;
 import android.util.Pair;
+import chan.content.Chan;
 import chan.content.ChanLocator;
 import chan.content.ChanManager;
 import chan.http.CookieBuilder;
@@ -27,6 +28,7 @@ import com.mishiranu.dashchan.content.net.RelayBlockResolver;
 import com.mishiranu.dashchan.content.service.AudioPlayerService;
 import com.mishiranu.dashchan.media.VideoPlayer;
 import com.mishiranu.dashchan.ui.MainActivity;
+import com.mishiranu.dashchan.widget.ClickableToast;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -34,62 +36,13 @@ import java.util.List;
 import java.util.Map;
 
 public class NavigationUtils {
-	public static final int FLAG_FROM_CACHE = 0x00000001;
-	public static final int FLAG_RETURNABLE = 0x00000002;
-
-	private static Intent obtainMainIntent(Context context, int flags, int allowFlags) {
-		return new Intent().setComponent(new ComponentName(context, MainActivity.class))
-				.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP)
-				.putExtra(C.EXTRA_NAVIGATION_FLAGS, flags & allowFlags);
-	}
-
-	public static Intent obtainThreadsIntent(Context context, String chanName, String boardName, int flags) {
-		int allowFlags = FLAG_FROM_CACHE | FLAG_RETURNABLE;
-		return obtainMainIntent(context, flags, allowFlags).putExtra(C.EXTRA_CHAN_NAME, chanName)
-				.putExtra(C.EXTRA_BOARD_NAME, boardName);
-	}
-
-	public static Intent obtainPostsIntent(Context context, String chanName, String boardName, String threadNumber,
-			String postNumber, int flags) {
-		int allowFlags = FLAG_FROM_CACHE | FLAG_RETURNABLE;
-		return obtainMainIntent(context, flags, allowFlags).putExtra(C.EXTRA_CHAN_NAME, chanName)
-				.putExtra(C.EXTRA_BOARD_NAME, boardName).putExtra(C.EXTRA_THREAD_NUMBER, threadNumber)
-				.putExtra(C.EXTRA_POST_NUMBER, postNumber);
-	}
-
-	public static Intent obtainSearchIntent(Context context, String chanName, String boardName, String searchQuery,
-			int flags) {
-		@SuppressWarnings("UnnecessaryLocalVariable")
-		int allowFlags = FLAG_RETURNABLE;
-		return obtainMainIntent(context, flags, allowFlags).putExtra(C.EXTRA_CHAN_NAME, chanName)
-				.putExtra(C.EXTRA_BOARD_NAME, boardName).putExtra(C.EXTRA_SEARCH_QUERY, searchQuery);
-	}
-
-	public static Intent obtainTargetIntent(Context context, String chanName, ChanLocator.NavigationData data,
-			int flags) {
-		switch (data.target) {
-			case ChanLocator.NavigationData.TARGET_THREADS: {
-				return obtainThreadsIntent(context, chanName, data.boardName, flags);
-			}
-			case ChanLocator.NavigationData.TARGET_POSTS: {
-				return obtainPostsIntent(context, chanName, data.boardName, data.threadNumber, data.postNumber, flags);
-			}
-			case ChanLocator.NavigationData.TARGET_SEARCH: {
-				return obtainSearchIntent(context, chanName, data.boardName, data.searchQuery, flags);
-			}
-			default: {
-				throw new IllegalStateException();
-			}
-		}
-	}
-
 	public enum BrowserType {AUTO, INTERNAL, EXTERNAL}
 
 	public static void handleUri(Context context, String chanName, Uri uri, BrowserType browserType) {
 		if (chanName != null) {
-			uri = ChanLocator.get(chanName).convert(uri);
+			uri = Chan.get(chanName).locator.convert(uri);
 		}
-		boolean isWeb = ChanLocator.getDefault().isWebScheme(uri);
+		boolean isWeb = Chan.getFallback().locator.isWebScheme(uri);
 		Intent intent;
 		boolean internalBrowser = isWeb && (browserType == BrowserType.INTERNAL || browserType == BrowserType.AUTO &&
 				Preferences.isUseInternalBrowser());
@@ -121,17 +74,20 @@ public class NavigationUtils {
 			intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
 			intent.putExtra(Browser.EXTRA_APPLICATION_ID, context.getPackageName());
 			intent.putExtra(C.EXTRA_FROM_CLIENT, true);
-			if (chanName != null && ChanLocator.get(chanName).safe(false).isAttachmentUri(uri)) {
-				Map<String, String> cookies = RelayBlockResolver.getInstance().getCookies(chanName);
-				if (!cookies.isEmpty()) {
-					// For MX Player, see https://sites.google.com/site/mxvpen/api
-					String userAgent = AdvancedPreferences.getUserAgent(chanName);
-					CookieBuilder cookieBuilder = new CookieBuilder();
-					for (Map.Entry<String, String> cookie : cookies.entrySet()) {
-						cookieBuilder.append(cookie.getKey(), cookie.getValue());
+			if (chanName != null) {
+				Chan chan = Chan.get(chanName);
+				if (chan.locator.safe(false).isAttachmentUri(uri)) {
+					Map<String, String> cookies = RelayBlockResolver.getInstance().getCookies(chan);
+					if (!cookies.isEmpty()) {
+						// For MX Player, see https://sites.google.com/site/mxvpen/api
+						String userAgent = AdvancedPreferences.getUserAgent(chanName);
+						CookieBuilder cookieBuilder = new CookieBuilder();
+						for (Map.Entry<String, String> cookie : cookies.entrySet()) {
+							cookieBuilder.append(cookie.getKey(), cookie.getValue());
+						}
+						intent.putExtra("headers", new String[] {"User-Agent", userAgent,
+								"Cookie", cookieBuilder.build()});
 					}
-					intent.putExtra("headers", new String[] {"User-Agent", userAgent,
-							"Cookie", cookieBuilder.build()});
 				}
 			}
 			if (!isWeb) {
@@ -141,18 +97,18 @@ public class NavigationUtils {
 		try {
 			context.startActivity(intent);
 		} catch (ActivityNotFoundException e) {
-			ToastUtils.show(context, R.string.unknown_address);
+			ClickableToast.show(R.string.unknown_address);
 		} catch (Exception e) {
-			ToastUtils.show(context, e.getMessage());
+			ClickableToast.show(e.getMessage());
 		}
 	}
 
 	public static void handleUriInternal(Context context, String chanName, Uri uri) {
-		String uriChanName = ChanManager.getInstance().getChanNameByHost(uri.getAuthority());
-		if (uriChanName != null) {
-			chanName = uriChanName;
+		Chan uriChan = Chan.getPreferred(null, uri);
+		if (uriChan.name != null) {
+			chanName = uriChan.name;
 		}
-		ChanLocator locator = ChanLocator.get(chanName);
+		ChanLocator locator = Chan.getFallback().locator;
 		boolean handled = false;
 		if (chanName != null && locator.safe(false).isAttachmentUri(uri)) {
 			Uri internalUri = locator.convert(uri);
@@ -188,30 +144,6 @@ public class NavigationUtils {
 	public static boolean isOpenableVideoExtension(String extension) {
 		return Preferences.isUseVideoPlayer() && VideoPlayer.isLoaded() &
 				C.OPENABLE_VIDEO_EXTENSIONS.contains(extension);
-	}
-
-	public static void searchImage(Context context, ConfigurationLock configurationLock,
-			final String chanName, Uri uri) {
-		ChanLocator locator = ChanLocator.getDefault();
-		final String imageUriString = ChanLocator.get(chanName).convert(uri).toString();
-		new DialogMenu(context)
-				.add("Google", () -> searchImageUri(context, locator.buildQueryWithHost("www.google.com",
-						"searchbyimage", "image_url", imageUriString)))
-				.add("Yandex", () -> searchImageUri(context, locator.buildQueryWithHost("yandex.ru",
-						"images/search", "rpt", "imageview", "img_url", imageUriString)))
-				.add("TinEye", () -> searchImageUri(context, locator.buildQueryWithHost("www.tineye.com",
-						"search", "url", imageUriString)))
-				.add("SauceNAO", () -> searchImageUri(context, locator.buildQueryWithHost("saucenao.com",
-						"search.php", "url", imageUriString)))
-				.add("iqdb.org", () -> searchImageUri(context, locator.buildQueryWithHost("iqdb.org",
-						"/", "url", imageUriString)))
-				.add("trace.moe", () -> searchImageUri(context, locator.buildQueryWithHost("trace.moe",
-						"/", "url", imageUriString)))
-				.show(configurationLock);
-	}
-
-	private static void searchImageUri(Context context, Uri searchUri) {
-		handleUri(context, null, searchUri, BrowserType.EXTERNAL);
 	}
 
 	public static void shareText(Context context, String subject, String text, Uri uri) {
@@ -252,7 +184,7 @@ public class NavigationUtils {
 	public static void shareFile(Context context, File file, String fileName) {
 		Pair<Uri, String> data = CacheManager.getInstance().prepareFileForShare(file, fileName);
 		if (data == null) {
-			ToastUtils.show(context, R.string.cache_is_unavailable);
+			ClickableToast.show(R.string.cache_is_unavailable);
 			return;
 		}
 		context.startActivity(Intent.createChooser(new Intent(Intent.ACTION_SEND)
@@ -261,12 +193,6 @@ public class NavigationUtils {
 	}
 
 	public static void restartApplication(Context context) {
-		try {
-			CacheManager.getInstance().waitSerializationFinished();
-		} catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
-			return;
-		}
 		Intent intent = new Intent(context, MainActivity.class)
 				.setAction(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
 				.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);

@@ -21,6 +21,7 @@
 		<item name="iconActionSearch">@drawable/ic_action_search_dark</item>
 		<item name="iconActionSelect">@drawable/ic_action_view_as_grid_dark</item>
 		<item name="iconActionSelectAll">@drawable/ic_action_select_all_dark</item>
+		<item name="iconActionSync">@drawable/ic_action_refresh_dark</item>
 		<item name="iconActionVolumeOff">@drawable/ic_action_volume_muted_dark</item>
 
 		<item name="iconButtonCancel">@drawable/ic_action_cancel_light</item>
@@ -77,6 +78,7 @@
 		<item name="iconActionSearch">@drawable/ic_action_search_dark</item>
 		<item name="iconActionSelect">@drawable/ic_action_view_as_grid_dark</item>
 		<item name="iconActionSelectAll">@drawable/ic_action_select_all_dark</item>
+		<item name="iconActionSync">@drawable/ic_action_refresh_dark</item>
 		<item name="iconActionVolumeOff">@drawable/ic_action_volume_muted_dark</item>
 
 		<item name="iconButtonCancel">@drawable/ic_action_cancel_dark</item>
@@ -114,6 +116,8 @@
 
 	<style name="Theme.Main.Light" parent="@style/Theme.Base.Main.Light">
 
+		<item name="overlayTheme">@style/Theme.Overlay.Light</item>
+
 		<item name="android:colorBackground">@color/background_popup_light</item>
 		<item name="colorWindowBackground">@color/background_window_light</item>
 		<item name="colorBlockBackground">@color/background_block_light</item>
@@ -140,6 +144,8 @@
 
 	<style name="Theme.Main.Dark" parent="@style/Theme.Base.Main.Dark">
 
+		<item name="overlayTheme">@style/Theme.Overlay.Dark</item>
+
 		<item name="android:colorBackground">@color/background_popup_dark</item>
 		<item name="colorWindowBackground">@color/background_window_dark</item>
 		<item name="colorBlockBackground">@color/background_block_dark</item>
@@ -164,10 +170,18 @@
 
 	</style>
 
-	<style name="Theme.Extended.Gallery" parent="@style/Theme.Main.Dark">
+	<style name="Widget.Gallery.ActionBar" parent="@android:style/Widget.Holo.ActionBar">
 
+		<item name="android:background">@android:color/transparent</item>
+
+	</style>
+
+	<style name="Theme.Overlay.Dark" parent="@style/Theme.Main.Dark">
+
+		<item name="isOverlay">true</item>
+		<item name="android:windowNoTitle">true</item>
 		<item name="android:windowBackground">@android:color/transparent</item>
-		<item name="android:windowActionBarOverlay">true</item>
+		<item name="android:windowActionModeOverlay">true</item>
 		<item name="android:colorBackgroundCacheHint">@null</item>
 		<item name="android:windowFrame">@null</item>
 		<item name="android:windowContentOverlay">@null</item>
@@ -176,21 +190,34 @@
 
 	</style>
 
-	<style name="Theme.Gallery" parent="@style/Theme.Extended.Gallery">
+	<style name="Theme.Overlay.Light" parent="@style/Theme.Main.Light">
 
+		<item name="isOverlay">true</item>
+		<item name="android:windowNoTitle">true</item>
+		<item name="android:windowBackground">@android:color/transparent</item>
+		<item name="android:windowActionModeOverlay">true</item>
+		<item name="android:colorBackgroundCacheHint">@null</item>
+		<item name="android:windowFrame">@null</item>
+		<item name="android:windowContentOverlay">@null</item>
+		<item name="android:windowAnimationStyle">@null</item>
+		<item name="android:windowIsTranslucent">true</item>
+
+	</style>
+
+	<style name="Theme.Extended.Gallery" parent="@style/Theme.Overlay.Dark">
+
+		<item name="android:windowNoTitle">false</item>
+		<item name="android:windowActionBarOverlay">true</item>
+		<item name="android:windowActionModeOverlay">false</item>
 		<item name="android:actionBarStyle">@style/Widget.Gallery.ActionBar</item>
 
 	</style>
 
+	<style name="Theme.Gallery" parent="@style/Theme.Extended.Gallery" />
+
 	<style name="Theme.Launcher" parent="@android:style/Theme.Holo.NoActionBar">
 
 		<item name="android:windowBackground">@color/background_window_dark</item>
-
-	</style>
-
-	<style name="Widget.Gallery.ActionBar" parent="@android:style/Widget.Holo.ActionBar">
-
-		<item name="android:background">@android:color/transparent</item>
 
 	</style>
 
@@ -212,7 +239,6 @@
 		<item name="android:paddingBottom">8dp</item>
 		<item name="android:textAllCaps">true</item>
 		<item name="android:textSize">11sp</item>
-		<item name="android:fontFamily">sans-serif-medium</item>
 		<item name="android:textColor">?attr/colorTextMeta</item>
 		<item name="android:tag">theme.textColor=meta</item>
 

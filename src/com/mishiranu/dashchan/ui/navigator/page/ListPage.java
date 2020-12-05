@@ -9,38 +9,56 @@ import android.view.ActionMode;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
-import chan.content.ChanConfiguration;
-import chan.content.ChanLocator;
+import androidx.annotation.NonNull;
+import androidx.fragment.app.Fragment;
+import androidx.fragment.app.FragmentManager;
+import androidx.lifecycle.Lifecycle;
+import androidx.lifecycle.LifecycleOwner;
+import androidx.lifecycle.LifecycleRegistry;
+import androidx.lifecycle.ViewModel;
+import androidx.lifecycle.ViewModelProvider;
+import chan.content.Chan;
+import com.mishiranu.dashchan.content.model.ErrorItem;
+import com.mishiranu.dashchan.content.model.PostNumber;
+import com.mishiranu.dashchan.ui.InstanceDialog;
 import com.mishiranu.dashchan.ui.navigator.Page;
 import com.mishiranu.dashchan.ui.navigator.manager.UiManager;
+import com.mishiranu.dashchan.util.ResourceUtils;
 import com.mishiranu.dashchan.widget.ListPosition;
-import com.mishiranu.dashchan.widget.PullableRecyclerView;
+import com.mishiranu.dashchan.widget.PaddedRecyclerView;
 import com.mishiranu.dashchan.widget.PullableWrapper;
+import java.lang.ref.WeakReference;
+import java.util.Objects;
 
-public abstract class ListPage implements PullableWrapper.PullCallback {
-	private enum State {INIT, LOCKED, RESUMED, PAUSED, DESTROYED}
-
-	public enum ViewType {LIST, PROGRESS, ERROR}
-
-	public interface IconProvider {
-		Drawable get(int attr);
-	}
-
+public abstract class ListPage implements LifecycleOwner, PullableWrapper.PullCallback {
 	public interface ExtraFactory<T> {
 		T newExtra();
+	}
+
+	public interface Retainable {
+		default void clear() {}
 	}
 
 	public static final class InitRequest {
 		private static final InitRequest EMPTY_REQUEST = new InitRequest(false, null, null);
 
 		public final boolean shouldLoad;
-		public final String postNumber;
+		public final PostNumber postNumber;
 		public final String threadTitle;
+		public final ErrorItem errorItem;
 
-		public InitRequest(boolean shouldLoad, String postNumber, String threadTitle) {
+		public InitRequest(boolean shouldLoad, PostNumber postNumber, String threadTitle) {
 			this.shouldLoad = shouldLoad;
 			this.postNumber = postNumber;
 			this.threadTitle = threadTitle;
+			errorItem = null;
+		}
+
+		public InitRequest(ErrorItem errorItem) {
+			shouldLoad = false;
+			postNumber = null;
+			threadTitle = null;
+			this.errorItem = errorItem;
 		}
 	}
 
@@ -56,45 +74,52 @@ public abstract class ListPage implements PullableWrapper.PullCallback {
 		}
 	}
 
-	public enum SearchSubmitResult {COLLAPSE, ACCEPT, DISCARD}
-
-	private Callback callback;
 	private Page page;
-	private PullableRecyclerView recyclerView;
+	private Callback callback;
+	private Fragment fragment;
+	private LifecycleRegistry lifecycle;
+	private PaddedRecyclerView recyclerView;
 	private ListPosition listPosition;
 	private UiManager uiManager;
-	private IconProvider iconProvider;
-	private Object retainExtra;
+	private Retainable retainableExtra;
 	private Parcelable parcelableExtra;
 	private InitRequest initRequest;
 	private InitSearch initSearch;
 
-	private State state = State.INIT;
-
-	public final void init(Callback callback, Page page, PullableRecyclerView recyclerView,
-			ListPosition listPosition, UiManager uiManager, IconProvider iconProvider,
-			Object retainExtra, Parcelable parcelableExtra, InitRequest initRequest, InitSearch initSearch) {
-		if (state == State.INIT) {
-			state = State.LOCKED;
+	public final void init(Page page, Callback callback, Fragment fragment, PaddedRecyclerView recyclerView,
+			ListPosition listPosition, UiManager uiManager, Retainable retainableExtra, Parcelable parcelableExtra,
+			InitRequest initRequest, InitSearch initSearch) {
+		if (lifecycle == null) {
+			lifecycle = new LifecycleRegistry(this);
 			this.callback = callback;
+			this.fragment = fragment;
 			this.page = page;
 			this.recyclerView = recyclerView;
 			this.listPosition = listPosition;
 			this.uiManager = uiManager;
-			this.iconProvider = iconProvider;
-			this.retainExtra = retainExtra;
+			this.retainableExtra = retainableExtra;
 			this.parcelableExtra = parcelableExtra;
 			this.initRequest = initRequest;
 			this.initSearch = initSearch;
+			getViewModel(fragment).update(this);
+			lifecycle.setCurrentState(Lifecycle.State.INITIALIZED);
 			onCreate();
+			lifecycle.setCurrentState(Lifecycle.State.STARTED);
 			this.initRequest = null;
 			this.initSearch = null;
-			state = State.PAUSED;
 		}
+	}
+
+	private Lifecycle.State getState() {
+		return lifecycle != null ? lifecycle.getCurrentState() : null;
 	}
 
 	protected final Context getContext() {
 		return recyclerView.getContext();
+	}
+
+	protected final Context getToolbarContext() {
+		return callback.getToolbarContext();
 	}
 
 	protected final Resources getResources() {
@@ -109,34 +134,40 @@ public abstract class ListPage implements PullableWrapper.PullCallback {
 		return getContext().getString(resId, formatArgs);
 	}
 
-	protected final String getQuantityString(int resId, int quantity, Object... formatArgs) {
-		return getResources().getQuantityString(resId, quantity, formatArgs);
-	}
-
 	protected final Page getPage() {
 		return page;
+	}
+
+	protected final FragmentManager getFragmentManager() {
+		return fragment.getChildFragmentManager();
+	}
+
+	protected final <T extends ViewModel> T getViewModel(Class<T> modelClass) {
+		return new ViewModelProvider(fragment).get(modelClass);
 	}
 
 	protected final UiManager getUiManager() {
 		return uiManager;
 	}
 
-	protected final ChanLocator getChanLocator() {
-		return ChanLocator.get(page.chanName);
+	protected final Chan getChan() {
+		return Chan.get(page.chanName);
 	}
 
-	protected final ChanConfiguration getChanConfiguration() {
-		return ChanConfiguration.get(page.chanName);
-	}
-
-	protected final PullableRecyclerView getRecyclerView() {
+	protected final PaddedRecyclerView getRecyclerView() {
 		return recyclerView;
 	}
 
+	protected final ListPosition takeListPosition() {
+		ListPosition listPosition = this.listPosition;
+		this.listPosition = null;
+		return listPosition;
+	}
+
 	protected final void restoreListPosition() {
+		ListPosition listPosition = takeListPosition();
 		if (listPosition != null) {
 			listPosition.apply(recyclerView);
-			listPosition = null;
 		}
 	}
 
@@ -154,7 +185,7 @@ public abstract class ListPage implements PullableWrapper.PullCallback {
 	}
 
 	protected final Drawable getActionBarIcon(int attr) {
-		return iconProvider != null ? iconProvider.get(attr) : null;
+		return ResourceUtils.getActionBarIcon(getToolbarContext(), attr);
 	}
 
 	protected final void notifyTitleChanged() {
@@ -162,7 +193,7 @@ public abstract class ListPage implements PullableWrapper.PullCallback {
 	}
 
 	protected final void updateOptionsMenu() {
-		if (state == State.RESUMED || state == State.PAUSED) {
+		if (isRunning()) {
 			callback.updateOptionsMenu();
 		}
 	}
@@ -171,32 +202,53 @@ public abstract class ListPage implements PullableWrapper.PullCallback {
 		callback.setCustomSearchView(view);
 	}
 
+	protected final void clearSearchFocus() {
+		callback.clearSearchFocus();
+	}
+
 	protected final ActionMode startActionMode(ActionMode.Callback callback) {
 		return this.callback.startActionMode(callback);
 	}
 
-	protected final void switchView(ViewType viewType, String message) {
-		callback.switchView(viewType, message);
+	protected final void switchList() {
+		callback.switchList();
 	}
 
-	protected final void switchView(ViewType viewType, int message) {
-		callback.switchView(viewType, message != 0 ? getString(message) : null);
+	protected final void switchProgress() {
+		callback.switchProgress();
+	}
+
+	protected final void switchError(ErrorItem errorItem) {
+		callback.switchError(errorItem != null ? errorItem : new ErrorItem(ErrorItem.Type.UNKNOWN));
+	}
+
+	protected final void switchError(String message) {
+		callback.switchError(message != null ? new ErrorItem(message) : new ErrorItem(ErrorItem.Type.UNKNOWN));
+	}
+
+	protected final void switchError(int message) {
+		callback.switchError(message != 0 ? new ErrorItem(message) : new ErrorItem(ErrorItem.Type.UNKNOWN));
 	}
 
 	protected final void showScaleAnimation() {
 		callback.showScaleAnimation();
 	}
 
-	protected final void handleRedirect(String chanName, String boardName, String threadNumber, String postNumber) {
+	protected final void handleRedirect(String chanName,
+			String boardName, String threadNumber, PostNumber postNumber) {
 		callback.handleRedirect(chanName, boardName, threadNumber, postNumber);
 	}
 
+	protected final void closePage() {
+		callback.closePage();
+	}
+
 	@SuppressWarnings("unchecked")
-	protected final <T> T getRetainExtra(ExtraFactory<T> factory) {
-		if (retainExtra == null && factory != null) {
-			retainExtra = factory.newExtra();
+	protected final <T extends Retainable> T getRetainableExtra(ExtraFactory<T> factory) {
+		if (retainableExtra == null && factory != null) {
+			retainableExtra = factory.newExtra();
 		}
-		return (T) retainExtra;
+		return (T) retainableExtra;
 	}
 
 	@SuppressWarnings("unchecked")
@@ -219,12 +271,16 @@ public abstract class ListPage implements PullableWrapper.PullCallback {
 
 	protected void onHandleNewPostDataList() {}
 
-	protected void onScrollToPost(String postNumber) {}
+	protected void onScrollToPost(PostNumber postNumber) {}
 
 	protected void onRequestStoreExtra(boolean saveToStack) {}
 
 	public String obtainTitle() {
 		return null;
+	}
+
+	public Pair<String, String> obtainTitleSubtitle() {
+		return new Pair<>(obtainTitle(), null);
 	}
 
 	public void onCreateOptionsMenu(Menu menu) {}
@@ -239,8 +295,8 @@ public abstract class ListPage implements PullableWrapper.PullCallback {
 
 	public void onSearchQueryChange(String query) {}
 
-	public SearchSubmitResult onSearchSubmit(String query) {
-		return SearchSubmitResult.DISCARD;
+	public boolean onSearchSubmit(String query) {
+		return false;
 	}
 
 	public void onSearchCancel() {}
@@ -252,14 +308,11 @@ public abstract class ListPage implements PullableWrapper.PullCallback {
 		return 0;
 	}
 
-	public void updatePageConfiguration(String postNumber) {}
+	public void updatePageConfiguration(PostNumber postNumber) {}
 
 	public final boolean isRunning() {
-		return state == State.RESUMED || state == State.PAUSED;
-	}
-
-	public final boolean isDestroyed() {
-		return state == State.DESTROYED;
+		Lifecycle.State state = getState();
+		return state == Lifecycle.State.STARTED || state == Lifecycle.State.RESUMED;
 	}
 
 	private void performResume() {
@@ -268,57 +321,88 @@ public abstract class ListPage implements PullableWrapper.PullCallback {
 	}
 
 	public final void resume() {
-		if (state == State.PAUSED) {
-			state = State.RESUMED;
+		if (getState() == Lifecycle.State.STARTED) {
+			lifecycle.setCurrentState(Lifecycle.State.RESUMED);
 			performResume();
 		}
 	}
 
 	public final void pause() {
-		if (state == State.RESUMED) {
-			state = State.PAUSED;
+		if (getState() == Lifecycle.State.RESUMED) {
+			lifecycle.setCurrentState(Lifecycle.State.STARTED);
 			onPause();
 		}
 	}
 
-	public final void cleanup() {
-		if (state == State.RESUMED || state == State.PAUSED) {
-			if (state == State.RESUMED) {
+	public final void destroy() {
+		if (isRunning()) {
+			if (getState() == Lifecycle.State.RESUMED) {
+				lifecycle.setCurrentState(Lifecycle.State.STARTED);
 				onPause();
 			}
-			state = State.DESTROYED;
+			lifecycle.setCurrentState(Lifecycle.State.DESTROYED);
 			onDestroy();
 		}
 	}
 
 	public final void handleNewPostDataListNow() {
-		if (state == State.RESUMED) {
+		if (getState() == Lifecycle.State.RESUMED) {
 			onHandleNewPostDataList();
 		}
 	}
 
-	public final void handleScrollToPost(String postNumber) {
-		if (state == State.RESUMED) {
+	public final void handleScrollToPost(PostNumber postNumber) {
+		if (getState() == Lifecycle.State.RESUMED) {
 			onScrollToPost(postNumber);
 		}
 	}
 
 	public final ListPosition getListPosition() {
-		return listPosition != null ? listPosition : ListPosition.obtain(recyclerView);
+		return listPosition != null ? listPosition : ListPosition.obtain(recyclerView, null);
 	}
 
-	public final Pair<Object, Parcelable> getExtraToStore(boolean saveToStack) {
+	public final Pair<Retainable, Parcelable> getExtraToStore(boolean saveToStack) {
 		onRequestStoreExtra(saveToStack);
-		return new Pair<>(retainExtra, parcelableExtra);
+		return new Pair<>(retainableExtra, parcelableExtra);
+	}
+
+	@NonNull
+	@Override
+	public final Lifecycle getLifecycle() {
+		return Objects.requireNonNull(lifecycle);
+	}
+
+	public static class PageViewModel extends ViewModel {
+		private WeakReference<ListPage> listPage;
+
+		public void update(ListPage listPage) {
+			this.listPage = listPage != null ? new WeakReference<>(listPage) : null;
+		}
+	}
+
+	private static PageViewModel getViewModel(Fragment fragment) {
+		return new ViewModelProvider(fragment).get(PageViewModel.class);
+	}
+
+	@SuppressWarnings("unchecked")
+	protected static <T extends ListPage> T extract(InstanceDialog.Provider provider) {
+		PageViewModel viewModel = getViewModel(provider.getParentFragment());
+		ListPage listPage = viewModel.listPage != null ? viewModel.listPage.get() : null;
+		return (T) listPage;
 	}
 
 	public interface Callback {
 		void notifyTitleChanged();
 		void updateOptionsMenu();
 		void setCustomSearchView(View view);
+		void clearSearchFocus();
+		Context getToolbarContext();
 		ActionMode startActionMode(ActionMode.Callback callback);
-		void switchView(ViewType viewType, String message);
+		void switchList();
+		void switchProgress();
+		void switchError(ErrorItem errorItem);
 		void showScaleAnimation();
-		void handleRedirect(String chanName, String boardName, String threadNumber, String postNumber);
+		void handleRedirect(String chanName, String boardName, String threadNumber, PostNumber postNumber);
+		void closePage();
 	}
 }

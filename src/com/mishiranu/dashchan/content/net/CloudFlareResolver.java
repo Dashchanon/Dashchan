@@ -2,10 +2,10 @@ package com.mishiranu.dashchan.content.net;
 
 import android.net.Uri;
 import android.os.Parcel;
-import chan.content.ChanConfiguration;
-import chan.content.ChanLocator;
+import chan.content.Chan;
 import chan.http.HttpException;
 import chan.http.HttpHolder;
+import chan.http.HttpResponse;
 import chan.util.StringUtils;
 import com.mishiranu.dashchan.R;
 import com.mishiranu.dashchan.content.MainApplication;
@@ -29,6 +29,16 @@ public class CloudFlareResolver {
 
 	private CloudFlareResolver() {}
 
+	private static class CookieResult {
+		public final String cookie;
+		public final String uriString;
+
+		public CookieResult(String cookie, String uriString) {
+			this.cookie = cookie;
+			this.uriString = uriString;
+		}
+	}
+
 	private static class Extra implements WebViewExtra {
 		@Override
 		public String getInjectJavascript() {
@@ -49,11 +59,11 @@ public class CloudFlareResolver {
 		};
 	}
 
-	private class Client implements RelayBlockResolver.Client {
+	private static class WebViewClient implements RelayBlockResolver.WebViewClient<CookieResult> {
 		private final Extra extra = new Extra();
 		private final String title;
 
-		public Client(String title) {
+		public WebViewClient(String title) {
 			this.title = title;
 		}
 
@@ -66,12 +76,8 @@ public class CloudFlareResolver {
 		}
 
 		@Override
-		public boolean handleResult(String chanName) {
-			if (finishUriString != null && cookie != null) {
-				storeCookie(chanName, cookie, finishUriString);
-				return true;
-			}
-			return false;
+		public CookieResult takeResult() {
+			return finishUriString != null && cookie != null ? new CookieResult(cookie, finishUriString) : null;
 		}
 
 		@Override
@@ -102,12 +108,32 @@ public class CloudFlareResolver {
 		}
 	}
 
+	private class Resolver implements RelayBlockResolver.Resolver {
+		public final String title;
+
+		public Resolver(String title) {
+			this.title = title;
+		}
+
+		@Override
+		public boolean resolve(RelayBlockResolver resolver, RelayBlockResolver.Session session)
+				throws RelayBlockResolver.CancelException, InterruptedException {
+			CookieResult result = resolver.resolveWebView(session, new WebViewClient(title));
+			if (result != null) {
+				storeCookie(session.chan, result.cookie, result.uriString);
+				return true;
+			}
+			return false;
+		}
+	}
+
 	public RelayBlockResolver.Result checkResponse(RelayBlockResolver resolver,
-			String chanName, Uri uri, HttpHolder holder) throws HttpException {
-		int responseCode = holder.getResponseCode();
+			Chan chan, Uri uri, HttpHolder holder, HttpResponse response, boolean resolve)
+			throws HttpException, InterruptedException {
+		int responseCode = response.getResponseCode();
 		if ((responseCode == HttpURLConnection.HTTP_FORBIDDEN || responseCode == HttpURLConnection.HTTP_UNAVAILABLE)
-				&& holder.getHeaderFields().containsKey("CF-RAY")) {
-			String responseText = holder.readDirect().getString();
+				&& response.getHeaderFields().containsKey("CF-RAY")) {
+			String responseText = response.readString();
 			switch (responseCode) {
 				case HttpURLConnection.HTTP_FORBIDDEN:
 				case HttpURLConnection.HTTP_UNAVAILABLE: {
@@ -129,7 +155,8 @@ public class CloudFlareResolver {
 					}
 					if (title != null) {
 						String titleFinal = title;
-						boolean success = resolver.runWebView(chanName, uri, () -> new Client(titleFinal));
+						boolean success = resolve && resolver
+								.runExclusive(chan, uri, holder, () -> new Resolver(titleFinal));
 						return new RelayBlockResolver.Result(true, success);
 					}
 				}
@@ -138,23 +165,21 @@ public class CloudFlareResolver {
 		return new RelayBlockResolver.Result(false, false);
 	}
 
-	private void storeCookie(String chanName, String cookie, String uriString) {
-		ChanConfiguration configuration = ChanConfiguration.get(chanName);
-		configuration.storeCookie(COOKIE_CLOUDFLARE, cookie, cookie != null ? "CloudFlare" : null);
-		configuration.commit();
+	private void storeCookie(Chan chan, String cookie, String uriString) {
+		chan.configuration.storeCookie(COOKIE_CLOUDFLARE, cookie, cookie != null ? "CloudFlare" : null);
+		chan.configuration.commit();
 		Uri uri = uriString != null ? Uri.parse(uriString) : null;
 		if (uri != null) {
-			ChanLocator locator = ChanLocator.get(chanName);
 			String host = uri.getHost();
-			if (locator.isConvertableChanHost(host)) {
-				locator.setPreferredHost(host);
+			if (chan.locator.isConvertableChanHost(host)) {
+				chan.locator.setPreferredHost(host);
 			}
-			Preferences.setUseHttps(chanName, "https".equals(uri.getScheme()));
+			Preferences.setUseHttps(chan, "https".equals(uri.getScheme()));
 		}
 	}
 
-	public Map<String, String> addCookies(String chanName, Map<String, String> cookies) {
-		String cookie = ChanConfiguration.get(chanName).getCookie(COOKIE_CLOUDFLARE);
+	public Map<String, String> addCookies(Chan chan, Map<String, String> cookies) {
+		String cookie = chan.configuration.getCookie(COOKIE_CLOUDFLARE);
 		if (!StringUtils.isEmpty(cookie)) {
 			if (cookies == null) {
 				cookies = new HashMap<>();

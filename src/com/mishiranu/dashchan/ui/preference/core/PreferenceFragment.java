@@ -7,6 +7,7 @@ import android.content.res.ColorStateList;
 import android.content.res.TypedArray;
 import android.graphics.drawable.Drawable;
 import android.os.Bundle;
+import android.util.Pair;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
@@ -15,15 +16,16 @@ import android.widget.TextView;
 import androidx.annotation.NonNull;
 import androidx.core.content.ContextCompat;
 import androidx.fragment.app.DialogFragment;
-import androidx.fragment.app.Fragment;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 import com.mishiranu.dashchan.C;
 import com.mishiranu.dashchan.R;
+import com.mishiranu.dashchan.ui.ContentFragment;
 import com.mishiranu.dashchan.util.ListViewUtils;
 import com.mishiranu.dashchan.util.ResourceUtils;
 import com.mishiranu.dashchan.util.ViewUtils;
 import com.mishiranu.dashchan.widget.DividerItemDecoration;
+import com.mishiranu.dashchan.widget.ExpandedLayout;
 import com.mishiranu.dashchan.widget.PaddedRecyclerView;
 import com.mishiranu.dashchan.widget.SimpleViewHolder;
 import com.mishiranu.dashchan.widget.ViewFactory;
@@ -31,8 +33,9 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 
-public abstract class PreferenceFragment extends Fragment {
+public abstract class PreferenceFragment extends ContentFragment {
 	private final ArrayList<Preference<?>> preferences = new ArrayList<>();
 	private final HashSet<Preference<?>> persistent = new HashSet<>();
 	private final ArrayList<Dependency> dependencies = new ArrayList<>();
@@ -95,6 +98,8 @@ public abstract class PreferenceFragment extends Fragment {
 		recyclerView = new PaddedRecyclerView(container.getContext());
 		recyclerView.setId(android.R.id.list);
 		recyclerView.setMotionEventSplittingEnabled(false);
+		recyclerView.setClipToPadding(false);
+		recyclerView.setVerticalScrollBarEnabled(true);
 		recyclerView.setLayoutManager(new LinearLayoutManager(container.getContext()));
 		recyclerView.setAdapter(new Adapter());
 		recyclerView.addItemDecoration(new DividerItemDecoration(recyclerView.getContext(), (c, position) -> {
@@ -111,9 +116,10 @@ public abstract class PreferenceFragment extends Fragment {
 			float density = ResourceUtils.obtainDensity(recyclerView);
 			ViewUtils.setNewPadding(recyclerView, (int) (16f * density), null, (int) (16f * density), null);
 		}
-		recyclerView.setLayoutParams(new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-				ViewGroup.LayoutParams.MATCH_PARENT));
-		return recyclerView;
+		ExpandedLayout layout = new ExpandedLayout(container.getContext(), true);
+		layout.addView(recyclerView, ExpandedLayout.LayoutParams.MATCH_PARENT,
+				ExpandedLayout.LayoutParams.MATCH_PARENT);
+		return layout;
 	}
 
 	@Override
@@ -165,6 +171,12 @@ public abstract class PreferenceFragment extends Fragment {
 		addPreference(preference, true);
 		preference.setOnClickListener(p -> new PreferenceDialog(p.key).show(getChildFragmentManager(),
 				PreferenceDialog.class.getName()));
+	}
+
+	public void removeAllPreferences() {
+		preferences.clear();
+		persistent.clear();
+		recyclerView.getAdapter().notifyDataSetChanged();
 	}
 
 	public int removePreference(Preference<?> preference) {
@@ -259,67 +271,56 @@ public abstract class PreferenceFragment extends Fragment {
 		return preference;
 	}
 
-	public int[] createInputTypes(int count, int inputType) {
-		int[] inputTypes = new int[count];
+	public List<Integer> createInputTypes(int count, int inputType) {
+		ArrayList<Integer> inputTypes = new ArrayList<>(count);
 		for (int i = 0; i < count; i++) {
-			inputTypes[i] = inputType;
+			inputTypes.add(inputType);
 		}
 		return inputTypes;
 	}
 
-	public MultipleEditTextPreference addMultipleEdit(String key, int titleResId, int summaryResId,
-			CharSequence[] hints, int[] inputTypes) {
+	public <T> MultipleEditPreference<T> addMultipleEdit(String key, int titleResId, int summaryResId,
+			List<CharSequence> hints, List<Integer> inputTypes, MultipleEditPreference.ValueCodec<T> valueCodec) {
 		return addMultipleEdit(key, titleResId, p -> summaryResId != 0 ? getString(summaryResId) : null,
-				hints, inputTypes);
+				hints, inputTypes, valueCodec);
 	}
 
-	public MultipleEditTextPreference addMultipleEdit(String key, int titleResId, String summaryPattern,
-			CharSequence[] hints, int[] inputTypes) {
+	public <T> MultipleEditPreference<T> addMultipleEdit(String key, int titleResId, String summaryPattern,
+			List<CharSequence> hints, List<Integer> inputTypes, MultipleEditPreference.ValueCodec<T> valueCodec) {
 		return addMultipleEdit(key, titleResId,
-				p -> MultipleEditTextPreference.formatValues(summaryPattern, p.getValue()), hints, inputTypes);
+				p -> MultipleEditPreference.formatValues(valueCodec, summaryPattern, p.getValue()),
+				hints, inputTypes, valueCodec);
 	}
 
-	public MultipleEditTextPreference addMultipleEdit(String key,
-			int titleResId, Preference.SummaryProvider<String[]> summaryProvider,
-			CharSequence[] hints, int[] inputTypes) {
-		MultipleEditTextPreference preference = new MultipleEditTextPreference(requireContext(), key,
-				getString(titleResId), summaryProvider, hints, inputTypes);
+	public <T> MultipleEditPreference<T> addMultipleEdit(String key, int titleResId,
+			Preference.SummaryProvider<T> summaryProvider, List<CharSequence> hints, List<Integer> inputTypes,
+			MultipleEditPreference.ValueCodec<T> valueCodec) {
+		MultipleEditPreference<T> preference = new MultipleEditPreference<>(requireContext(), key,
+				getString(titleResId), summaryProvider, hints, inputTypes, valueCodec);
 		addDialogPreference(preference);
 		return preference;
 	}
 
-	public ListPreference addList(String key, String[] values,
-			String defaultValue, int titleResId, int entriesResId) {
-		return addList(key, values, defaultValue, titleResId, getResources().getStringArray(entriesResId));
-	}
-
-	public ListPreference addList(String key, String[] values,
-			String defaultValue, int titleResId, int[] entriesResIds) {
-		String[] entries = new String[entriesResIds.length];
-		for (int i = 0; i < entries.length; i++) {
-			entries[i] = getString(entriesResIds[i]);
-		}
-		return addList(key, values, defaultValue, titleResId, entries);
-	}
-
-	public ListPreference addList(String key, String[] values,
-			String defaultValue, int titleResId, CharSequence[] entries) {
+	public ListPreference addList(String key, List<String> values,
+			String defaultValue, int titleResId, List<CharSequence> entries) {
 		ListPreference preference = new ListPreference(requireContext(), key, defaultValue, getString(titleResId),
 				entries, values);
 		addDialogPreference(preference);
 		return preference;
 	}
 
-	public SeekPreference addSeek(String key, int defaultValue,
-			int titleResId, int summaryFormatResId, int minValue, int maxValue, int step, float multiplier) {
+	public SeekPreference addSeek(String key, int defaultValue, int titleResId, int summaryFormatResId,
+			Pair<Integer, Integer> specialValue, int minValue, int maxValue, int step) {
 		return addSeek(key, defaultValue, titleResId != 0 ? getString(titleResId) : null,
-				summaryFormatResId != 0 ? getString(summaryFormatResId) : null, minValue, maxValue, step, multiplier);
+				summaryFormatResId != 0 ? getString(summaryFormatResId) : null,
+				specialValue != null ? new Pair<>(specialValue.first, getString(specialValue.second)) : null,
+				minValue, maxValue, step);
 	}
 
-	public SeekPreference addSeek(String key, int defaultValue,
-			String title, String summaryFormat, int minValue, int maxValue, int step, float multiplier) {
-		SeekPreference preference = new SeekPreference(requireContext(), key, defaultValue, title,
-				summaryFormat, minValue, maxValue, step, multiplier);
+	public SeekPreference addSeek(String key, int defaultValue, String title, String summaryFormat,
+			Pair<Integer, String> specialValue, int minValue, int maxValue, int step) {
+		SeekPreference preference = new SeekPreference(requireContext(), key, defaultValue, title, summaryFormat,
+				specialValue, minValue, maxValue, step);
 		addDialogPreference(preference);
 		return preference;
 	}
@@ -334,6 +335,30 @@ public abstract class PreferenceFragment extends Fragment {
 		Dependency dependency = new StringDependency(key, dependencyKey, positive, values);
 		dependencies.add(dependency);
 		updateDependency(dependency);
+	}
+
+	public interface EnumString<T extends Enum<T>> {
+		String getString(T value);
+	}
+
+	public interface EnumStringResource<T extends Enum<T>> {
+		int getResourceId(T value);
+	}
+
+	public <T extends Enum<T>> List<String> enumList(T[] enumValues, EnumString<T> callback) {
+		ArrayList<String> list = new ArrayList<>(enumValues.length);
+		for (T value : enumValues) {
+			list.add(callback.getString(value));
+		}
+		return list;
+	}
+
+	public <T extends Enum<T>> List<CharSequence> enumResList(T[] enumValues, EnumStringResource<T> callback) {
+		ArrayList<CharSequence> list = new ArrayList<>(enumValues.length);
+		for (T value : enumValues) {
+			list.add(getString(callback.getResourceId(value)));
+		}
+		return list;
 	}
 
 	public Preference<?> findPreference(String key) {
@@ -442,7 +467,7 @@ public abstract class PreferenceFragment extends Fragment {
 			layout.addView(header);
 			layout.setLayoutParams(new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
 					ViewGroup.LayoutParams.WRAP_CONTENT));
-			return new ViewHolder(layout, header, null);
+			return new ViewHolder(layout, header, null, null);
 		}
 	}
 
@@ -529,6 +554,18 @@ public abstract class PreferenceFragment extends Fragment {
 		@Override
 		public AlertDialog onCreateDialog(Bundle savedInstanceState) {
 			return getPreference().createDialog(savedInstanceState);
+		}
+
+		@Override
+		public void onStart() {
+			super.onStart();
+			getPreference().startDialog((AlertDialog) getDialog());
+		}
+
+		@Override
+		public void onStop() {
+			getPreference().stopDialog((AlertDialog) getDialog());
+			super.onStop();
 		}
 
 		@Override

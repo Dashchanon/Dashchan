@@ -1,39 +1,39 @@
 package com.mishiranu.dashchan.ui.preference;
 
 import android.app.AlertDialog;
+import android.app.Dialog;
 import android.content.DialogInterface;
 import android.content.SharedPreferences;
 import android.os.Bundle;
-import android.text.InputType;
-import android.text.SpannableStringBuilder;
-import android.text.style.TypefaceSpan;
+import android.util.Pair;
 import android.view.View;
-import android.widget.ListView;
 import androidx.annotation.NonNull;
 import androidx.fragment.app.DialogFragment;
-import chan.util.DataFile;
+import androidx.lifecycle.ViewModelProvider;
 import chan.util.StringUtils;
 import com.mishiranu.dashchan.C;
 import com.mishiranu.dashchan.R;
-import com.mishiranu.dashchan.content.CacheManager;
 import com.mishiranu.dashchan.content.Preferences;
-import com.mishiranu.dashchan.content.async.AsyncManager;
-import com.mishiranu.dashchan.media.VideoPlayer;
-import com.mishiranu.dashchan.ui.ActivityHandler;
+import com.mishiranu.dashchan.content.async.ExecutorTask;
+import com.mishiranu.dashchan.content.async.TaskViewModel;
+import com.mishiranu.dashchan.content.database.PagesDatabase;
+import com.mishiranu.dashchan.content.storage.FavoritesStorage;
+import com.mishiranu.dashchan.ui.DrawerForm;
 import com.mishiranu.dashchan.ui.FragmentHandler;
+import com.mishiranu.dashchan.ui.preference.core.CheckPreference;
 import com.mishiranu.dashchan.ui.preference.core.Preference;
 import com.mishiranu.dashchan.ui.preference.core.PreferenceFragment;
+import com.mishiranu.dashchan.util.ConcurrentUtils;
 import com.mishiranu.dashchan.widget.ProgressDialog;
-import java.util.HashMap;
-import java.util.Locale;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
 
-public class ContentsFragment extends PreferenceFragment implements ActivityHandler {
-	private static final String EXTRA_IN_STORAGE_REQUEST = "inStorageRequest";
-
-	private Preference<?> downloadUriTreePreference;
+public class ContentsFragment extends PreferenceFragment {
+	private CheckPreference replyNotifications;
 	private Preference<?> clearCachePreference;
-
-	private boolean inStorageRequest;
 
 	@Override
 	protected SharedPreferences getPreferences() {
@@ -41,106 +41,64 @@ public class ContentsFragment extends PreferenceFragment implements ActivityHand
 	}
 
 	@Override
-	public void onCreate(Bundle savedInstanceState) {
-		super.onCreate(savedInstanceState);
-		inStorageRequest = savedInstanceState != null && savedInstanceState.getBoolean(EXTRA_IN_STORAGE_REQUEST);
-	}
-
-	@Override
 	public void onViewCreated(@NonNull View view, Bundle savedInstanceState) {
 		super.onViewCreated(view, savedInstanceState);
 
-		addList(Preferences.KEY_LOAD_THUMBNAILS, Preferences.GENERIC_VALUES_NETWORK,
-				Preferences.DEFAULT_LOAD_THUMBNAILS, R.string.load_thumbnails, Preferences.GENERIC_ENTRIES_NETWORK);
-
-		addHeader(R.string.threads_auto_refreshing);
-		addList(Preferences.KEY_AUTO_REFRESH_MODE, Preferences.VALUES_AUTO_REFRESH_MODE,
-				Preferences.DEFAULT_AUTO_REFRESH_MODE, R.string.auto_refreshing_mode,
-				Preferences.ENTRIES_AUTO_REFRESH_MODE);
+		addHeader(R.string.threads);
 		addSeek(Preferences.KEY_AUTO_REFRESH_INTERVAL, Preferences.DEFAULT_AUTO_REFRESH_INTERVAL,
-				R.string.refresh_interval, R.string.every_number_sec__format, Preferences.MIN_AUTO_REFRESH_INTERVAL,
-				Preferences.MAX_AUTO_REFRESH_INTERVAL, Preferences.STEP_AUTO_REFRESH_INTERVAL, 1f);
+				R.string.refresh_open_thread, R.string.every_number_sec__format,
+				new Pair<>(Preferences.DISABLED_AUTO_REFRESH_INTERVAL, R.string.disabled),
+				Preferences.MIN_AUTO_REFRESH_INTERVAL, Preferences.MAX_AUTO_REFRESH_INTERVAL,
+				Preferences.STEP_AUTO_REFRESH_INTERVAL);
+		addList(Preferences.KEY_CYCLICAL_REFRESH, enumList(Preferences.CyclicalRefreshMode.values(), v -> v.value),
+				Preferences.DEFAULT_CYCLICAL_REFRESH.value, R.string.cyclical_threads_refresh_mode,
+				enumResList(Preferences.CyclicalRefreshMode.values(), v -> v.titleResId));
 
-		addHeader(R.string.downloads);
-		addCheck(true, Preferences.KEY_DOWNLOAD_DETAIL_NAME, Preferences.DEFAULT_DOWNLOAD_DETAIL_NAME,
-				R.string.detailed_file_name, R.string.detailed_file_name__summary);
-		addCheck(true, Preferences.KEY_DOWNLOAD_ORIGINAL_NAME, Preferences.DEFAULT_DOWNLOAD_ORIGINAL_NAME,
-				R.string.original_file_name, R.string.original_file_name__summary);
-		if (C.USE_SAF) {
-			downloadUriTreePreference = addButton(getString(R.string.download_directory),
-					p -> DataFile.obtain(requireContext(), DataFile.Target.DOWNLOADS, null).getName());
-			downloadUriTreePreference.setOnClickListener(p -> {
-				if (((FragmentHandler) requireActivity()).requestStorage()) {
-					inStorageRequest = true;
-				}
-			});
-		} else {
-			addEdit(Preferences.KEY_DOWNLOAD_PATH, null, R.string.download_path, C.DEFAULT_DOWNLOAD_PATH,
-					InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-		}
-		addList(Preferences.KEY_DOWNLOAD_SUBDIR, Preferences.VALUES_DOWNLOAD_SUBDIR,
-				Preferences.DEFAULT_DOWNLOAD_SUBDIR, R.string.show_download_configuration_dialog,
-				Preferences.ENTRIES_DOWNLOAD_SUBDIR);
-		addEdit(Preferences.KEY_SUBDIR_PATTERN, Preferences.DEFAULT_SUBDIR_PATTERN,
-				R.string.subdirectory_pattern, Preferences.DEFAULT_SUBDIR_PATTERN,
-				InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI)
-				.setDescription(makeSubdirDescription());
-		if (C.API_LOLLIPOP) {
-			addCheck(true, Preferences.KEY_NOTIFY_DOWNLOAD_COMPLETE, Preferences.DEFAULT_NOTIFY_DOWNLOAD_COMPLETE,
-					R.string.notify_when_download_is_completed, R.string.notify_when_download_is_completed__summary);
-		}
+		addHeader(R.string.favorites);
+		addList(Preferences.KEY_FAVORITES_ORDER, enumList(Preferences.FavoritesOrder.values(), o -> o.value),
+				Preferences.DEFAULT_FAVORITES_ORDER.value, R.string.favorite_threads_order,
+				enumResList(Preferences.FavoritesOrder.values(), o -> o.titleResId))
+				.setOnAfterChangeListener(p -> FavoritesStorage.getInstance().sortIfNeeded());
+		addList(Preferences.KEY_FAVORITE_ON_REPLY, enumList(Preferences.FavoriteOnReplyMode.values(), o -> o.value),
+				Preferences.DEFAULT_FAVORITE_ON_REPLY.value, R.string.add_thread_on_reply,
+				enumResList(Preferences.FavoriteOnReplyMode.values(), o -> o.titleResId));
+		addCheck(true, Preferences.KEY_WATCHER_WATCH_INITIALLY, Preferences.DEFAULT_WATCHER_WATCH_INITIALLY,
+				R.string.watch_initially, R.string.watch_initially__summary);
 
-		addHeader(R.string.images);
-		addList(Preferences.KEY_LOAD_NEAREST_IMAGE, Preferences.GENERIC_VALUES_NETWORK,
-				Preferences.DEFAULT_LOAD_NEAREST_IMAGE, R.string.load_nearest_image,
-				Preferences.GENERIC_ENTRIES_NETWORK);
-
-		addHeader(R.string.video_player);
-		boolean playerAvailable = VideoPlayer.loadLibraries(requireContext());
-		if (!playerAvailable) {
-			addButton(0, R.string.requires_decoding_libraries__sentence).setSelectable(false);
-		}
-		addCheck(true, Preferences.KEY_USE_VIDEO_PLAYER, Preferences.DEFAULT_USE_VIDEO_PLAYER,
-				R.string.use_built_in_video_player, R.string.use_built_in_video_player__summary)
-				.setEnabled(playerAvailable);
-		addList(Preferences.KEY_VIDEO_COMPLETION, Preferences.VALUES_VIDEO_COMPLETION,
-				Preferences.DEFAULT_VIDEO_COMPLETION, R.string.action_on_playback_completion,
-				Preferences.ENTRIES_VIDEO_COMPLETION).setEnabled(playerAvailable);
-		addCheck(true, Preferences.KEY_VIDEO_PLAY_AFTER_SCROLL, Preferences.DEFAULT_VIDEO_PLAY_AFTER_SCROLL,
-				R.string.play_after_scroll, R.string.play_after_scroll__summary).setEnabled(playerAvailable);
-		addCheck(true, Preferences.KEY_VIDEO_SEEK_ANY_FRAME, Preferences.DEFAULT_VIDEO_SEEK_ANY_FRAME,
-				R.string.seek_any_frame, R.string.seek_any_frame__summary).setEnabled(playerAvailable);
-		if (playerAvailable) {
-			addDependency(Preferences.KEY_VIDEO_COMPLETION, Preferences.KEY_USE_VIDEO_PLAYER, true);
-			addDependency(Preferences.KEY_VIDEO_PLAY_AFTER_SCROLL, Preferences.KEY_USE_VIDEO_PLAYER, true);
-			addDependency(Preferences.KEY_VIDEO_SEEK_ANY_FRAME, Preferences.KEY_USE_VIDEO_PLAYER, true);
-		}
+		addHeader(R.string.favorites_watcher);
+		addSeek(Preferences.KEY_WATCHER_REFRESH_INTERVAL, Preferences.DEFAULT_WATCHER_REFRESH_INTERVAL,
+				R.string.refresh_favorites, R.string.every_number_sec__format,
+				new Pair<>(Preferences.DISABLED_WATCHER_REFRESH_INTERVAL, R.string.disabled),
+				Preferences.MIN_WATCHER_REFRESH_INTERVAL, Preferences.MAX_WATCHER_REFRESH_INTERVAL,
+				Preferences.STEP_WATCHER_REFRESH_INTERVAL);
+		addCheck(true, Preferences.KEY_WATCHER_WIFI_ONLY, Preferences.DEFAULT_WATCHER_WIFI_ONLY, R.string.wifi_only, 0);
+		replyNotifications = addCheck(false, "reply_notifications", false,
+				R.string.reply_notifications, R.string.reply_notifications__format);
+		replyNotifications.setOnClickListener(p -> {
+			if (C.API_OREO) {
+				Preferences.setWatcherNotifications(p.getValue() ? Collections.emptySet()
+						: Collections.singleton(Preferences.NotificationFeature.ENABLED));
+				invalidateReplyNotifications();
+			} else {
+				WatcherNotificationsDialog dialog = new WatcherNotificationsDialog();
+				dialog.show(getChildFragmentManager(), WatcherNotificationsDialog.class.getName());
+			}
+		});
+		invalidateReplyNotifications();
 
 		addHeader(R.string.additional);
-		addSeek(Preferences.KEY_CACHE_SIZE, Preferences.DEFAULT_CACHE_SIZE,
-				getString(R.string.cache_size), "%d MB", 50, 750, 10, Preferences.MULTIPLIER_CACHE_SIZE);
-		clearCachePreference = addButton(getString(R.string.clear_cache), p -> {
-			long cacheSize = CacheManager.getInstance().getCacheSize();
-			return String.format(Locale.US, "%.2f", cacheSize / 1000f / 1000f) + " MB";
-		});
+		clearCachePreference = addButton(getString(R.string.clear_cache),
+				p -> StringUtils.formatFileSizeMegabytes(PagesDatabase.getInstance().getSize()));
 		clearCachePreference.setOnClickListener(p -> {
-			ClearCacheFragment fragment = new ClearCacheFragment();
-			fragment.setTargetFragment(this, 0);
-			fragment.show(getParentFragmentManager(), ClearCacheFragment.class.getName());
+			ClearCacheDialog dialog = new ClearCacheDialog();
+			dialog.show(getChildFragmentManager(), ClearCacheDialog.class.getName());
 		});
-
-		addDependency(Preferences.KEY_AUTO_REFRESH_INTERVAL, Preferences.KEY_AUTO_REFRESH_MODE, true,
-				Preferences.VALUE_AUTO_REFRESH_MODE_ENABLED);
-		addDependency(Preferences.KEY_SUBDIR_PATTERN, Preferences.KEY_DOWNLOAD_SUBDIR, false,
-				Preferences.VALUE_DOWNLOAD_SUBDIR_DISABLED);
-		updateCacheSize();
+		clearCachePreference.invalidate();
 	}
 
 	@Override
 	public void onDestroyView() {
 		super.onDestroyView();
-
-		downloadUriTreePreference = null;
 		clearCachePreference = null;
 	}
 
@@ -150,64 +108,47 @@ public class ContentsFragment extends PreferenceFragment implements ActivityHand
 		((FragmentHandler) requireActivity()).setTitleSubtitle(getString(R.string.contents), null);
 	}
 
-	@Override
-	public void onSaveInstanceState(@NonNull Bundle outState) {
-		super.onSaveInstanceState(outState);
-		outState.putBoolean(EXTRA_IN_STORAGE_REQUEST, inStorageRequest);
+	private void invalidateReplyNotifications() {
+		replyNotifications.setValue(Preferences.getWatcherNotifications()
+				.contains(Preferences.NotificationFeature.ENABLED));
 	}
 
-	@Override
-	public void onStorageRequestResult() {
-		if (inStorageRequest) {
-			inStorageRequest = false;
-			downloadUriTreePreference.invalidate();
-		}
-	}
-
-	private CharSequence makeSubdirDescription() {
-		String[] formats = {"\\c", "\\d", "\\b", "\\t", "\\e", "<\u2026>"};
-		int[] descriptions = {R.string.forum_code, R.string.forum_title, R.string.board_code, R.string.thread_number,
-				R.string.thread_title, R.string.optional_part};
-		SpannableStringBuilder builder = new SpannableStringBuilder();
-		for (int i = 0; i < formats.length; i++) {
-			if (builder.length() > 0) {
-				builder.append('\n');
-			}
-			StringUtils.appendSpan(builder, formats[i], new TypefaceSpan("sans-serif-medium"));
-			builder.append(" — ");
-			builder.append(getString(descriptions[i]));
-		}
-		return builder;
-	}
-
-	private void updateCacheSize() {
-		long cacheSize = CacheManager.getInstance().getCacheSize();
-		clearCachePreference.setEnabled(cacheSize > 0L);
-		clearCachePreference.invalidate();
-	}
-
-	public static class ClearCacheFragment extends DialogFragment implements DialogInterface.OnMultiChoiceClickListener,
-			DialogInterface.OnClickListener, DialogInterface.OnShowListener {
+	public static class WatcherNotificationsDialog extends DialogFragment {
 		private static final String EXTRA_CHECKED_ITEMS = "checkedItems";
 
 		private boolean[] checkedItems;
 
 		@NonNull
 		@Override
-		public AlertDialog onCreateDialog(Bundle savedInstanceState) {
-			checkedItems = savedInstanceState != null ? savedInstanceState.getBooleanArray(EXTRA_CHECKED_ITEMS) : null;
-			if (checkedItems == null) {
-				checkedItems = new boolean[] {true, true, true, false};
+		public Dialog onCreateDialog(Bundle savedInstanceState) {
+			String[] items = new String[Preferences.NotificationFeature.values().length];
+			for (int i = 0; i < items.length; i++) {
+				items[i] = getString(Preferences.NotificationFeature.values()[i].titleResId);
 			}
-			String[] items = {getString(R.string.thumbnails), getString(R.string.cached_files),
-					getString(R.string.old_threads), getString(R.string.all_threads)};
-			AlertDialog dialog = new AlertDialog.Builder(requireContext())
-					.setTitle(getString(R.string.clear_cache))
-					.setMultiChoiceItems(items, checkedItems, this)
-					.setNegativeButton(android.R.string.cancel, null).setPositiveButton(android.R.string.ok, this)
+			if (savedInstanceState != null) {
+				checkedItems = savedInstanceState.getBooleanArray(EXTRA_CHECKED_ITEMS);
+			} else {
+				checkedItems = new boolean[Preferences.NotificationFeature.values().length];
+				Set<Preferences.NotificationFeature> notificationFeatures = Preferences.getWatcherNotifications();
+				for (int i = 0; i < checkedItems.length; i++) {
+					checkedItems[i] = notificationFeatures.contains(Preferences.NotificationFeature.values()[i]);
+				}
+			}
+			return new AlertDialog.Builder(requireContext())
+					.setTitle(R.string.reply_notifications)
+					.setMultiChoiceItems(items, checkedItems, (d, which, isChecked) -> checkedItems[which] = isChecked)
+					.setPositiveButton(android.R.string.ok, (d, which) -> {
+						HashSet<Preferences.NotificationFeature> notificationFeatures = new HashSet<>();
+						for (int i = 0; i < checkedItems.length; i++) {
+							if (checkedItems[i]) {
+								notificationFeatures.add(Preferences.NotificationFeature.values()[i]);
+							}
+						}
+						Preferences.setWatcherNotifications(notificationFeatures);
+						((ContentsFragment) getParentFragment()).invalidateReplyNotifications();
+					})
+					.setNegativeButton(android.R.string.cancel, null)
 					.create();
-			dialog.setOnShowListener(this);
-			return dialog;
 		}
 
 		@Override
@@ -215,55 +156,45 @@ public class ContentsFragment extends PreferenceFragment implements ActivityHand
 			super.onSaveInstanceState(outState);
 			outState.putBooleanArray(EXTRA_CHECKED_ITEMS, checkedItems);
 		}
+	}
 
+	public static class ClearCacheDialog extends DialogFragment {
+		private static final String EXTRA_CHECKED_INDEX = "checkedIndex";
+
+		private int checkedIndex;
+
+		@NonNull
 		@Override
-		public void onShow(DialogInterface dialog) {
-			((AlertDialog) dialog).getListView().getChildAt(2).setEnabled(!checkedItems[3]);
+		public AlertDialog onCreateDialog(Bundle savedInstanceState) {
+			checkedIndex = savedInstanceState != null ? savedInstanceState.getInt(EXTRA_CHECKED_INDEX) : 0;
+			String[] items = {getString(R.string.old_threads), getString(R.string.all_threads)};
+			return new AlertDialog.Builder(requireContext())
+					.setTitle(getString(R.string.clear_cache))
+					.setSingleChoiceItems(items, checkedIndex, (d, which) -> checkedIndex = which)
+					.setPositiveButton(android.R.string.ok, (d, w) -> {
+						ClearingDialog clearingDialog = new ClearingDialog(checkedIndex == 1);
+						clearingDialog.setTargetFragment(getParentFragment(), 0);
+						clearingDialog.show(getParentFragment().getParentFragmentManager(),
+								ClearingDialog.class.getName());
+					})
+					.setNegativeButton(android.R.string.cancel, null)
+					.create();
 		}
 
 		@Override
-		public void onClick(DialogInterface dialog, int which, boolean isChecked) {
-			switch (which) {
-				case 2: {
-					if (checkedItems[3]) {
-						isChecked = !isChecked;
-						((AlertDialog) dialog).getListView().setItemChecked(which, isChecked);
-					}
-					break;
-				}
-				case 3: {
-					ListView listView = ((AlertDialog) dialog).getListView();
-					listView.getChildAt(2).setEnabled(!isChecked);
-					break;
-				}
-			}
-			checkedItems[which] = isChecked;
-		}
-
-		@Override
-		public void onClick(DialogInterface dialog, int which) {
-			ClearingDialog clearingDialog = new ClearingDialog(checkedItems[0], checkedItems[1],
-					checkedItems[2], checkedItems[3]);
-			clearingDialog.setTargetFragment(getTargetFragment(), 0);
-			clearingDialog.show(getTargetFragment().getParentFragmentManager(), ClearingDialog.class.getName());
+		public void onSaveInstanceState(@NonNull Bundle outState) {
+			super.onSaveInstanceState(outState);
+			outState.putInt(EXTRA_CHECKED_INDEX, checkedIndex);
 		}
 	}
 
-	public static class ClearingDialog extends DialogFragment implements AsyncManager.Callback {
-		private static final String EXTRA_THUMBNAILS = "thumbnails";
-		private static final String EXTRA_MEDIA = "media";
-		private static final String EXTRA_OLD_PAGES = "oldPages";
+	public static class ClearingDialog extends DialogFragment {
 		private static final String EXTRA_ALL_PAGES = "allPages";
-
-		private static final String TASK_CLEAR_CACHE = "clear_cache";
 
 		public ClearingDialog() {}
 
-		public ClearingDialog(boolean thumbnails, boolean media, boolean oldPages, boolean allPages) {
+		public ClearingDialog(boolean allPages) {
 			Bundle args = new Bundle();
-			args.putBoolean(EXTRA_THUMBNAILS, thumbnails);
-			args.putBoolean(EXTRA_MEDIA, media);
-			args.putBoolean(EXTRA_OLD_PAGES, oldPages);
 			args.putBoolean(EXTRA_ALL_PAGES, allPages);
 			setArguments(args);
 		}
@@ -279,79 +210,71 @@ public class ContentsFragment extends PreferenceFragment implements ActivityHand
 		@Override
 		public void onActivityCreated(Bundle savedInstanceState) {
 			super.onActivityCreated(savedInstanceState);
-			AsyncManager.get(this).startTask(TASK_CLEAR_CACHE, this, null, false);
+
+			ClearCacheViewModel viewModel = new ViewModelProvider(this).get(ClearCacheViewModel.class);
+			if (!viewModel.hasTaskOrValue()) {
+				Bundle args = requireArguments();
+				boolean allPages = args.getBoolean(EXTRA_ALL_PAGES);
+				Collection<PagesDatabase.ThreadKey> openThreads = Collections.emptyList();
+				if (!allPages) {
+					Collection<DrawerForm.Page> drawerPages =
+							((FragmentHandler) requireActivity()).obtainDrawerPages();
+					openThreads = new ArrayList<>(openThreads.size());
+					for (DrawerForm.Page page : drawerPages) {
+						if (page.threadNumber != null) {
+							openThreads.add(new PagesDatabase.ThreadKey(page.chanName,
+									page.boardName, page.threadNumber));
+						}
+					}
+				}
+				ClearCacheTask task = new ClearCacheTask(viewModel, allPages, openThreads);
+				task.execute(ConcurrentUtils.SEPARATE_EXECUTOR);
+				viewModel.attach(task);
+			}
+			viewModel.observe(this, result -> {
+				dismiss();
+				sendUpdateCacheSize();
+			});
 		}
 
 		private void sendUpdateCacheSize() {
-			((ContentsFragment) getTargetFragment()).updateCacheSize();
+			((ContentsFragment) getTargetFragment()).clearCachePreference.invalidate();
 		}
 
 		@Override
 		public void onCancel(@NonNull DialogInterface dialog) {
 			super.onCancel(dialog);
-			AsyncManager.get(this).cancelTask(TASK_CLEAR_CACHE, this);
 			sendUpdateCacheSize();
-		}
-
-		@Override
-		public AsyncManager.Holder onCreateAndExecuteTask(String name, HashMap<String, Object> extra) {
-			Bundle args = requireArguments();
-			ClearCacheTask task = new ClearCacheTask(args.getBoolean(EXTRA_THUMBNAILS), args.getBoolean(EXTRA_MEDIA),
-					args.getBoolean(EXTRA_OLD_PAGES), args.getBoolean(EXTRA_ALL_PAGES));
-			task.executeOnExecutor(ClearCacheTask.THREAD_POOL_EXECUTOR);
-			return task.getHolder();
-		}
-
-		@Override
-		public void onFinishTaskExecution(String name, AsyncManager.Holder holder) {
-			dismiss();
-			sendUpdateCacheSize();
-		}
-
-		@Override
-		public void onRequestTaskCancel(String name, Object task) {
-			((ClearCacheTask) task).cancel();
 		}
 	}
 
-	private static class ClearCacheTask extends AsyncManager.SimpleTask<Void, Void, Void> {
-		private final boolean thumbnails;
-		private final boolean media;
-		private final boolean oldPages;
-		private final boolean allPages;
+	public static class ClearCacheViewModel extends TaskViewModel<ClearCacheTask, Object> {}
 
-		public ClearCacheTask(boolean thumbnails, boolean media, boolean oldPages, boolean allPages) {
-			this.thumbnails = thumbnails;
-			this.media = media;
-			this.oldPages = oldPages;
+	private static class ClearCacheTask extends ExecutorTask<Void, Object> {
+		private final ClearCacheViewModel viewModel;
+		private final boolean allPages;
+		private final Collection<PagesDatabase.ThreadKey> openThreads;
+
+		public ClearCacheTask(ClearCacheViewModel viewModel, boolean allPages,
+				Collection<PagesDatabase.ThreadKey> openThreads) {
+			this.viewModel = viewModel;
 			this.allPages = allPages;
+			this.openThreads = openThreads;
 		}
 
 		@Override
-		protected Void doInBackground(Void... params) {
-			CacheManager cacheManager = CacheManager.getInstance();
-			try {
-				if (thumbnails) {
-					cacheManager.eraseThumbnailsCache();
-				}
-				if (media) {
-					cacheManager.eraseMediaCache();
-				}
-				if (oldPages && !allPages) {
-					cacheManager.erasePagesCache(true);
-				}
-				if (allPages) {
-					cacheManager.erasePagesCache(false);
-				}
-			} catch (InterruptedException e) {
-				Thread.currentThread().interrupt();
+		protected Void run() {
+			if (allPages) {
+				PagesDatabase.getInstance().eraseAll();
+			} else {
+				PagesDatabase.getInstance().erase(openThreads);
 			}
 			return null;
 		}
 
 		@Override
-		public void cancel() {
-			cancel(true);
+		protected void onComplete(Object o) {
+			viewModel.handleResult(this);
 		}
 	}
 }

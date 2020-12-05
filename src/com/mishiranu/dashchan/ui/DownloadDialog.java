@@ -6,7 +6,6 @@ import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
 import android.net.Uri;
-import android.os.AsyncTask;
 import android.text.Editable;
 import android.text.TextUtils;
 import android.text.TextWatcher;
@@ -26,18 +25,22 @@ import android.widget.LinearLayout;
 import android.widget.RadioButton;
 import android.widget.RadioGroup;
 import android.widget.TextView;
-import chan.content.ChanConfiguration;
+import androidx.annotation.NonNull;
+import chan.content.Chan;
+import chan.util.CommonUtils;
 import chan.util.DataFile;
 import chan.util.StringUtils;
 import com.mishiranu.dashchan.C;
 import com.mishiranu.dashchan.R;
 import com.mishiranu.dashchan.content.FileProvider;
 import com.mishiranu.dashchan.content.Preferences;
+import com.mishiranu.dashchan.content.async.ExecutorTask;
 import com.mishiranu.dashchan.content.service.DownloadService;
-import com.mishiranu.dashchan.util.ConfigurationLock;
+import com.mishiranu.dashchan.util.ConcurrentUtils;
 import com.mishiranu.dashchan.util.MimeTypes;
 import com.mishiranu.dashchan.util.ResourceUtils;
-import com.mishiranu.dashchan.util.ToastUtils;
+import com.mishiranu.dashchan.util.ViewUtils;
+import com.mishiranu.dashchan.widget.ClickableToast;
 import com.mishiranu.dashchan.widget.ProgressDialog;
 import java.io.File;
 import java.util.ArrayList;
@@ -45,8 +48,11 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.Executor;
 
 public class DownloadDialog {
+	private static final Executor EXECUTOR = ConcurrentUtils.newSingleThreadPool(2000, "DownloadDialog", null);
+
 	public interface Callback {
 		void resolve(DownloadService.ChoiceRequest choiceRequest, DownloadService.DirectRequest directRequest);
 		void resolve(DownloadService.ReplaceRequest replaceRequest, DownloadService.ReplaceRequest.Action action);
@@ -54,7 +60,6 @@ public class DownloadDialog {
 	}
 
 	private final Context context;
-	private final ConfigurationLock configurationLock;
 	private final Callback callback;
 
 	private static class DialogHolder<Request> {
@@ -86,9 +91,8 @@ public class DownloadDialog {
 	private final DialogHolder<DownloadService.ReplaceRequest> replaceDialog = new DialogHolder<>();
 	private final DialogHolder<DownloadService.PrepareRequest> prepareDialog = new DialogHolder<>();
 
-	public DownloadDialog(Context context, ConfigurationLock configurationLock, Callback callback) {
+	public DownloadDialog(Context context, Callback callback) {
 		this.context = new ContextThemeWrapper(context, R.style.Theme_Gallery);
-		this.configurationLock = configurationLock;
 		this.callback = callback;
 	}
 
@@ -126,8 +130,26 @@ public class DownloadDialog {
 		}
 	}
 
+	private static class ChoiceState {
+		public boolean subdirectory;
+		public boolean detailedName;
+		public boolean originalName;
+		public String path;
+	}
+
 	private AlertDialog createChoice(DownloadService.ChoiceRequest choiceRequest,
 			AlertDialog.OnDismissListener onDismissListener) {
+		boolean newState = false;
+		if (!(choiceRequest.state instanceof ChoiceState)) {
+			choiceRequest.state = new ChoiceState();
+			newState = true;
+		}
+		ChoiceState state = (ChoiceState) choiceRequest.state;
+		if (newState) {
+			state.detailedName = Preferences.isDownloadDetailName();
+			state.originalName = Preferences.isDownloadOriginalName();
+		}
+
 		DataFile root = DataFile.obtain(context, DataFile.Target.DOWNLOADS, null);
 		InputMethodManager inputMethodManager = (InputMethodManager) context
 				.getSystemService(Context.INPUT_METHOD_SERVICE);
@@ -143,12 +165,14 @@ public class DownloadDialog {
 			allowDetailName = false;
 		}
 		if (allowDetailName) {
-			detailNameCheckBox.setChecked(Preferences.isDownloadDetailName());
+			detailNameCheckBox.setChecked(state.detailedName);
+			detailNameCheckBox.setOnCheckedChangeListener((b, isChecked) -> state.detailedName = isChecked);
 		} else {
 			detailNameCheckBox.setVisibility(View.GONE);
 		}
 		if (allowOriginalName) {
-			originalNameCheckBox.setChecked(Preferences.isDownloadOriginalName());
+			originalNameCheckBox.setChecked(state.originalName);
+			originalNameCheckBox.setOnCheckedChangeListener((b, isChecked) -> state.originalName = isChecked);
 		} else {
 			originalNameCheckBox.setVisibility(View.GONE);
 		}
@@ -159,15 +183,30 @@ public class DownloadDialog {
 		}
 
 		if (choiceRequest.chanName != null && choiceRequest.threadNumber != null) {
-			String chanTitle = ChanConfiguration.get(choiceRequest.chanName).getTitle();
+			String chanTitle = Chan.get(choiceRequest.chanName).configuration.getTitle();
 			String threadTitle = choiceRequest.threadTitle;
 			if (threadTitle != null) {
 				threadTitle = StringUtils.escapeFile(StringUtils.cutIfLongerToLine(threadTitle, 50, false), false);
 			}
 			String text = Preferences.getSubdir(choiceRequest.chanName, chanTitle,
 					choiceRequest.boardName, choiceRequest.threadNumber, threadTitle);
-			editText.setText(text);
-			editText.setSelection(text.length());
+			if (newState) {
+				state.path = text;
+			}
+			editText.setText(state.path);
+			editText.setSelection(editText.getText().length());
+			editText.addTextChangedListener(new TextWatcher() {
+				@Override
+				public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+
+				@Override
+				public void onTextChanged(CharSequence s, int start, int before, int count) {}
+
+				@Override
+				public void afterTextChanged(Editable s) {
+					state.path = s.toString();
+				}
+			});
 			if (StringUtils.isEmpty(text)) {
 				text = Preferences.formatSubdir(Preferences.DEFAULT_SUBDIR_PATTERN, choiceRequest.chanName,
 						chanTitle, choiceRequest.boardName, choiceRequest.threadNumber, threadTitle);
@@ -175,7 +214,6 @@ public class DownloadDialog {
 			editText.setHint(text);
 		}
 
-		editText.setEnabled(false);
 		editText.setOnItemClickListener((parent, v, position, id) -> v.post(() -> {
 			Adapter adapter = (Adapter) editText.getAdapter();
 			adapter.items = Collections.emptyList();
@@ -186,10 +224,10 @@ public class DownloadDialog {
 		Runnable dropDownRunnable = editText::showDropDown;
 
 		RadioGroup radioGroup = view.findViewById(R.id.download_choice);
-		radioGroup.check(R.id.download_common);
 		radioGroup.setOnCheckedChangeListener((rg, checkedId) -> {
 			boolean enabled = checkedId == R.id.download_subdirectory;
 			editText.setEnabled(enabled);
+			state.subdirectory = enabled;
 			if (enabled) {
 				editText.dismissDropDown();
 				refreshDropDownContents(editText);
@@ -203,6 +241,7 @@ public class DownloadDialog {
 				editText.removeCallbacks(dropDownRunnable);
 			}
 		});
+		radioGroup.check(state.subdirectory ? R.id.download_subdirectory : R.id.download_common);
 		view.<RadioButton>findViewById(R.id.download_common)
 				.setText(context.getString(R.string.save_to_directory__format, root.getName()));
 
@@ -221,16 +260,17 @@ public class DownloadDialog {
 						editText, detailNameCheckBox, originalNameCheckBox))
 				.setOnCancelListener(d -> callback.resolve(choiceRequest, null))
 				.create();
-		dialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN
-				| WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+		dialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN |
+				(C.API_R ? WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN
+						: ViewUtils.SOFT_INPUT_ADJUST_RESIZE_COMPAT));
 		editText.setOnEditorActionListener((v, actionId, event) -> {
 			handleChoiceResolve(choiceRequest, editText, detailNameCheckBox, originalNameCheckBox);
 			dialog.dismiss();
 			return true;
 		});
-		configurationLock.lockConfiguration(dialog, dismissDialog -> {
+		dialog.setOnDismissListener(d -> {
 			adapter.shutdown();
-			onDismissListener.onDismiss(dismissDialog);
+			onDismissListener.onDismiss(d);
 		});
 		dialog.show();
 		return dialog;
@@ -264,8 +304,17 @@ public class DownloadDialog {
 		callback.resolve(choiceRequest, directRequest);
 	}
 
+	private static class ReplaceState {
+		public int selectedId;
+	}
+
 	private AlertDialog createReplace(DownloadService.ReplaceRequest replaceRequest,
 			AlertDialog.OnDismissListener onDismissListener) {
+		if (!(replaceRequest.state instanceof ReplaceState)) {
+			replaceRequest.state = new ReplaceState();
+		}
+		ReplaceState state = (ReplaceState) replaceRequest.state;
+
 		int count = replaceRequest.queued + replaceRequest.exists;
 		float density = ResourceUtils.obtainDensity(context);
 		int padding = context.getResources().getDimensionPixelSize(R.dimen.dialog_padding_view);
@@ -277,7 +326,7 @@ public class DownloadDialog {
 				(R.plurals.number_files_already_exist__sentence_format, count, count));
 		linearLayout.addView(textView);
 
-		final RadioGroup radioGroup = new RadioGroup(context);
+		RadioGroup radioGroup = new RadioGroup(context);
 		radioGroup.setOrientation(RadioGroup.VERTICAL);
 		int[] options = {R.string.replace, R.string.keep_all, R.string.skip};
 		int[] ids = {android.R.id.button1, android.R.id.button2, android.R.id.button3};
@@ -287,8 +336,12 @@ public class DownloadDialog {
 			radioButton.setId(ids[i]);
 			radioGroup.addView(radioButton);
 		}
-		radioGroup.check(ids[0]);
+		if (state.selectedId == 0) {
+			state.selectedId = ids[0];
+		}
+		radioGroup.check(state.selectedId);
 		radioGroup.setPadding(0, (int) (12f * density), 0, 0);
+		radioGroup.setOnCheckedChangeListener((g, id) -> state.selectedId = id);
 		linearLayout.addView(radioGroup);
 
 		AlertDialog.Builder builder = new AlertDialog.Builder(context)
@@ -334,14 +387,14 @@ public class DownloadDialog {
 						context.startActivity(new Intent(Intent.ACTION_VIEW).setDataAndType(uri, type)
 								.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_GRANT_READ_URI_PERMISSION));
 					} catch (ActivityNotFoundException e) {
-						ToastUtils.show(context, R.string.unknown_address);
+						ClickableToast.show(R.string.unknown_address);
 					}
 				}
 			}));
 		} else {
 			dialog = builder.create();
 		}
-		configurationLock.lockConfiguration(dialog, onDismissListener);
+		dialog.setOnDismissListener(onDismissListener);
 		dialog.show();
 		return dialog;
 	}
@@ -401,7 +454,7 @@ public class DownloadDialog {
 		private String lastDirectoryPath;
 		private final HashMap<String, DataFile> cachedDirectories = new HashMap<>();
 		private List<DialogDirectory> lastDirectoryItems;
-		private AsyncTask<Void, ?, ?> lastDirectoryTask;
+		private ExecutorTask<?, ?> lastDirectoryTask;
 
 		public static String buildPath(List<String> segments, int parent) {
 			StringBuilder directoryPathBuilder = new StringBuilder();
@@ -430,12 +483,12 @@ public class DownloadDialog {
 				List<DialogDirectory> items;
 				synchronized (lastDirectoryLock) {
 					String directoryPath = buildPath(segments, 0);
-					if (lastDirectoryPath == null || !StringUtils.equals(lastDirectoryPath, directoryPath)) {
+					if (lastDirectoryPath == null || !CommonUtils.equals(lastDirectoryPath, directoryPath)) {
 						lastDirectoryPath = directoryPath;
 						lastDirectoryItems = Collections.emptyList();
 
 						if (lastDirectoryTask != null) {
-							lastDirectoryTask.cancel(true);
+							lastDirectoryTask.cancel();
 							lastDirectoryTask = null;
 						}
 
@@ -451,10 +504,9 @@ public class DownloadDialog {
 								}
 							}
 							Pair<DataFile, String> cachedDirectoryFinal = cachedDirectory;
-							lastDirectoryTask = new AsyncTask<Void, Void,
-									Pair<List<DataFile>, List<DialogDirectory>>>() {
+							lastDirectoryTask = new ExecutorTask<Void, Pair<List<DataFile>, List<DialogDirectory>>>() {
 								@Override
-								protected Pair<List<DataFile>, List<DialogDirectory>> doInBackground(Void... params) {
+								protected Pair<List<DataFile>, List<DialogDirectory>> run() {
 									DataFile directory = cachedDirectoryFinal != null
 											? cachedDirectoryFinal.first.getChild(cachedDirectoryFinal.second) :
 											StringUtils.isEmpty(directoryPath) ? root : root.getChild(directoryPath);
@@ -481,7 +533,7 @@ public class DownloadDialog {
 								}
 
 								@Override
-								protected void onPostExecute(Pair<List<DataFile>, List<DialogDirectory>> items) {
+								protected void onComplete(Pair<List<DataFile>, List<DialogDirectory>> items) {
 									synchronized (lastDirectoryLock) {
 										if (items.first != null) {
 											for (DataFile file : items.first) {
@@ -495,7 +547,7 @@ public class DownloadDialog {
 									}
 								}
 							};
-							lastDirectoryTask.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+							lastDirectoryTask.execute(EXECUTOR);
 						}
 					}
 
@@ -534,7 +586,7 @@ public class DownloadDialog {
 			synchronized (lastDirectoryLock) {
 				lastDirectoryCancel = true;
 				if (lastDirectoryTask != null) {
-					lastDirectoryTask.cancel(true);
+					lastDirectoryTask.cancel();
 					lastDirectoryTask = null;
 				}
 			}
@@ -588,6 +640,7 @@ public class DownloadDialog {
 			return convert(true);
 		}
 
+		@NonNull
 		@Override
 		public String toString() {
 			return convert(false);

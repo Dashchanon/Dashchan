@@ -2,13 +2,11 @@ package com.mishiranu.dashchan.ui.preference;
 
 import android.annotation.SuppressLint;
 import android.app.AlertDialog;
-import android.content.DialogInterface;
 import android.os.Bundle;
 import android.text.Editable;
 import android.text.Layout;
 import android.text.TextWatcher;
 import android.text.style.BackgroundColorSpan;
-import android.view.ContextThemeWrapper;
 import android.view.LayoutInflater;
 import android.view.Menu;
 import android.view.MenuInflater;
@@ -23,29 +21,30 @@ import android.widget.TextView;
 import androidx.annotation.NonNull;
 import androidx.fragment.app.DialogFragment;
 import androidx.recyclerview.widget.RecyclerView;
-import chan.content.ChanConfiguration;
+import chan.content.Chan;
 import chan.content.ChanManager;
 import chan.util.StringUtils;
 import com.mishiranu.dashchan.C;
 import com.mishiranu.dashchan.R;
 import com.mishiranu.dashchan.content.storage.AutohideStorage;
-import com.mishiranu.dashchan.ui.ActivityHandler;
 import com.mishiranu.dashchan.ui.FragmentHandler;
 import com.mishiranu.dashchan.util.ListViewUtils;
 import com.mishiranu.dashchan.util.ResourceUtils;
+import com.mishiranu.dashchan.util.ViewUtils;
 import com.mishiranu.dashchan.widget.CustomSearchView;
 import com.mishiranu.dashchan.widget.ErrorEditTextSetter;
 import com.mishiranu.dashchan.widget.MenuExpandListener;
 import com.mishiranu.dashchan.widget.SimpleViewHolder;
 import com.mishiranu.dashchan.widget.ViewFactory;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashSet;
 import java.util.Locale;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
-public class AutohideFragment extends BaseListFragment implements ActivityHandler {
+public class AutohideFragment extends BaseListFragment {
 	private static final String EXTRA_SEARCH_QUERY = "searchQuery";
 	private static final String EXTRA_SEARCH_FOCUSED = "searchFocused";
 
@@ -69,8 +68,7 @@ public class AutohideFragment extends BaseListFragment implements ActivityHandle
 	public void onViewCreated(@NonNull View view, Bundle savedInstanceState) {
 		super.onViewCreated(view, savedInstanceState);
 
-		searchView = new CustomSearchView(C.API_LOLLIPOP ? new ContextThemeWrapper(requireContext(),
-				R.style.Theme_Special_White) : requireActivity().getActionBar().getThemedContext());
+		searchView = getViewHolder().obtainSearchView();
 		searchView.setHint(getString(R.string.filter));
 		searchView.setOnChangeListener(query -> {
 			((Adapter) getRecyclerView().getAdapter()).setSearchQuery(query);
@@ -247,9 +245,8 @@ public class AutohideFragment extends BaseListFragment implements ActivityHandle
 		@NonNull
 		@Override
 		public RecyclerView.ViewHolder onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
-			View view = ViewFactory.makeTwoLinesListItem(parent);
-			((ViewFactory.TwoLinesViewHolder) view.getTag()).text2.setSingleLine(true);
-			return ListViewUtils.bind(new SimpleViewHolder(view), false, null, this);
+			return ListViewUtils.bind(new SimpleViewHolder(ViewFactory.makeTwoLinesListItem(parent,
+					ViewFactory.FEATURE_SINGLE_LINE).view), false, null, this);
 		}
 
 		@Override
@@ -297,6 +294,9 @@ public class AutohideFragment extends BaseListFragment implements ActivityHandle
 			if (autohideItem.optionName) {
 				orCount++;
 			}
+			if (autohideItem.optionFileName) {
+				orCount++;
+			}
 			if (orCount > 0) {
 				if (and) {
 					builder.append(" & ");
@@ -322,6 +322,12 @@ public class AutohideFragment extends BaseListFragment implements ActivityHandle
 					}
 					builder.append("name");
 				}
+				if (autohideItem.optionFileName) {
+					if (or) {
+						builder.append(" | ");
+					}
+					builder.append("file");
+				}
 				if (and && orCount > 1) {
 					builder.append(')');
 				}
@@ -335,7 +341,7 @@ public class AutohideFragment extends BaseListFragment implements ActivityHandle
 		}
 	}
 
-	public static class AutohideDialog extends DialogFragment implements View.OnClickListener {
+	public static class AutohideDialog extends DialogFragment implements ChanMultiChoiceDialog.Callback {
 		private static final String EXTRA_ITEM = "item";
 		private static final String EXTRA_INDEX = "index";
 
@@ -350,6 +356,7 @@ public class AutohideFragment extends BaseListFragment implements ActivityHandle
 		private CheckBox autohideSubject;
 		private CheckBox autohideComment;
 		private CheckBox autohideName;
+		private CheckBox autohideFileName;
 		private EditText valueEdit;
 		private TextView errorText;
 		private TextView matcherText;
@@ -379,13 +386,17 @@ public class AutohideFragment extends BaseListFragment implements ActivityHandle
 			autohideSubject = view.findViewById(R.id.autohide_subject);
 			autohideComment = view.findViewById(R.id.autohide_comment);
 			autohideName = view.findViewById(R.id.autohide_name);
+			autohideFileName = view.findViewById(R.id.autohide_file_name);
 			valueEdit = view.findViewById(R.id.value);
 			errorText = view.findViewById(R.id.error_text);
 			matcherText = view.findViewById(R.id.matcher_result);
 			testStringEdit = view.findViewById(R.id.test_string);
 			valueEdit.addTextChangedListener(valueListener);
 			testStringEdit.addTextChangedListener(testStringListener);
-			chanNameSelector.setOnClickListener(this);
+			chanNameSelector.setOnClickListener(v -> new ChanMultiChoiceDialog(selectedChanNames).show(this));
+			if (C.API_LOLLIPOP) {
+				chanNameSelector.setTypeface(ResourceUtils.TYPEFACE_MEDIUM);
+			}
 			if (!ChanManager.getInstance().hasMultipleAvailableChans()) {
 				chanNameSelector.setVisibility(View.GONE);
 			}
@@ -408,6 +419,7 @@ public class AutohideFragment extends BaseListFragment implements ActivityHandle
 				autohideSubject.setChecked(autohideItem.optionSubject);
 				autohideComment.setChecked(autohideItem.optionComment);
 				autohideName.setChecked(autohideItem.optionName);
+				autohideFileName.setChecked(autohideItem.optionFileName);
 				valueEdit.setText(autohideItem.value);
 			} else {
 				chanNameSelector.setText(R.string.all_forums);
@@ -418,6 +430,7 @@ public class AutohideFragment extends BaseListFragment implements ActivityHandle
 				autohideSubject.setChecked(true);
 				autohideComment.setChecked(true);
 				autohideName.setChecked(true);
+				autohideFileName.setChecked(false);
 				valueEdit.setText(null);
 			}
 			updateTestResult();
@@ -443,14 +456,9 @@ public class AutohideFragment extends BaseListFragment implements ActivityHandle
 						(d, which) -> ((AutohideFragment) getParentFragment()).onDelete(index));
 			}
 			AlertDialog dialog = builder.create();
-			dialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+			dialog.getWindow().setSoftInputMode(C.API_R ? WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN
+					: ViewUtils.SOFT_INPUT_ADJUST_RESIZE_COMPAT);
 			return dialog;
-		}
-
-		@Override
-		public void onClick(View v) {
-			MultipleChanDialog dialog = new MultipleChanDialog(new ArrayList<>(selectedChanNames));
-			dialog.show(getChildFragmentManager(), MultipleChanDialog.class.getName());
 		}
 
 		private void updateSelectedText() {
@@ -462,8 +470,8 @@ public class AutohideFragment extends BaseListFragment implements ActivityHandle
 				chanNameText = getString(R.string.multiple_forums);
 			} else {
 				String chanName = selectedChanNames.iterator().next();
-				ChanConfiguration configuration = ChanConfiguration.get(chanName);
-				String title = configuration != null ? configuration.getTitle() : chanName;
+				Chan chan = Chan.get(chanName);
+				String title = chan.name != null ? chan.configuration.getTitle() : chanName;
 				chanNameText = getString(R.string.forum_only__format, title);
 			}
 			chanNameSelector.setText(chanNameText);
@@ -477,15 +485,17 @@ public class AutohideFragment extends BaseListFragment implements ActivityHandle
 			boolean optionSubject = autohideSubject.isChecked();
 			boolean optionComment = autohideComment.isChecked();
 			boolean optionName = autohideName.isChecked();
+			boolean optionFileName = autohideFileName.isChecked();
 			String value = valueEdit.getText().toString();
 			return new AutohideStorage.AutohideItem(selectedChanNames.size() > 0 ? selectedChanNames : null,
 					boardName, threadNumber, optionOriginalPost, optionSage,
-					optionSubject, optionComment, optionName, value);
+					optionSubject, optionComment, optionName, optionFileName, value);
 		}
 
-		private void onChansSelected(ArrayList<String> selected) {
+		@Override
+		public void onChansSelected(Collection<String> chanNames) {
 			selectedChanNames.clear();
-			selectedChanNames.addAll(selected);
+			selectedChanNames.addAll(chanNames);
 			updateSelectedText();
 		}
 
@@ -603,69 +613,5 @@ public class AutohideFragment extends BaseListFragment implements ActivityHandle
 			@Override
 			public void afterTextChanged(Editable s) {}
 		};
-	}
-
-	public static class MultipleChanDialog extends DialogFragment
-			implements DialogInterface.OnMultiChoiceClickListener {
-		private static final String EXTRA_SELECTED = "selected";
-		private static final String EXTRA_CHECKED = "checked";
-
-		public MultipleChanDialog() {}
-
-		public MultipleChanDialog(ArrayList<String> selected) {
-			Bundle args = new Bundle();
-			args.putStringArrayList(EXTRA_SELECTED, selected);
-			setArguments(args);
-		}
-
-		private boolean[] checkedItems;
-
-		@NonNull
-		@Override
-		public AlertDialog onCreateDialog(Bundle savedInstanceState) {
-			ArrayList<String> chanNames = new ArrayList<>();
-			for (String chanName : ChanManager.getInstance().getAvailableChanNames()) {
-				chanNames.add(chanName);
-			}
-			String[] items = new String[chanNames.size()];
-			for (int i = 0; i < chanNames.size(); i++) {
-				items[i] = ChanConfiguration.get(chanNames.get(i)).getTitle();
-			}
-			boolean[] checkedItems = savedInstanceState != null ? savedInstanceState
-					.getBooleanArray(EXTRA_CHECKED) : null;
-			// size != length means some chans were added or deleted while configuration was changing (very rare case)
-			if (checkedItems == null || chanNames.size() != checkedItems.length) {
-				ArrayList<String> selected = requireArguments().getStringArrayList(EXTRA_SELECTED);
-				checkedItems = new boolean[items.length];
-				for (int i = 0; i < chanNames.size(); i++) {
-					checkedItems[i] = selected.contains(chanNames.get(i));
-				}
-			}
-			this.checkedItems = checkedItems;
-			return new AlertDialog.Builder(requireContext())
-					.setMultiChoiceItems(items, checkedItems, this)
-					.setNegativeButton(android.R.string.cancel, null)
-					.setPositiveButton(android.R.string.ok, (d, which) -> {
-						ArrayList<String> selected = new ArrayList<>();
-						for (int i = 0; i < chanNames.size(); i++) {
-							if (this.checkedItems[i]) {
-								selected.add(chanNames.get(i));
-							}
-						}
-						((AutohideDialog) getParentFragment()).onChansSelected(selected);
-					})
-					.create();
-		}
-
-		@Override
-		public void onSaveInstanceState(@NonNull Bundle outState) {
-			super.onSaveInstanceState(outState);
-			outState.putBooleanArray(EXTRA_CHECKED, checkedItems);
-		}
-
-		@Override
-		public void onClick(DialogInterface dialog, int which, boolean isChecked) {
-			checkedItems[which] = isChecked;
-		}
 	}
 }

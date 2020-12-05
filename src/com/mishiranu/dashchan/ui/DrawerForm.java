@@ -30,27 +30,30 @@ import android.widget.PopupMenu;
 import android.widget.TextView;
 import androidx.annotation.NonNull;
 import androidx.drawerlayout.widget.DrawerLayout;
+import androidx.fragment.app.FragmentManager;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
+import chan.content.Chan;
 import chan.content.ChanConfiguration;
-import chan.content.ChanLocator;
 import chan.content.ChanManager;
+import chan.content.ChanMarkup;
+import chan.util.CommonUtils;
 import chan.util.StringUtils;
 import com.mishiranu.dashchan.C;
 import com.mishiranu.dashchan.R;
 import com.mishiranu.dashchan.content.Preferences;
+import com.mishiranu.dashchan.content.model.PostNumber;
 import com.mishiranu.dashchan.content.service.WatcherService;
 import com.mishiranu.dashchan.content.storage.FavoritesStorage;
 import com.mishiranu.dashchan.graphics.ChanIconDrawable;
-import com.mishiranu.dashchan.util.ConfigurationLock;
-import com.mishiranu.dashchan.util.DialogMenu;
 import com.mishiranu.dashchan.util.FlagUtils;
 import com.mishiranu.dashchan.util.GraphicsUtils;
+import com.mishiranu.dashchan.util.IOUtils;
 import com.mishiranu.dashchan.util.ListViewUtils;
 import com.mishiranu.dashchan.util.NavigationUtils;
 import com.mishiranu.dashchan.util.ResourceUtils;
-import com.mishiranu.dashchan.util.ToastUtils;
 import com.mishiranu.dashchan.util.ViewUtils;
+import com.mishiranu.dashchan.widget.ClickableToast;
 import com.mishiranu.dashchan.widget.DividerItemDecoration;
 import com.mishiranu.dashchan.widget.EdgeEffectHandler;
 import com.mishiranu.dashchan.widget.PaddedRecyclerView;
@@ -68,11 +71,10 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> implements EdgeEffectHandler.Shift,
-		DrawerLayout.DrawerListener, EditText.OnEditorActionListener, SortableHelper.Callback<DrawerForm.ViewHolder>,
-		WatcherService.Client.Callback {
+		DrawerLayout.DrawerListener, EditText.OnEditorActionListener, SortableHelper.Callback<DrawerForm.ViewHolder> {
 	private final Context context;
 	private final Callback callback;
-	private final ConfigurationLock configurationLock;
+	private final FragmentManager fragmentManager;
 	private final WatcherView.ColorSet watcherViewColorSet;
 	private final SortableHelper<ViewHolder> sortableHelper;
 	private final int drawerIconColor;
@@ -98,7 +100,7 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 
 	private boolean mergeChans = false;
 	private boolean showHistory = false;
-	private int pagesListMode = -1;
+	private Preferences.PagesListMode pagesListMode = null;
 	private boolean chanSelectMode = false;
 	private boolean showRestartButton = false;
 	private CategoriesOrder categoriesOrder;
@@ -137,24 +139,24 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 	}
 
 	public interface Callback {
-		public void onSelectChan(String chanName);
-		public void onSelectBoard(String chanName, String boardName, boolean fromCache);
-		public boolean onSelectThread(String chanName, String boardName, String threadNumber, String postNumber,
+		void onSelectChan(String chanName);
+		void onSelectBoard(String chanName, String boardName, boolean fromCache);
+		boolean onSelectThread(String chanName, String boardName, String threadNumber, PostNumber postNumber,
 				String threadTitle, boolean fromCache);
-		public void onClosePage(String chanName, String boardName, String threadNumber);
-		public void onCloseAllPages();
-		public int onEnterNumber(int number);
-		public void onSelectDrawerMenuItem(int item);
-		public void onDraggingStateChanged(boolean dragging);
-		public Collection<Page> obtainDrawerPages();
-		public void restartApplication();
+		void onClosePage(String chanName, String boardName, String threadNumber);
+		void onCloseAllPages();
+		int onEnterNumber(int number);
+		void onSelectDrawerMenuItem(int item);
+		void onDraggingStateChanged(boolean dragging);
+		Collection<Page> obtainDrawerPages();
+		void restartApplication();
 	}
 
-	public DrawerForm(Context context, Callback callback, ConfigurationLock configurationLock,
+	public DrawerForm(Context context, Callback callback, FragmentManager fragmentManager,
 			WatcherService.Client watcherServiceClient) {
 		this.context = context;
 		this.callback = callback;
-		this.configurationLock = configurationLock;
+		this.fragmentManager = fragmentManager;
 		this.watcherServiceClient = watcherServiceClient;
 
 		int enabledColor = ThemeEngine.getTheme(context).accent;
@@ -281,9 +283,9 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 		chanNameView = new TextView(context, null, android.R.attr.textAppearanceListItem);
 		ViewUtils.setTextSizeScaled(chanNameView, C.API_LOLLIPOP ? 14 : 16);
 		if (C.API_LOLLIPOP) {
-			chanNameView.setTypeface(GraphicsUtils.TYPEFACE_MEDIUM);
+			chanNameView.setTypeface(ResourceUtils.TYPEFACE_MEDIUM);
 		} else {
-			chanNameView.setFilters(new InputFilter[]{new InputFilter.AllCaps()});
+			chanNameView.setFilters(new InputFilter[] {new InputFilter.AllCaps()});
 		}
 		selectorContainer.addView(chanNameView, new LinearLayout.LayoutParams(0,
 				LinearLayout.LayoutParams.WRAP_CONTENT, 1));
@@ -322,21 +324,21 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 				LinearLayout.LayoutParams.WRAP_CONTENT);
 
 		inputMethodManager = (InputMethodManager) context.getSystemService(Context.INPUT_METHOD_SERVICE);
-		updatePreferencesInternal(true);
-		updateChans();
+		updatePreferencesWithoutConfiguration();
+		updateChansWithoutConfiguration();
 	}
 
-	private void updateConfiguration(String chanName, boolean force) {
-		if (!StringUtils.equals(chanName, this.chanName) || force || menu.isEmpty()) {
+	private void updateConfigurationInternal(String chanName, boolean force) {
+		if (!CommonUtils.equals(chanName, this.chanName) || force || menu.isEmpty()) {
 			this.chanName = chanName;
-			ChanConfiguration configuration = ChanConfiguration.get(chanName);
-			chanNameView.setText(configuration.getTitle());
+			Chan chan = Chan.get(chanName);
+			chanNameView.setText(chan.configuration.getTitle());
 			menu.clear();
 			Context context = this.context;
 			TypedArray typedArray = context.obtainStyledAttributes(new int[] {R.attr.iconDrawerMenuBoards,
 					R.attr.iconDrawerMenuUserBoards, R.attr.iconDrawerMenuHistory, R.attr.iconDrawerMenuPreferences});
-			boolean hasUserBoards = configuration.getOption(ChanConfiguration.OPTION_READ_USER_BOARDS);
-			if (chanName != null && !configuration.getOption(ChanConfiguration.OPTION_SINGLE_BOARD_MODE)) {
+			boolean hasUserBoards = chan.configuration.getOption(ChanConfiguration.OPTION_READ_USER_BOARDS);
+			if (chanName != null && !chan.configuration.getOption(ChanConfiguration.OPTION_SINGLE_BOARD_MODE)) {
 				menu.add(new ListItem(ListItem.Type.MENU, MENU_ITEM_BOARDS, typedArray.getResourceId(0, 0),
 						context.getString(hasUserBoards ? R.string.general_boards : R.string.boards)));
 			}
@@ -351,12 +353,12 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 			menu.add(new ListItem(ListItem.Type.MENU, MENU_ITEM_PREFERENCES, typedArray.getResourceId(3, 0),
 					context.getString(R.string.preferences)));
 			typedArray.recycle();
-			invalidateItems(force, true);
+			updateItems(true, true);
 		}
 	}
 
 	public void updateConfiguration(String chanName) {
-		updateConfiguration(chanName, false);
+		updateConfigurationInternal(chanName, false);
 	}
 
 	public View getContentView() {
@@ -382,7 +384,7 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 	}
 
 	public void updateRestartViewVisibility() {
-		boolean showRestartButton = !chanSelectMode && ChanManager.getInstance().hasNewExtensionsInstalled();
+		boolean showRestartButton = !chanSelectMode && ChanManager.getInstance().isRestartRequired();
 		if (this.showRestartButton != showRestartButton) {
 			this.showRestartButton = showRestartButton;
 			notifyDataSetChanged();
@@ -390,18 +392,22 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 	}
 
 	public void updateChans() {
+		updateChansWithoutConfiguration();
+		updateConfigurationInternal(chanName, true);
+	}
+
+	private void updateChansWithoutConfiguration() {
 		ChanManager manager = ChanManager.getInstance();
-		Iterable<String> availableChans = manager.getAvailableChanNames();
+		Iterable<Chan> availableChans = manager.getAvailableChans();
 		int availableChansCount = 0;
 		chans.clear();
 		watcherSupportSet.clear();
-		for (String chanName : availableChans) {
+		for (Chan chan : availableChans) {
 			availableChansCount++;
-			ChanConfiguration configuration = ChanConfiguration.get(chanName);
-			if (configuration.getOption(ChanConfiguration.OPTION_READ_POSTS_COUNT)) {
-				watcherSupportSet.add(chanName);
+			if (watcherServiceClient.isWatcherSupported(chan)) {
+				watcherSupportSet.add(chan.name);
 			}
-			chans.add(new ListItem(ListItem.Type.CHAN, 0, chanName, null, null, configuration.getTitle()));
+			chans.add(new ListItem(ListItem.Type.CHAN, 0, chan.name, null, null, chan.configuration.getTitle()));
 		}
 		selectorContainer.setVisibility(availableChansCount >= 2 ? View.VISIBLE : View.GONE);
 		if (chanSelectMode && availableChansCount <= 1) {
@@ -411,22 +417,23 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 	}
 
 	public void updatePreferences() {
-		updatePreferencesInternal(false);
+		if (updatePreferencesWithoutConfiguration()) {
+			updateConfigurationInternal(chanName, true);
+		}
 	}
 
-	private void updatePreferencesInternal(boolean initial) {
+	private boolean updatePreferencesWithoutConfiguration() {
 		boolean mergeChans = Preferences.isMergeChans();
 		boolean showHistory = Preferences.isRememberHistory();
-		int pagesListMode = Preferences.getPagesListMode();
+		Preferences.PagesListMode pagesListMode = Preferences.getPagesListMode();
 		if (this.mergeChans != mergeChans || this.showHistory != showHistory ||
 				this.pagesListMode != pagesListMode) {
 			this.mergeChans = mergeChans;
 			this.showHistory = showHistory;
 			this.pagesListMode = pagesListMode;
-			if (!initial) {
-				updateConfiguration(chanName, true);
-			}
+			return true;
 		}
+		return false;
 	}
 
 	@Override
@@ -475,76 +482,86 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 		switch (listItem.type) {
 			case PAGE:
 			case FAVORITE: {
-				DialogMenu dialogMenu = new DialogMenu(context);
-				dialogMenu.add(R.string.copy_link, () -> onCopyShareLink(listItem, false));
-				if (listItem.isThreadItem()) {
-					dialogMenu.add(R.string.share_link, () -> onCopyShareLink(listItem, true));
-				}
-				if (listItem.type != ListItem.Type.FAVORITE && !FavoritesStorage.getInstance()
-						.hasFavorite(listItem.chanName, listItem.boardName, listItem.threadNumber)) {
-					dialogMenu.add(R.string.add_to_favorites, () -> {
-						if (listItem.isThreadItem()) {
-							FavoritesStorage.getInstance().add(listItem.chanName, listItem.boardName,
-									listItem.threadNumber, listItem.title, 0);
-						} else {
-							FavoritesStorage.getInstance().add(listItem.chanName, listItem.boardName);
-						}
-					});
-				}
-				if (listItem.type == ListItem.Type.FAVORITE) {
-					dialogMenu.add(R.string.remove_from_favorites, () -> FavoritesStorage.getInstance()
-							.remove(listItem.chanName, listItem.boardName, listItem.threadNumber));
-					if (listItem.threadNumber != null) {
-						dialogMenu.add(R.string.rename, () -> {
-							EditText editText = new SafePasteEditText(context);
-							editText.setSingleLine(true);
-							editText.setText(listItem.title);
-							editText.setSelection(editText.length());
-							LinearLayout linearLayout = new LinearLayout(context);
-							linearLayout.setOrientation(LinearLayout.HORIZONTAL);
-							linearLayout.addView(editText, LinearLayout.LayoutParams.MATCH_PARENT,
-									LinearLayout.LayoutParams.WRAP_CONTENT);
-							int padding = context.getResources().getDimensionPixelSize(R.dimen
-									.dialog_padding_view);
-							linearLayout.setPadding(padding, padding, padding, padding);
-							AlertDialog dialog = new AlertDialog.Builder(context)
-									.setView(linearLayout).setTitle(R.string.rename)
-									.setNegativeButton(android.R.string.cancel, null)
-									.setPositiveButton(android.R.string.ok, (d, which) -> {
-										String newTitle = editText.getText().toString();
-										FavoritesStorage.getInstance().modifyTitle(listItem.chanName,
-												listItem.boardName, listItem.threadNumber, newTitle, true);
-									}).create();
-							dialog.getWindow().setSoftInputMode(WindowManager
-									.LayoutParams.SOFT_INPUT_STATE_VISIBLE);
-							configurationLock.lockConfiguration(dialog);
-							dialog.show();
-						});
-					}
-				}
-				dialogMenu.show(configurationLock);
+				showPageFavoriteMenu(fragmentManager, listItem.type == ListItem.Type.FAVORITE, listItem.isThreadItem(),
+						listItem.chanName, listItem.boardName, listItem.threadNumber, listItem.title);
 				return true;
 			}
 		}
 		return false;
 	}
 
-	private void onCopyShareLink(ListItem listItem, boolean share) {
-		ChanLocator locator = ChanLocator.get(listItem.chanName);
-		Uri uri = listItem.isThreadItem() ? locator.safe(true).createThreadUri
-				(listItem.boardName, listItem.threadNumber)
-				: locator.safe(true).createBoardUri(listItem.boardName, 0);
+	private static void showPageFavoriteMenu(FragmentManager fragmentManager, boolean isFavorite, boolean isThread,
+			String chanName, String boardName, String threadNumber, String title) {
+		new InstanceDialog(fragmentManager, null, provider -> {
+			Context context = provider.getContext();
+			DialogMenu dialogMenu = new DialogMenu(provider.getContext());
+			dialogMenu.add(R.string.copy_link, () -> onCopyShareLink(context, isThread, false,
+					chanName, boardName, threadNumber, title));
+			if (isThread) {
+				dialogMenu.add(R.string.share_link, () -> onCopyShareLink(context, isThread, true,
+						chanName, boardName, threadNumber, title));
+			}
+			if (isFavorite) {
+				dialogMenu.add(R.string.remove_from_favorites, () -> FavoritesStorage.getInstance()
+						.remove(chanName, boardName, threadNumber));
+				if (threadNumber != null) {
+					dialogMenu.add(R.string.rename, () -> showRenameFragment(provider.getFragmentManager(),
+							chanName, boardName, threadNumber, title));
+				}
+			} else if (!FavoritesStorage.getInstance().hasFavorite(chanName, boardName, threadNumber)) {
+				dialogMenu.add(R.string.add_to_favorites, () -> {
+					if (isThread) {
+						FavoritesStorage.getInstance().add(chanName, boardName, threadNumber, title);
+					} else {
+						FavoritesStorage.getInstance().add(chanName, boardName);
+					}
+				});
+			}
+			return dialogMenu.create();
+		});
+	}
+
+	private static void onCopyShareLink(Context context, boolean isThread, boolean share,
+			String chanName, String boardName, String threadNumber, String title) {
+		Chan chan = Chan.get(chanName);
+		Uri uri = isThread ? chan.locator.safe(true).createThreadUri(boardName, threadNumber)
+				: chan.locator.safe(true).createBoardUri(boardName, 0);
 		if (uri != null) {
 			if (share) {
-				String subject = listItem.title;
-				if (StringUtils.isEmptyOrWhitespace(subject)) {
-					subject = uri.toString();
-				}
-				NavigationUtils.shareLink(context, subject, uri);
+				NavigationUtils.shareLink(context, StringUtils.isEmptyOrWhitespace(title)
+						? uri.toString() : title, uri);
 			} else {
 				StringUtils.copyToClipboard(context, uri.toString());
 			}
 		}
+	}
+
+	private static void showRenameFragment(FragmentManager fragmentManager,
+			String chanName, String boardName, String threadNumber, String title) {
+		new InstanceDialog(fragmentManager, null, provider -> {
+			Context context = provider.getContext();
+			EditText editText = new SafePasteEditText(context);
+			editText.setId(android.R.id.edit);
+			editText.setSingleLine(true);
+			editText.setText(title);
+			editText.setSelection(editText.length());
+			LinearLayout linearLayout = new LinearLayout(context);
+			linearLayout.setOrientation(LinearLayout.HORIZONTAL);
+			linearLayout.addView(editText, LinearLayout.LayoutParams.MATCH_PARENT,
+					LinearLayout.LayoutParams.WRAP_CONTENT);
+			int padding = context.getResources().getDimensionPixelSize(R.dimen
+					.dialog_padding_view);
+			linearLayout.setPadding(padding, padding, padding, padding);
+			AlertDialog dialog = new AlertDialog.Builder(context)
+					.setView(linearLayout).setTitle(R.string.rename)
+					.setNegativeButton(android.R.string.cancel, null)
+					.setPositiveButton(android.R.string.ok, (d, which) -> {
+						String newTitle = editText.getText().toString();
+						FavoritesStorage.getInstance().updateTitle(chanName, boardName, threadNumber, newTitle, true);
+					}).create();
+			dialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE);
+			return dialog;
+		});
 	}
 
 	@Override
@@ -629,36 +646,69 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 				}
 			}
 			Uri uri = Uri.parse(text);
-			String chanName = ChanManager.getInstance().getChanNameByHost(uri.getAuthority());
-			if (chanName != null) {
+			Chan chan = Chan.getPreferred(null, uri);
+			if (chan.name != null) {
 				boolean success = false;
 				String boardName = null;
 				String threadNumber = null;
-				String postNumber = null;
-				ChanLocator locator = ChanLocator.get(chanName);
-				if (locator.safe(false).isThreadUri(uri)) {
-					boardName = locator.safe(false).getBoardName(uri);
-					threadNumber = locator.safe(false).getThreadNumber(uri);
-					postNumber = locator.safe(false).getPostNumber(uri);
+				PostNumber postNumber = null;
+				if (chan.locator.safe(false).isThreadUri(uri)) {
+					boardName = chan.locator.safe(false).getBoardName(uri);
+					threadNumber = chan.locator.safe(false).getThreadNumber(uri);
+					postNumber = chan.locator.safe(false).getPostNumber(uri);
 					success = true;
-				} else if (locator.safe(false).isBoardUri(uri)) {
-					boardName = locator.safe(false).getBoardName(uri);
+				} else if (chan.locator.safe(false).isBoardUri(uri)) {
+					boardName = chan.locator.safe(false).getBoardName(uri);
 					threadNumber = null;
 					postNumber = null;
 					success = true;
 				}
 				if (success) {
 					if (threadNumber == null) {
-						callback.onSelectBoard(chanName, boardName, false);
+						callback.onSelectBoard(chan.name, boardName, false);
 					} else {
-						callback.onSelectThread(chanName, boardName, threadNumber, postNumber, null, false);
+						callback.onSelectThread(chan.name, boardName, threadNumber, postNumber, null, false);
 					}
 					clearTextAndHideKeyboard();
 					return;
 				}
 			}
 		}
-		ToastUtils.show(context, R.string.enter_valid_data);
+		if (text.isEmpty()) {
+			SearchHelpFormat searchHelpFormat = null;
+			if (chanName != null) {
+				Chan chan = Chan.get(chanName);
+				if (chan.name != null && !chan.configuration.getOption(ChanConfiguration.OPTION_SINGLE_BOARD_MODE)) {
+					searchHelpFormat = SearchHelpFormat.obtain(chan, false);
+				}
+			}
+			if (searchHelpFormat == null) {
+				for (Chan chan : ChanManager.getInstance().getAvailableChans()) {
+					if (!chan.configuration.getOption(ChanConfiguration.OPTION_SINGLE_BOARD_MODE)) {
+						searchHelpFormat = SearchHelpFormat.obtain(chan, false);
+						if (searchHelpFormat != null) {
+							break;
+						}
+					}
+				}
+			}
+			if (searchHelpFormat == null) {
+				for (Chan chan : ChanManager.getInstance().getAvailableChans()) {
+					if (chan.configuration.getOption(ChanConfiguration.OPTION_SINGLE_BOARD_MODE)) {
+						searchHelpFormat = SearchHelpFormat.obtain(chan, true);
+						if (searchHelpFormat != null) {
+							break;
+						}
+					}
+				}
+			}
+			if (searchHelpFormat == null) {
+				searchHelpFormat = new SearchHelpFormat("mobi", "307707", "https://2ch.hk/mobi/res/307707.html");
+			}
+			showSearchHelp(fragmentManager, searchHelpFormat);
+			return;
+		}
+		ClickableToast.show(R.string.enter_valid_data);
 	}
 
 	@Override
@@ -667,45 +717,109 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 		return true;
 	}
 
-	public void invalidateItems(boolean pages, boolean favorites) {
-		if (pages) {
-			this.pages.clear();
-			if (pagesListMode != Preferences.PAGES_LIST_MODE_HIDE_PAGES) {
-				updateListPages();
+	private static class SearchHelpFormat {
+		public final String boardName;
+		public final String threadNumber;
+		public final String threadUrl;
+
+		public SearchHelpFormat(String boardName, String threadNumber, String threadUrl) {
+			this.boardName = boardName;
+			this.threadNumber = threadNumber;
+			this.threadUrl = threadUrl;
+		}
+
+		public static SearchHelpFormat obtain(Chan chan, boolean allowEmptyBoardName) {
+			String boardName = Preferences.getDefaultBoardName(chan);
+			if (boardName == null) {
+				ArrayList<FavoritesStorage.FavoriteItem> favoriteItems = FavoritesStorage
+						.getInstance().getBoards(chan.name);
+				if (!favoriteItems.isEmpty()) {
+					boardName = favoriteItems.get(0).boardName;
+				}
 			}
+			if (boardName == null) {
+				if (allowEmptyBoardName) {
+					boardName = "b";
+				} else {
+					return null;
+				}
+			}
+			String threadNumber = null;
+			ArrayList<FavoritesStorage.FavoriteItem> favoriteItems = FavoritesStorage
+					.getInstance().getThreads(chan.name);
+			if (!favoriteItems.isEmpty()) {
+				threadNumber = favoriteItems.get(0).threadNumber;
+			}
+			if (threadNumber == null) {
+				return null;
+			}
+			Uri uri = chan.locator.safe(false).createThreadUri(boardName, threadNumber);
+			if (uri == null) {
+				return null;
+			}
+			return new SearchHelpFormat(boardName, threadNumber, uri.toString());
+		}
+	}
+
+	private static void showSearchHelp(FragmentManager fragmentManager, SearchHelpFormat searchHelpFormat) {
+		new InstanceDialog(fragmentManager, null, provider -> {
+			Context context = provider.getContext();
+			String html = IOUtils.readRawResourceString(context.getResources(), R.raw.markup_drawer_search)
+					.replace("__REPLACE_BOARD_NAME__", searchHelpFormat.boardName)
+					.replace("__REPLACE_THREAD_NUMBER__", searchHelpFormat.threadNumber)
+					.replace("__REPLACE_THREAD_URL__", searchHelpFormat.threadUrl);
+			return new AlertDialog.Builder(context)
+					.setTitle(R.string.code_number_address)
+					.setMessage(BUILDER_SEARCH_HELP.fromHtmlReduced(html))
+					.setPositiveButton(android.R.string.ok, null)
+					.create();
+		});
+	}
+
+	private static final ChanMarkup.MarkupBuilder BUILDER_SEARCH_HELP = new ChanMarkup.MarkupBuilder(markup -> {
+		markup.addTag("h1", ChanMarkup.TAG_BOLD);
+		markup.addTag("u", ChanMarkup.TAG_UNDERLINE);
+	});
+
+	public void updateItems(boolean pages, boolean favorites) {
+		if (pages && pagesListMode != Preferences.PagesListMode.HIDE_PAGES) {
+			updateListPages();
 		}
 		if (favorites) {
-			this.favorites.clear();
 			updateListFavorites();
 		}
-		switch (pagesListMode) {
-			case Preferences.PAGES_LIST_MODE_PAGES_FIRST: {
-				categoriesOrder = CategoriesOrder.PAGES_FIRST;
-				break;
-			}
-			case Preferences.PAGES_LIST_MODE_FAVORITES_FIRST: {
-				categoriesOrder = CategoriesOrder.FAVORITES_FIRST;
-				break;
-			}
-			case Preferences.PAGES_LIST_MODE_HIDE_PAGES: {
-				categoriesOrder = CategoriesOrder.HIDE_PAGES;
-				break;
-			}
-			default: {
-				categoriesOrder = null;
-				break;
+		if (pagesListMode == null) {
+			categoriesOrder = null;
+		} else {
+			switch (pagesListMode) {
+				case PAGES_FIRST: {
+					categoriesOrder = CategoriesOrder.PAGES_FIRST;
+					break;
+				}
+				case FAVORITES_FIRST: {
+					categoriesOrder = CategoriesOrder.FAVORITES_FIRST;
+					break;
+				}
+				case HIDE_PAGES: {
+					categoriesOrder = CategoriesOrder.HIDE_PAGES;
+					break;
+				}
+				default: {
+					throw new IllegalStateException();
+				}
 			}
 		}
 		notifyDataSetChanged();
 	}
 
 	private void updateListPages() {
+		this.pages.clear();
 		boolean mergeChans = this.mergeChans;
 		Collection<Page> allPages = callback.obtainDrawerPages();
 		ArrayList<Page> pages = new ArrayList<>();
 		for (Page page : allPages) {
 			if (mergeChans || page.chanName.equals(chanName)) {
-				if (page.threadNumber != null || !ChanConfiguration.get(page.chanName)
+				if (page.threadNumber != null || !Chan.get(page.chanName).configuration
 						.getOption(ChanConfiguration.OPTION_SINGLE_BOARD_MODE)) {
 					pages.add(page);
 				}
@@ -722,13 +836,14 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 							page.threadNumber, page.threadTitle));
 				} else {
 					this.pages.add(new ListItem(ListItem.Type.PAGE, 0, page.chanName, page.boardName,
-							null, ChanConfiguration.get(page.chanName).getBoardTitle(page.boardName)));
+							null, Chan.get(page.chanName).configuration.getBoardTitle(page.boardName)));
 				}
 			}
 		}
 	}
 
 	private void updateListFavorites() {
+		this.favorites.clear();
 		boolean mergeChans = this.mergeChans;
 		FavoritesStorage favoritesStorage = FavoritesStorage.getInstance();
 		ArrayList<FavoritesStorage.FavoriteItem> favoriteBoards = favoritesStorage.getBoards(mergeChans
@@ -738,7 +853,8 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 		boolean addSection = true;
 		for (int i = 0; i < favoriteThreads.size(); i++) {
 			FavoritesStorage.FavoriteItem favoriteItem = favoriteThreads.get(i);
-			if (!ChanManager.getInstance().isAvailableChanName(favoriteItem.chanName)) {
+			Chan chan = Chan.get(favoriteItem.chanName);
+			if (chan.name == null) {
 				continue;
 			}
 			if (mergeChans || favoriteItem.chanName.equals(chanName)) {
@@ -756,20 +872,14 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 				}
 				ListItem listItem = new ListItem(ListItem.Type.FAVORITE, 0, favoriteItem.chanName,
 						favoriteItem.boardName, favoriteItem.threadNumber, favoriteItem.title);
-				if (watcherSupportSet.contains(favoriteItem.chanName)) {
-					WatcherService.TemporalCountData temporalCountData = watcherServiceClient
-							.countNewPosts(favoriteItem);
-					listItem.watcherPostsCountDifference = temporalCountData.postsCountDifference;
-					listItem.watcherHasNewPosts = temporalCountData.hasNewPosts;
-					listItem.watcherIsError = temporalCountData.isError;
-				}
 				favorites.add(listItem);
 			}
 		}
 		addSection = true;
 		for (int i = 0; i < favoriteBoards.size(); i++) {
 			FavoritesStorage.FavoriteItem favoriteItem = favoriteBoards.get(i);
-			if (!ChanManager.getInstance().isAvailableChanName(favoriteItem.chanName)) {
+			Chan chan = Chan.get(favoriteItem.chanName);
+			if (chan.name == null) {
 				continue;
 			}
 			if (mergeChans || favoriteItem.chanName.equals(chanName)) {
@@ -779,7 +889,7 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 					addSection = false;
 				}
 				favorites.add(new ListItem(ListItem.Type.FAVORITE, 0, favoriteItem.chanName, favoriteItem.boardName,
-						null, ChanConfiguration.get(favoriteItem.chanName).getBoardTitle(favoriteItem.boardName)));
+						null, chan.configuration.getBoardTitle(favoriteItem.boardName)));
 			}
 		}
 	}
@@ -811,10 +921,6 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 		public final String boardName;
 		public final String threadNumber;
 		public final String title;
-
-		private int watcherPostsCountDifference = 0;
-		private boolean watcherHasNewPosts = false;
-		private boolean watcherIsError = false;
 
 		private static long nextItemId = 0;
 
@@ -857,8 +963,8 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 		}
 
 		public boolean compare(String chanName, String boardName, String threadNumber) {
-			return StringUtils.equals(this.chanName, chanName) && StringUtils.equals(this.boardName, boardName)
-					&& StringUtils.equals(this.threadNumber, threadNumber);
+			return CommonUtils.equals(this.chanName, chanName) && CommonUtils.equals(this.boardName, boardName)
+					&& CommonUtils.equals(this.threadNumber, threadNumber);
 		}
 	}
 
@@ -899,10 +1005,7 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 										(itListItem.chanName, itListItem.boardName, itListItem.threadNumber);
 								if (favoriteItem != null) {
 									hasEnabled |= favoriteItem.watcherEnabled;
-									WatcherService.TemporalCountData temporalCountData =
-											watcherServiceClient.countNewPosts(favoriteItem);
-									if (temporalCountData.postsCountDifference ==
-											WatcherService.POSTS_COUNT_DIFFERENCE_DELETED) {
+									if (getCounter(itListItem).deleted) {
 										deleteFavoriteItems.add(favoriteItem);
 									}
 								}
@@ -926,7 +1029,11 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 						popupMenu.setOnMenuItemClickListener(item -> {
 							switch (item.getItemId()) {
 								case FAVORITES_MENU_REFRESH: {
-									watcherServiceClient.update();
+									if (mergeChans) {
+										watcherServiceClient.refreshAll(null);
+									} else if (chanName != null) {
+										watcherServiceClient.refreshAll(chanName);
+									}
 									return true;
 								}
 								case FAVORITES_MENU_CLEAR_DELETED: {
@@ -937,17 +1044,7 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 										builder.append("\n\u2022 ").append(formatBoardThreadTitle(true,
 												favoriteItem.boardName, favoriteItem.threadNumber, favoriteItem.title));
 									}
-									AlertDialog dialog = new AlertDialog.Builder(context)
-											.setMessage(builder)
-											.setNegativeButton(android.R.string.cancel, null)
-											.setPositiveButton(android.R.string.ok, (d, which) -> {
-												for (FavoritesStorage.FavoriteItem favoriteItem : deleteFavoriteItems) {
-													favoritesStorage.remove(favoriteItem.chanName,
-															favoriteItem.boardName, favoriteItem.threadNumber);
-												}
-											})
-											.show();
-									configurationLock.lockConfiguration(dialog);
+									showDeleteFavoritesDialog(fragmentManager, builder, deleteFavoriteItems);
 									return true;
 								}
 							}
@@ -960,6 +1057,22 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 			}
 		}
 	};
+
+	private static void showDeleteFavoritesDialog(FragmentManager fragmentManager,
+			CharSequence message, List<FavoritesStorage.FavoriteItem> deleteFavoriteItems) {
+		new InstanceDialog(fragmentManager, null, provider -> new AlertDialog
+				.Builder(provider.getContext())
+				.setMessage(message)
+				.setNegativeButton(android.R.string.cancel, null)
+				.setPositiveButton(android.R.string.ok, (d, which) -> {
+					FavoritesStorage favoritesStorage = FavoritesStorage.getInstance();
+					for (FavoritesStorage.FavoriteItem favoriteItem : deleteFavoriteItems) {
+						favoritesStorage.remove(favoriteItem.chanName,
+								favoriteItem.boardName, favoriteItem.threadNumber);
+					}
+				})
+				.create());
+	}
 
 	private enum ViewType {
 		HEADER(false, false, false),
@@ -1125,7 +1238,7 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 		textView.setEllipsize(TextUtils.TruncateAt.END);
 		textView.setSingleLine(true);
 		if (C.API_LOLLIPOP) {
-			textView.setTypeface(GraphicsUtils.TYPEFACE_MEDIUM);
+			textView.setTypeface(ResourceUtils.TYPEFACE_MEDIUM);
 			int color = textView.getTextColors().getDefaultColor();
 			if (section) {
 				color &= 0x5effffff;
@@ -1327,10 +1440,7 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 						listItem.boardName, listItem.threadNumber, listItem.title));
 				if (listItem.type == ListItem.Type.FAVORITE && listItem.isThreadItem() &&
 						watcherSupportSet.contains(listItem.chanName)) {
-					WatcherService.WatcherItem watcherItem = watcherServiceClient.getItem(listItem.chanName,
-							listItem.boardName, listItem.threadNumber);
-					updateWatcherItem(holder, watcherItem != null ? watcherItem.getLastState()
-							: WatcherService.State.DISABLED);
+					holder.watcher.update(getCounter(listItem));
 				}
 				break;
 			}
@@ -1344,7 +1454,7 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 		if (holder != null && holder.icon != null) {
 			if (listItem.iconChan) {
 				if (!chanIcons.containsKey(listItem.chanName)) {
-					ChanIconDrawable drawable = ChanManager.getInstance().getIcon(listItem.chanName);
+					ChanIconDrawable drawable = ChanManager.getInstance().getIcon(Chan.get(listItem.chanName));
 					chanIcons.put(listItem.chanName, drawable);
 				}
 				ChanIconDrawable chanIcon = chanIcons.get(listItem.chanName);
@@ -1488,44 +1598,30 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 		}
 	}
 
-	private void updateWatcherItem(ViewHolder holder, WatcherService.State state) {
-		ListItem listItem = getItem(holder.getAdapterPosition());
-		holder.watcher.setPostsCountDifference(listItem.watcherPostsCountDifference,
-				listItem.watcherHasNewPosts, listItem.watcherIsError);
-		// Null state means state not changed
-		if (state != null) {
-			holder.watcher.setWatcherState(state);
-		}
+	private WatcherService.Counter getCounter(ListItem listItem) {
+		return watcherServiceClient.getCounter(listItem.chanName, listItem.boardName, listItem.threadNumber);
 	}
 
 	private final View.OnClickListener watcherClickListener = v -> {
 		DrawerForm.ListItem listItem = getItemFromChild(v);
 		if (listItem != null) {
-			FavoritesStorage.getInstance().toggleWatcher(listItem.chanName, listItem.boardName, listItem.threadNumber);
+			FavoritesStorage.getInstance().setWatcherEnabled(listItem.chanName,
+					listItem.boardName, listItem.threadNumber, null);
 		}
 	};
 
-	@Override
-	public void onWatcherUpdate(WatcherService.WatcherItem watcherItem, WatcherService.State state) {
-		if ((mergeChans || watcherItem.chanName.equals(chanName))
-				&& watcherSupportSet.contains(watcherItem.chanName)) {
-			ListItem targetItem = null;
-			for (ListItem listItem : favorites) {
-				if (listItem.compare(watcherItem.chanName, watcherItem.boardName, watcherItem.threadNumber)) {
-					targetItem = listItem;
-					break;
-				}
-			}
-			if (targetItem != null) {
-				targetItem.watcherPostsCountDifference = watcherItem.getPostsCountDifference();
-				targetItem.watcherHasNewPosts = watcherItem.hasNewPosts();
-				targetItem.watcherIsError = watcherItem.isError();
-				int childCount = recyclerView.getChildCount();
-				for (int i = 0; i < childCount; i++) {
-					ViewHolder holder = (ViewHolder) recyclerView.getChildViewHolder(recyclerView.getChildAt(i));
-					int position = holder.getAdapterPosition();
-					if (position >= 0 && targetItem == getItem(position)) {
-						updateWatcherItem(holder, state);
+	public void onWatcherUpdate(String chanName, String boardName, String threadNumber,
+			WatcherService.Counter counter) {
+		if (mergeChans || chanName.equals(this.chanName)) {
+			int childCount = recyclerView.getChildCount();
+			for (int i = 0; i < childCount; i++) {
+				ViewHolder holder = (ViewHolder) recyclerView.getChildViewHolder(recyclerView.getChildAt(i));
+				int position = holder.getAdapterPosition();
+				if (position >= 0) {
+					ListItem listItem = getItem(position);
+					if (listItem.type == ListItem.Type.FAVORITE &&
+							listItem.compare(chanName, boardName, threadNumber)) {
+						holder.watcher.update(counter);
 						break;
 					}
 				}
@@ -1557,7 +1653,7 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 				ChanManager.getInstance().setChansOrder(chanNames);
 				// Regroup favorite threads
 				if (mergeChans) {
-					invalidateItems(false, true);
+					updateItems(false, true);
 				}
 			} else if (favoriteMovedTo >= 0) {
 				// "to" is always > 0 since favorites list contains header
@@ -1582,7 +1678,7 @@ public class DrawerForm extends RecyclerView.Adapter<DrawerForm.ViewHolder> impl
 		DrawerForm.ListItem from = getItem(fromHolder.getAdapterPosition());
 		DrawerForm.ListItem to = getItem(toHolder.getAdapterPosition());
 		return from.type == to.type && (from.type == DrawerForm.ListItem.Type.CHAN ||
-				from.type == DrawerForm.ListItem.Type.FAVORITE && StringUtils.equals(from.chanName, to.chanName) &&
+				from.type == DrawerForm.ListItem.Type.FAVORITE && CommonUtils.equals(from.chanName, to.chanName) &&
 						(from.threadNumber == null) == (to.threadNumber == null));
 	}
 

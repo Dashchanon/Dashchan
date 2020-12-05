@@ -11,7 +11,6 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.Message;
 import android.os.Parcelable;
-import android.util.SparseArray;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
@@ -28,29 +27,40 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import androidx.annotation.NonNull;
 import androidx.fragment.app.DialogFragment;
+import androidx.fragment.app.Fragment;
 import androidx.fragment.app.FragmentActivity;
+import androidx.fragment.app.FragmentManager;
+import androidx.lifecycle.Lifecycle;
+import androidx.lifecycle.LifecycleObserver;
+import androidx.lifecycle.LifecycleOwner;
+import androidx.lifecycle.OnLifecycleEvent;
+import androidx.lifecycle.ViewModel;
+import androidx.lifecycle.ViewModelProvider;
+import chan.content.Chan;
 import chan.content.ChanConfiguration;
-import chan.content.ChanManager;
 import chan.content.ChanPerformer;
 import chan.http.HttpException;
 import chan.util.StringUtils;
 import com.mishiranu.dashchan.C;
 import com.mishiranu.dashchan.R;
 import com.mishiranu.dashchan.content.Preferences;
-import com.mishiranu.dashchan.content.async.AsyncManager;
 import com.mishiranu.dashchan.content.async.ReadCaptchaTask;
+import com.mishiranu.dashchan.content.async.TaskViewModel;
 import com.mishiranu.dashchan.content.model.ErrorItem;
 import com.mishiranu.dashchan.content.net.RecaptchaReader;
 import com.mishiranu.dashchan.graphics.SelectorBorderDrawable;
 import com.mishiranu.dashchan.graphics.SelectorCheckDrawable;
+import com.mishiranu.dashchan.util.ConcurrentUtils;
 import com.mishiranu.dashchan.util.GraphicsUtils;
 import com.mishiranu.dashchan.util.ResourceUtils;
-import com.mishiranu.dashchan.util.ToastUtils;
 import com.mishiranu.dashchan.util.ViewUtils;
+import com.mishiranu.dashchan.widget.ClickableToast;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
+import java.util.Objects;
 import java.util.UUID;
 
 public class ForegroundManager implements Handler.Callback {
@@ -62,56 +72,168 @@ public class ForegroundManager implements Handler.Callback {
 		return INSTANCE;
 	}
 
-	private static final int MESSAGE_REQUIRE_USER_CAPTCHA = 1;
-	private static final int MESSAGE_REQUIRE_USER_CHOICE = 2;
-	private static final int MESSAGE_REQUIRE_USER_RECAPTCHA_V2 = 3;
-	private static final int MESSAGE_SHOW_CAPTCHA_INVALID = 4;
+	private static final int MESSAGE_INTERRUPT = 1;
+	private static final int MESSAGE_REQUIRE_USER_CAPTCHA = 2;
+	private static final int MESSAGE_REQUIRE_USER_CHOICE = 3;
+	private static final int MESSAGE_REQUIRE_USER_RECAPTCHA_V2 = 4;
+	private static final int MESSAGE_SHOW_CAPTCHA_INVALID = 5;
+
+	private static class DelayedMessage {
+		public final int what;
+		public final HandlerData handlerData;
+
+		public DelayedMessage(int what, HandlerData handlerData) {
+			this.what = what;
+			this.handlerData = handlerData;
+		}
+	}
 
 	private final Handler handler = new Handler(Looper.getMainLooper(), this);
-	private final SparseArray<PendingData> pendingDataArray = new SparseArray<>();
+	private final HashMap<String, PendingData> pendingDataMap = new HashMap<>();
+	private final ArrayList<DelayedMessage> delayedMessages = new ArrayList<>();
 
-	private int pendingDataStartIndex = 0;
 	private WeakReference<FragmentActivity> activity;
+	private WeakReference<InstanceViewModel> viewModel;
 
 	private FragmentActivity getActivity() {
-		return activity != null ? activity.get() : null;
+		FragmentActivity activity = this.activity != null ? this.activity.get() : null;
+		return activity == null || activity.getLifecycle().getCurrentState()
+				== Lifecycle.State.DESTROYED ? null : activity;
 	}
 
-	@SuppressWarnings("unchecked")
-	private <T extends PendingData> T getPendingData(int pendingDataIndex) {
-		synchronized (pendingDataArray) {
-			return (T) pendingDataArray.get(pendingDataIndex);
+	private PendingData getPendingData(String pendingDataId) {
+		synchronized (pendingDataMap) {
+			return pendingDataMap.get(pendingDataId);
 		}
 	}
 
-	private static final String EXTRA_PENDING_DATA_INDEX = "pendingDataIndex";
+	private final LifecycleObserver lifecycleObserver = new LifecycleObserver() {
+		@SuppressWarnings("unused")
+		@OnLifecycleEvent(Lifecycle.Event.ON_START)
+		public void onStart(LifecycleOwner owner) {
+			handleStartResume(owner);
+		}
 
-	private interface PendingDataDialogFragment {
-		Bundle requireArguments();
+		@SuppressWarnings("unused")
+		@OnLifecycleEvent(Lifecycle.Event.ON_RESUME)
+		public void onResume(LifecycleOwner owner) {
+			handleStartResume(owner);
+		}
+
+		private void handleStartResume(LifecycleOwner owner) {
+			FragmentActivity activity = getActivity();
+			if (activity != null && activity == owner) {
+				handleActivityResumeChecked(activity);
+			}
+		}
+	};
+
+	public static class InstanceViewModel extends ViewModel {
+		@Override
+		protected void onCleared() {
+			INSTANCE.handleCleared(this);
+		}
+	}
+
+	private void handleActivityResumeChecked(FragmentActivity activity) {
+		FragmentManager fragmentManager = activity.getSupportFragmentManager();
+		if (!fragmentManager.isStateSaved()) {
+			for (Fragment fragment : fragmentManager.getFragments()) {
+				if (fragment instanceof PendingDataDialog) {
+					PendingDataDialog<?> dialog = (PendingDataDialog<?>) fragment;
+					dialog.getPendingDataOrDismiss();
+				}
+			}
+			if (!delayedMessages.isEmpty()) {
+				ArrayList<DelayedMessage> delayedMessages = new ArrayList<>(this.delayedMessages);
+				this.delayedMessages.clear();
+				for (DelayedMessage delayedMessage : delayedMessages) {
+					handleMessage(handler.obtainMessage(delayedMessage.what, delayedMessage.handlerData));
+				}
+			}
+		}
+	}
+
+	private void handleCleared(InstanceViewModel viewModel) {
+		Objects.requireNonNull(viewModel);
+		if (this.viewModel != null && this.viewModel.get() == viewModel) {
+			this.viewModel = null;
+			if (!delayedMessages.isEmpty()) {
+				ArrayList<DelayedMessage> delayedMessages = new ArrayList<>(this.delayedMessages);
+				this.delayedMessages.clear();
+				for (DelayedMessage delayedMessage : delayedMessages) {
+					PendingData pendingData = getPendingData(delayedMessage.handlerData.pendingDataId);
+					if (pendingData != null) {
+						synchronized (pendingData) {
+							pendingData.ready = true;
+							pendingData.notifyAll();
+						}
+					}
+				}
+			}
+		}
+	}
+
+	private interface PendingDataDialog<T extends PendingData> extends LifecycleObserver {
+		interface StoreResultCallback<T> {
+			void onStoreResult(T pendingData);
+		}
+
+		String EXTRA_PENDING_DATA_ID = "pendingDataId";
+
+		void show(@NonNull FragmentManager manager, String tag);
+		@NonNull Bundle requireArguments();
+		@NonNull FragmentManager requireFragmentManager();
 		void dismiss();
 
-		default void fillArguments(Bundle args, int pendingDataIndex) {
-			args.putInt(EXTRA_PENDING_DATA_INDEX, pendingDataIndex);
+		default void fillArguments(Bundle args, String pendingDataId) {
+			args.putString(EXTRA_PENDING_DATA_ID, pendingDataId);
 		}
 
-		default <T extends PendingData> T getPendingData(boolean dismissIfNull) {
-			T result = getInstance().getPendingData(requireArguments().getInt(EXTRA_PENDING_DATA_INDEX));
-			if (dismissIfNull && result == null) {
+		default String getPendingDataId() {
+			return requireArguments().getString(EXTRA_PENDING_DATA_ID);
+		}
+
+		default T getPendingData() {
+			@SuppressWarnings("unchecked")
+			T result = (T) getInstance().getPendingData(getPendingDataId());
+			return result;
+		}
+
+		default T getPendingDataOrDismiss() {
+			T pendingData = getPendingData();
+			if (pendingData == null && !requireFragmentManager().isStateSaved()) {
 				dismiss();
 			}
-			return result;
+			return pendingData;
+		}
+
+		default void show(FragmentActivity activity) {
+			show(activity.getSupportFragmentManager(), getPendingDataId());
+		}
+
+		default void notifyResult(StoreResultCallback<T> callback) {
+			T pendingData = getPendingData();
+			if (pendingData != null) {
+				synchronized (pendingData) {
+					if (callback != null) {
+						callback.onStoreResult(pendingData);
+					}
+					pendingData.ready = true;
+					pendingData.notifyAll();
+				}
+			}
 		}
 	}
 
-	public static class CaptchaDialogFragment extends DialogFragment implements PendingDataDialogFragment,
-			CaptchaForm.Callback, AsyncManager.Callback, ReadCaptchaTask.Callback {
+	public static class CaptchaDialog extends DialogFragment implements PendingDataDialog<CaptchaPendingData>,
+			CaptchaForm.Callback, ReadCaptchaTask.Callback {
 		private static final String EXTRA_CHAN_NAME = "chanName";
 		private static final String EXTRA_CAPTCHA_TYPE = "captchaType";
 		private static final String EXTRA_REQUIREMENT = "requirement";
 		private static final String EXTRA_BOARD_NAME = "boardName";
 		private static final String EXTRA_THREAD_NUMBER = "threadNumber";
 		private static final String EXTRA_DESCRIPTION = "description";
-		private static final String EXTRA_TASK_NAME = "taskName";
 
 		private static final String EXTRA_CAPTCHA_STATE = "captchaState";
 		private static final String EXTRA_LOADED_INPUT = "loadedInput";
@@ -119,10 +241,7 @@ public class ForegroundManager implements Handler.Callback {
 		private static final String EXTRA_LARGE = "large";
 		private static final String EXTRA_BLACK_AND_WHITE = "blackAndWhite";
 
-		private static final String EXTRA_FORCE_CAPTCHA = "forceCaptcha";
-		private static final String EXTRA_MAY_SHOW_LOAD_BUTTON = "mayShowLoadButton";
-
-		private ChanPerformer.CaptchaState captchaState;
+		private ReadCaptchaTask.CaptchaState captchaState;
 		private ChanConfiguration.Captcha.Input loadedInput;
 		private Bitmap image;
 		private boolean large;
@@ -132,38 +251,34 @@ public class ForegroundManager implements Handler.Callback {
 
 		private Button positiveButton;
 
-		public CaptchaDialogFragment() {}
+		public CaptchaDialog() {}
 
-		public CaptchaDialogFragment(int pendingDataIndex, String chanName, String captchaType, String requirement,
+		public CaptchaDialog(String pendingDataId, String chanName, String captchaType, String requirement,
 				String boardName, String threadNumber, String description) {
 			Bundle args = new Bundle();
-			fillArguments(args, pendingDataIndex);
+			fillArguments(args, pendingDataId);
 			args.putString(EXTRA_CHAN_NAME, chanName);
 			args.putString(EXTRA_CAPTCHA_TYPE, captchaType);
 			args.putString(EXTRA_REQUIREMENT, requirement);
 			args.putString(EXTRA_BOARD_NAME, boardName);
 			args.putString(EXTRA_THREAD_NUMBER, threadNumber);
-			args.putString(EXTRA_TASK_NAME, "read_captcha_" + UUID.randomUUID().toString());
 			args.putString(EXTRA_DESCRIPTION, description);
 			setArguments(args);
-		}
-
-		public void show(FragmentActivity activity) {
-			show(activity.getSupportFragmentManager(), getClass().getName());
 		}
 
 		@Override
 		public void onActivityCreated(Bundle savedInstanceState) {
 			super.onActivityCreated(savedInstanceState);
-			CaptchaPendingData pendingData = getPendingData(true);
+
+			CaptchaPendingData pendingData = getPendingDataOrDismiss();
 			if (pendingData == null) {
 				return;
 			}
 			boolean needLoad = true;
 			if (pendingData.captchaData != null && savedInstanceState != null) {
 				String captchaStateString = savedInstanceState.getString(EXTRA_CAPTCHA_STATE);
-				ChanPerformer.CaptchaState captchaState = captchaStateString != null
-						? ChanPerformer.CaptchaState.valueOf(captchaStateString) : null;
+				ReadCaptchaTask.CaptchaState captchaState = captchaStateString != null
+						? ReadCaptchaTask.CaptchaState.valueOf(captchaStateString) : null;
 				Bitmap image = savedInstanceState.getParcelable(EXTRA_IMAGE);
 				if (captchaState != null) {
 					String loadedInputString = savedInstanceState.getString(EXTRA_LOADED_INPUT);
@@ -178,6 +293,9 @@ public class ForegroundManager implements Handler.Callback {
 			if (needLoad) {
 				reloadCaptcha(pendingData, false, true, false);
 			}
+
+			CaptchaViewModel viewModel = new ViewModelProvider(this).get(CaptchaViewModel.class);
+			viewModel.observe(this, this);
 		}
 
 		@Override
@@ -190,113 +308,62 @@ public class ForegroundManager implements Handler.Callback {
 			outState.putBoolean(EXTRA_BLACK_AND_WHITE, blackAndWhite);
 		}
 
-		private void reloadCaptcha(CaptchaPendingData pendingData, boolean forceCaptcha, boolean mayShowLoadButton,
-				boolean restart) {
+		private void reloadCaptcha(CaptchaPendingData pendingData,
+				boolean forceCaptcha, boolean mayShowLoadButton, boolean restart) {
 			pendingData.captchaData = null;
 			pendingData.loadedCaptchaType = null;
+			boolean allowSolveAutomatically = !forceCaptcha ||
+					captchaState != ReadCaptchaTask.CaptchaState.MAY_LOAD_SOLVING;
 			captchaState = null;
 			image = null;
 			large = false;
 			blackAndWhite = false;
 			updatePositiveButtonState();
 			captchaForm.showLoading();
-			HashMap<String, Object> extra = new HashMap<>();
-			extra.put(EXTRA_FORCE_CAPTCHA, forceCaptcha);
-			extra.put(EXTRA_MAY_SHOW_LOAD_BUTTON, mayShowLoadButton);
-			AsyncManager.get(this).startTask(requireArguments().getString(EXTRA_TASK_NAME), this, extra, restart);
-		}
-
-		private static class ReadCaptchaHolder extends AsyncManager.Holder implements ReadCaptchaTask.Callback {
-			@Override
-			public void onReadCaptchaSuccess(ChanPerformer.CaptchaState captchaState,
-					ChanPerformer.CaptchaData captchaData, String captchaType, ChanConfiguration.Captcha.Input input,
-					ChanConfiguration.Captcha.Validity validity, Bitmap image, boolean large, boolean blackAndWhite) {
-				storeResult("onReadCaptchaSuccess", captchaState, captchaData, captchaType, input, validity,
-						image, large, blackAndWhite);
-			}
-
-			@Override
-			public void onReadCaptchaError(ErrorItem errorItem) {
-				storeResult("onReadCaptchaError", errorItem);
+			CaptchaViewModel viewModel = new ViewModelProvider(this).get(CaptchaViewModel.class);
+			if (restart || !viewModel.hasTaskOrValue()) {
+				Bundle args = requireArguments();
+				Chan chan = Chan.get(args.getString(EXTRA_CHAN_NAME));
+				List<String> captchaPass = forceCaptcha || chan.name == null ? null : Preferences.getCaptchaPass(chan);
+				ReadCaptchaTask task = new ReadCaptchaTask(viewModel.callback, pendingData.captchaReader,
+						args.getString(EXTRA_CAPTCHA_TYPE), args.getString(EXTRA_REQUIREMENT), captchaPass,
+						mayShowLoadButton, allowSolveAutomatically, chan,
+						args.getString(EXTRA_BOARD_NAME), args.getString(EXTRA_THREAD_NUMBER));
+				task.execute(ConcurrentUtils.PARALLEL_EXECUTOR);
+				viewModel.attach(task);
 			}
 		}
 
-		@Override
-		public AsyncManager.Holder onCreateAndExecuteTask(String name, HashMap<String, Object> extra) {
-			Bundle args = requireArguments();
-			String chanName = args.getString(EXTRA_CHAN_NAME);
-			boolean forceCaptcha = (boolean) extra.get(EXTRA_FORCE_CAPTCHA);
-			boolean mayShowLoadButton = (boolean) extra.get(EXTRA_MAY_SHOW_LOAD_BUTTON);
-			String[] captchaPass = forceCaptcha || chanName == null ? null : Preferences.getCaptchaPass(chanName);
-			CaptchaPendingData pendingData = getPendingData(false);
-			if (pendingData == null) {
-				return null;
-			}
-			ReadCaptchaHolder holder = new ReadCaptchaHolder();
-			ReadCaptchaTask task = new ReadCaptchaTask(holder, pendingData.captchaReader,
-					args.getString(EXTRA_CAPTCHA_TYPE), args.getString(EXTRA_REQUIREMENT), captchaPass,
-					mayShowLoadButton, chanName, args.getString(EXTRA_BOARD_NAME), args.getString(EXTRA_THREAD_NUMBER));
-			task.executeOnExecutor(ReadCaptchaTask.THREAD_POOL_EXECUTOR);
-			return holder.attach(task);
-		}
+		public static class CaptchaViewModel extends TaskViewModel.Proxy<ReadCaptchaTask, ReadCaptchaTask.Callback> {}
 
-		@Override
-		public void onFinishTaskExecution(String name, AsyncManager.Holder holder) {
-			String methodName = holder.nextArgument();
-			if ("onReadCaptchaSuccess".equals(methodName)) {
-				ChanPerformer.CaptchaState captchaState = holder.nextArgument();
-				ChanPerformer.CaptchaData captchaData = holder.nextArgument();
-				String captchaType = holder.nextArgument();
-				ChanConfiguration.Captcha.Input input = holder.nextArgument();
-				ChanConfiguration.Captcha.Validity validity = holder.nextArgument();
-				Bitmap image = holder.nextArgument();
-				boolean large = holder.nextArgument();
-				boolean blackAndWhite = holder.nextArgument();
-				onReadCaptchaSuccess(captchaState, captchaData, captchaType, input, validity,
-						image, large, blackAndWhite);
-			} else if ("onReadCaptchaError".equals(methodName)) {
-				ErrorItem errorItem = holder.nextArgument();
-				onReadCaptchaError(errorItem);
-			}
-		}
-
-		@Override
-		public void onRequestTaskCancel(String name, Object task) {
-			((ReadCaptchaTask) task).cancel();
-		}
-
-		@Override
-		public void onReadCaptchaSuccess(ChanPerformer.CaptchaState captchaState, ChanPerformer.CaptchaData captchaData,
-				String captchaType, ChanConfiguration.Captcha.Input input, ChanConfiguration.Captcha.Validity validity,
-				Bitmap image, boolean large, boolean blackAndWhite) {
-			CaptchaPendingData pendingData = getPendingData(true);
+		public void onReadCaptchaSuccess(ReadCaptchaTask.Result result) {
+			CaptchaPendingData pendingData = getPendingDataOrDismiss();
 			if (pendingData == null) {
 				return;
 			}
-			pendingData.captchaData = captchaData != null ? captchaData : new ChanPerformer.CaptchaData();
-			pendingData.loadedCaptchaType = captchaType;
-			showCaptcha(captchaState, captchaType, input, image, large, blackAndWhite);
-			if (isResumed() && captchaState == ChanPerformer.CaptchaState.SKIP) {
+			pendingData.captchaData = result.captchaData != null ? result.captchaData : new ChanPerformer.CaptchaData();
+			pendingData.loadedCaptchaType = result.captchaType;
+			showCaptcha(result.captchaState, result.captchaType, result.input,
+					result.image, result.large, result.blackAndWhite);
+			if (result.captchaState == ReadCaptchaTask.CaptchaState.SKIP) {
 				onConfirmCaptcha();
 			}
 		}
 
 		@Override
 		public void onReadCaptchaError(ErrorItem errorItem) {
-			CaptchaPendingData pendingData = getPendingData(true);
-			if (pendingData == null) {
-				return;
+			if (getPendingDataOrDismiss() != null) {
+				ClickableToast.show(errorItem);
+				captchaForm.showError();
 			}
-			ToastUtils.show(requireContext(), errorItem);
-			captchaForm.showError();
 		}
 
-		private void showCaptcha(ChanPerformer.CaptchaState captchaState, String captchaType,
+		private void showCaptcha(ReadCaptchaTask.CaptchaState captchaState, String captchaType,
 				ChanConfiguration.Captcha.Input input, Bitmap image, boolean large, boolean blackAndWhite) {
 			this.captchaState = captchaState;
 			if (captchaType != null && input == null) {
-				input = ChanConfiguration.get(requireArguments().getString(EXTRA_CHAN_NAME)).safe()
-						.obtainCaptcha(captchaType).input;
+				Chan chan = Chan.get(requireArguments().getString(EXTRA_CHAN_NAME));
+				input = chan.configuration.safe().obtainCaptcha(captchaType).input;
 			}
 			loadedInput = input;
 			if (this.image != null && this.image != image) {
@@ -311,20 +378,12 @@ public class ForegroundManager implements Handler.Callback {
 			updatePositiveButtonState();
 		}
 
-		private void finishDialog(CaptchaPendingData pendingData) {
-			AsyncManager.get(this).cancelTask(requireArguments().getString(EXTRA_TASK_NAME), this);
-			if (pendingData != null) {
-				synchronized (pendingData) {
-					pendingData.ready = true;
-					pendingData.notifyAll();
-				}
-			}
-		}
-
 		private void updatePositiveButtonState() {
 			if (positiveButton != null) {
 				positiveButton.setEnabled(captchaState != null &&
-						captchaState != ChanPerformer.CaptchaState.NEED_LOAD);
+						captchaState != ReadCaptchaTask.CaptchaState.NEED_LOAD &&
+						captchaState != ReadCaptchaTask.CaptchaState.MAY_LOAD &&
+						captchaState != ReadCaptchaTask.CaptchaState.MAY_LOAD_SOLVING);
 			}
 		}
 
@@ -340,13 +399,14 @@ public class ForegroundManager implements Handler.Callback {
 			} else {
 				comment.setVisibility(View.GONE);
 			}
-			ChanConfiguration.Captcha captcha = ChanConfiguration.get(args.getString(EXTRA_CHAN_NAME))
+			Chan chan = Chan.get(args.getString(EXTRA_CHAN_NAME));
+			ChanConfiguration.Captcha captcha = chan.configuration
 					.safe().obtainCaptcha(args.getString(EXTRA_CAPTCHA_TYPE));
 			EditText captchaInputView = container.findViewById(R.id.captcha_input);
 			captchaForm = new CaptchaForm(this, false, true, container, null, captchaInputView, captcha);
 			AlertDialog alertDialog = new AlertDialog.Builder(requireContext())
 					.setTitle(R.string.confirmation).setView(container)
-					.setPositiveButton(android.R.string.ok, (dialog, which) -> onConfirmCaptcha())
+					.setPositiveButton(android.R.string.ok, (dialog, which) -> confirmCaptchaInternal())
 					.setNegativeButton(android.R.string.cancel, (dialog, which) -> cancelInternal())
 					.create();
 			alertDialog.setCanceledOnTouchOutside(false);
@@ -365,7 +425,7 @@ public class ForegroundManager implements Handler.Callback {
 
 		@Override
 		public void onRefreshCaptcha(boolean forceRefresh) {
-			CaptchaPendingData pendingData = getPendingData(true);
+			CaptchaPendingData pendingData = getPendingDataOrDismiss();
 			if (pendingData == null) {
 				return;
 			}
@@ -374,15 +434,8 @@ public class ForegroundManager implements Handler.Callback {
 
 		@Override
 		public void onConfirmCaptcha() {
-			CaptchaPendingData pendingData = getPendingData(true);
-			if (pendingData == null) {
-				return;
-			}
-			if (pendingData.captchaData != null) {
-				pendingData.captchaData.put(ChanPerformer.CaptchaData.INPUT, captchaForm.getInput());
-			}
-			finishDialog(pendingData);
 			dismiss();
+			confirmCaptchaInternal();
 		}
 
 		@Override
@@ -391,13 +444,19 @@ public class ForegroundManager implements Handler.Callback {
 			cancelInternal();
 		}
 
+		private void confirmCaptchaInternal() {
+			notifyResult(pendingData -> {
+				if (pendingData.captchaData != null) {
+					pendingData.captchaData.put(ChanPerformer.CaptchaData.INPUT, captchaForm.getInput());
+				}
+			});
+		}
+
 		private void cancelInternal() {
-			CaptchaPendingData pendingData = getPendingData(false);
-			if (pendingData != null) {
+			notifyResult(pendingData -> {
 				pendingData.captchaData = null;
 				pendingData.loadedCaptchaType = null;
-			}
-			finishDialog(pendingData);
+			});
 		}
 	}
 
@@ -461,7 +520,7 @@ public class ForegroundManager implements Handler.Callback {
 		}
 	}
 
-	public static class ItemChoiceDialogFragment extends DialogFragment implements PendingDataDialogFragment,
+	public static class ItemChoiceDialog extends DialogFragment implements PendingDataDialog<ChoicePendingData>,
 			DialogInterface.OnClickListener, AdapterView.OnItemClickListener {
 		private static final String EXTRA_SELECTED = "selected";
 		private static final String EXTRA_ITEMS = "items";
@@ -472,12 +531,12 @@ public class ForegroundManager implements Handler.Callback {
 		private boolean[] selected;
 		private boolean hasImage;
 
-		public ItemChoiceDialogFragment() {}
+		public ItemChoiceDialog() {}
 
-		public ItemChoiceDialogFragment(int pendingDataIndex, boolean[] selected, CharSequence[] items,
+		public ItemChoiceDialog(String pendingDataId, boolean[] selected, CharSequence[] items,
 				String descriptionText, Bitmap descriptionImage, boolean multiple) {
 			Bundle args = new Bundle();
-			fillArguments(args, pendingDataIndex);
+			fillArguments(args, pendingDataId);
 			args.putBooleanArray(EXTRA_SELECTED, selected);
 			args.putCharSequenceArray(EXTRA_ITEMS, items);
 			args.putString(EXTRA_DESCRIPTION_TEXT, descriptionText);
@@ -486,14 +545,10 @@ public class ForegroundManager implements Handler.Callback {
 			setArguments(args);
 		}
 
-		public void show(FragmentActivity activity) {
-			show(activity.getSupportFragmentManager(), getClass().getName());
-		}
-
 		@Override
 		public void onActivityCreated(Bundle savedInstanceState) {
 			super.onActivityCreated(savedInstanceState);
-			getPendingData(true); // Dismiss if null
+			getPendingDataOrDismiss();
 		}
 
 		@Override
@@ -567,34 +622,27 @@ public class ForegroundManager implements Handler.Callback {
 					selected[i] = i == arrayPosition;
 				}
 				dismiss();
-				storeResult(true);
+				publishResult(true);
 			}
 		}
 
 		@Override
 		public void onClick(DialogInterface dialog, int which) {
-			storeResult(which == AlertDialog.BUTTON_POSITIVE);
+			publishResult(which == AlertDialog.BUTTON_POSITIVE);
 		}
 
 		@Override
 		public void onCancel(@NonNull DialogInterface dialog) {
 			super.onCancel(dialog);
-			storeResult(false);
+			publishResult(false);
 		}
 
-		private void storeResult(boolean success) {
-			ChoicePendingData pendingData = getPendingData(false);
-			if (pendingData != null) {
-				synchronized (pendingData) {
-					pendingData.result = success ? selected : null;
-					pendingData.ready = true;
-					pendingData.notifyAll();
-				}
-			}
+		private void publishResult(boolean success) {
+			notifyResult(pendingData -> pendingData.result = success ? selected : null);
 		}
 	}
 
-	public static class ImageChoiceDialogFragment extends DialogFragment implements PendingDataDialogFragment,
+	public static class ImageChoiceDialog extends DialogFragment implements PendingDataDialog<ChoicePendingData>,
 			View.OnClickListener, DialogInterface.OnClickListener {
 		private static final String EXTRA_COLUMNS = "columns";
 		private static final String EXTRA_SELECTED = "selected";
@@ -606,12 +654,12 @@ public class ForegroundManager implements Handler.Callback {
 		private FrameLayout[] selectionViews;
 		private boolean[] selected;
 
-		public ImageChoiceDialogFragment() {}
+		public ImageChoiceDialog() {}
 
-		public ImageChoiceDialogFragment(int pendingDataIndex, int columns, boolean[] selected, Bitmap[] images,
+		public ImageChoiceDialog(String pendingDataId, int columns, boolean[] selected, Bitmap[] images,
 				String descriptionText, Bitmap descriptionImage, boolean multiple) {
 			Bundle args = new Bundle();
-			fillArguments(args, pendingDataIndex);
+			fillArguments(args, pendingDataId);
 			args.putInt(EXTRA_COLUMNS, columns);
 			args.putBooleanArray(EXTRA_SELECTED, selected);
 			args.putParcelableArray(EXTRA_IMAGES, images);
@@ -619,10 +667,6 @@ public class ForegroundManager implements Handler.Callback {
 			args.putParcelable(EXTRA_DESCRIPTION_IMAGE, descriptionImage);
 			args.putBoolean(EXTRA_MULTIPLE, multiple);
 			setArguments(args);
-		}
-
-		public void show(FragmentActivity activity) {
-			show(activity.getSupportFragmentManager(), getClass().getName());
 		}
 
 		private void ensureArrays() {
@@ -638,7 +682,7 @@ public class ForegroundManager implements Handler.Callback {
 		@Override
 		public void onActivityCreated(Bundle savedInstanceState) {
 			super.onActivityCreated(savedInstanceState);
-			PendingData pendingData = getPendingData(true);
+			PendingData pendingData = getPendingDataOrDismiss();
 			if (pendingData == null) {
 				return;
 			}
@@ -785,7 +829,7 @@ public class ForegroundManager implements Handler.Callback {
 					selected[i] = i == index;
 				}
 				dismiss();
-				storeResult(true);
+				publishResult(true);
 			}
 		}
 
@@ -800,77 +844,78 @@ public class ForegroundManager implements Handler.Callback {
 
 		@Override
 		public void onClick(DialogInterface dialog, int which) {
-			storeResult(which == AlertDialog.BUTTON_POSITIVE);
+			publishResult(which == AlertDialog.BUTTON_POSITIVE);
 		}
 
 		@Override
 		public void onCancel(@NonNull DialogInterface dialog) {
 			super.onCancel(dialog);
-			storeResult(false);
+			publishResult(false);
 		}
 
-		private void storeResult(boolean success) {
-			ChoicePendingData pendingData = getPendingData(false);
-			if (pendingData != null) {
-				synchronized (pendingData) {
-					pendingData.result = success ? selected : null;
-					pendingData.ready = true;
-					pendingData.notifyAll();
-				}
-			}
+		private void publishResult(boolean success) {
+			notifyResult(pendingData -> pendingData.result = success ? selected : null);
 		}
 	}
 
-	public static class RecaptchaV2DialogFragment extends RecaptchaReader.V2Dialog
-			implements PendingDataDialogFragment {
-		public RecaptchaV2DialogFragment() {}
+	public static class RecaptchaV2Dialog extends RecaptchaReader.V2Dialog
+			implements PendingDataDialog<RecaptchaV2PendingData> {
+		public RecaptchaV2Dialog() {}
 
-		public RecaptchaV2DialogFragment(int pendingDataIndex, String referer, String apiKey,
-				boolean invisible, boolean hcaptcha) {
-			super(referer, apiKey, invisible, hcaptcha);
-			fillArguments(getArguments(), pendingDataIndex);
-		}
-
-		public void show(FragmentActivity activity) {
-			show(activity.getSupportFragmentManager(), getClass().getName());
+		public RecaptchaV2Dialog(String pendingDataId, String referer, String apiKey,
+				boolean invisible, boolean hcaptcha, RecaptchaReader.ChallengeExtra challengeExtra) {
+			super(referer, apiKey, invisible, hcaptcha, challengeExtra);
+			fillArguments(getArguments(), pendingDataId);
 		}
 
 		@Override
-		public void publishResponse(String response, HttpException exception) {
-			RecaptchaV2PendingData pendingData = getPendingData(false);
-			if (pendingData != null) {
-				synchronized (pendingData) {
-					pendingData.response = response;
-					pendingData.exception = exception;
-					pendingData.ready = true;
-					pendingData.notifyAll();
-				}
-			}
+		public void publishResult(String response, HttpException exception) {
+			notifyResult(pendingData -> {
+				pendingData.response = response;
+				pendingData.exception = exception;
+			});
 		}
 	}
 
 	@Override
 	public boolean handleMessage(Message msg) {
 		switch (msg.what) {
+			case MESSAGE_INTERRUPT: {
+				HandlerData handlerData = (HandlerData) msg.obj;
+				FragmentActivity activity = getActivity();
+				if (activity != null) {
+					FragmentManager fragmentManager = activity.getSupportFragmentManager();
+					if (!fragmentManager.isStateSaved()) {
+						DialogFragment fragment = (DialogFragment) fragmentManager
+								.findFragmentByTag(handlerData.pendingDataId);
+						if (fragment != null) {
+							fragment.dismiss();
+						}
+					}
+				}
+				return true;
+			}
 			case MESSAGE_REQUIRE_USER_CAPTCHA:
 			case MESSAGE_REQUIRE_USER_CHOICE:
 			case MESSAGE_REQUIRE_USER_RECAPTCHA_V2: {
 				HandlerData handlerData = (HandlerData) msg.obj;
 				FragmentActivity activity = getActivity();
+				PendingData pendingData = getPendingData(handlerData.pendingDataId);
+				if (pendingData == null) {
+					return true;
+				}
 				if (activity == null) {
-					PendingData pendingData;
-					synchronized (pendingDataArray) {
-						pendingData = pendingDataArray.get(handlerData.pendingDataIndex);
-					}
 					synchronized (pendingData) {
 						pendingData.ready = true;
 						pendingData.notifyAll();
 					}
+				} else if (activity.getSupportFragmentManager().isStateSaved()) {
+					delayedMessages.add(new DelayedMessage(msg.what, handlerData));
 				} else {
 					switch (msg.what) {
 						case MESSAGE_REQUIRE_USER_CAPTCHA: {
 							CaptchaHandlerData captchaHandlerData = (CaptchaHandlerData) handlerData;
-							new CaptchaDialogFragment(handlerData.pendingDataIndex, captchaHandlerData.chanName,
+							new CaptchaDialog(handlerData.pendingDataId, captchaHandlerData.chanName,
 									captchaHandlerData.captchaType, captchaHandlerData.requirement,
 									captchaHandlerData.boardName, captchaHandlerData.threadNumber,
 									captchaHandlerData.description).show(activity);
@@ -879,12 +924,12 @@ public class ForegroundManager implements Handler.Callback {
 						case MESSAGE_REQUIRE_USER_CHOICE: {
 							ChoiceHandlerData choiceHandlerData = (ChoiceHandlerData) handlerData;
 							if (choiceHandlerData.images != null) {
-								new ImageChoiceDialogFragment(handlerData.pendingDataIndex, choiceHandlerData.columns,
+								new ImageChoiceDialog(handlerData.pendingDataId, choiceHandlerData.columns,
 										choiceHandlerData.selected, choiceHandlerData.images,
 										choiceHandlerData.descriptionText, choiceHandlerData.descriptionImage,
 										choiceHandlerData.multiple).show(activity);
 							} else {
-								new ItemChoiceDialogFragment(handlerData.pendingDataIndex, choiceHandlerData.selected,
+								new ItemChoiceDialog(handlerData.pendingDataId, choiceHandlerData.selected,
 										choiceHandlerData.items, choiceHandlerData.descriptionText,
 										choiceHandlerData.descriptionImage, choiceHandlerData.multiple).show(activity);
 							}
@@ -892,19 +937,17 @@ public class ForegroundManager implements Handler.Callback {
 						}
 						case MESSAGE_REQUIRE_USER_RECAPTCHA_V2: {
 							RecaptchaV2HandlerData recaptchaV2HandlerData = (RecaptchaV2HandlerData) handlerData;
-							new RecaptchaV2DialogFragment(handlerData.pendingDataIndex, recaptchaV2HandlerData.referer,
+							new RecaptchaV2Dialog(handlerData.pendingDataId, recaptchaV2HandlerData.referer,
 									recaptchaV2HandlerData.apiKey, recaptchaV2HandlerData.invisible,
-									recaptchaV2HandlerData.hcaptcha).show(activity);
+									recaptchaV2HandlerData.hcaptcha, recaptchaV2HandlerData.challengeExtra)
+									.show(activity);
 						}
 					}
 				}
 				return true;
 			}
 			case MESSAGE_SHOW_CAPTCHA_INVALID: {
-				FragmentActivity activity = getActivity();
-				if (activity != null) {
-					ToastUtils.show(activity, R.string.captcha_is_not_valid);
-				}
+				ClickableToast.show(R.string.captcha_is_not_valid);
 				return true;
 			}
 		}
@@ -912,10 +955,10 @@ public class ForegroundManager implements Handler.Callback {
 	}
 
 	private static abstract class HandlerData {
-		public final int pendingDataIndex;
+		public final String pendingDataId;
 
-		public HandlerData(int pendingDataIndex) {
-			this.pendingDataIndex = pendingDataIndex;
+		public HandlerData(String pendingDataId) {
+			this.pendingDataId = pendingDataId;
 		}
 	}
 
@@ -927,9 +970,9 @@ public class ForegroundManager implements Handler.Callback {
 		public final String threadNumber;
 		public final String description;
 
-		public CaptchaHandlerData(int pendingDataIndex, String chanName, String captchaType, String requirement,
+		public CaptchaHandlerData(String pendingDataId, String chanName, String captchaType, String requirement,
 				String boardName, String threadNumber, String description) {
-			super(pendingDataIndex);
+			super(pendingDataId);
 			this.chanName = chanName;
 			this.captchaType = captchaType;
 			this.requirement = requirement;
@@ -948,9 +991,9 @@ public class ForegroundManager implements Handler.Callback {
 		public final Bitmap descriptionImage;
 		public final boolean multiple;
 
-		public ChoiceHandlerData(int pendingDataIndex, int columns, boolean[] selected, Bitmap[] images,
+		public ChoiceHandlerData(String pendingDataId, int columns, boolean[] selected, Bitmap[] images,
 				CharSequence[] items, String descriptionText, Bitmap descriptionImage, boolean multiple) {
-			super(pendingDataIndex);
+			super(pendingDataId);
 			this.columns = columns;
 			this.selected = selected;
 			this.images = images;
@@ -966,28 +1009,30 @@ public class ForegroundManager implements Handler.Callback {
 		public final String apiKey;
 		public final boolean invisible;
 		public final boolean hcaptcha;
+		public final RecaptchaReader.ChallengeExtra challengeExtra;
 
-		private RecaptchaV2HandlerData(int pendingDataIndex, String referer, String apiKey,
-				boolean invisible, boolean hcaptcha) {
-			super(pendingDataIndex);
+		private RecaptchaV2HandlerData(String pendingDataId, String referer, String apiKey,
+				boolean invisible, boolean hcaptcha, RecaptchaReader.ChallengeExtra challengeExtra) {
+			super(pendingDataId);
 			this.referer = referer;
 			this.apiKey = apiKey;
 			this.invisible = invisible;
 			this.hcaptcha = hcaptcha;
+			this.challengeExtra = challengeExtra;
 		}
 	}
 
 	private static abstract class PendingData {
 		public boolean ready = false;
 
-		public boolean await() {
+		public boolean await(Handler handler, HandlerData handlerData) throws InterruptedException {
 			synchronized (this) {
 				while (!ready) {
 					try {
 						wait();
 					} catch (InterruptedException e) {
-						Thread.currentThread().interrupt();
-						return false;
+						handler.obtainMessage(MESSAGE_INTERRUPT, handlerData).sendToTarget();
+						throw e;
 					}
 				}
 			}
@@ -1015,42 +1060,39 @@ public class ForegroundManager implements Handler.Callback {
 		public HttpException exception;
 	}
 
-	private int putPendingData(PendingData pendingData) {
-		int index;
-		synchronized (pendingDataArray) {
-			index = pendingDataStartIndex++;
-			pendingDataArray.put(index, pendingData);
+	private String putPendingData(PendingData pendingData) {
+		String id = UUID.randomUUID().toString();
+		synchronized (pendingDataMap) {
+			pendingDataMap.put(id, pendingData);
 		}
-		return index;
+		return id;
 	}
 
-	private void removePendingData(int index) {
-		synchronized (pendingDataArray) {
-			pendingDataArray.remove(index);
+	private void removePendingData(String id) {
+		synchronized (pendingDataMap) {
+			pendingDataMap.remove(id);
 		}
 	}
 
-	public ChanPerformer.CaptchaData requireUserCaptcha(ChanManager.Linked linked, String requirement,
-			String boardName, String threadNumber, boolean retry) {
-		ChanConfiguration configuration = ChanConfiguration.get(linked);
-		String captchaType = configuration.getCaptchaType();
-		String chanName = linked.getChanName();
-		return requireUserCaptcha(null, captchaType, requirement, chanName, boardName, threadNumber, null, retry);
+	public ChanPerformer.CaptchaData requireUserCaptcha(Chan chan, String requirement,
+			String boardName, String threadNumber, boolean retry) throws InterruptedException {
+		return requireUserCaptcha(null, chan.configuration.getCaptchaType(), requirement,
+				chan.name, boardName, threadNumber, null, retry);
 	}
 
 	public ChanPerformer.CaptchaData requireUserCaptcha(ReadCaptchaTask.CaptchaReader captchaReader,
 			String captchaType, String requirement, String chanName, String boardName, String threadNumber,
-			String description, boolean retry) {
+			String description, boolean retry) throws InterruptedException {
 		CaptchaPendingData pendingData = new CaptchaPendingData(captchaReader);
-		int pendingDataIndex = putPendingData(pendingData);
+		String pendingDataId = putPendingData(pendingData);
 		try {
-			CaptchaHandlerData handlerData = new CaptchaHandlerData(pendingDataIndex, chanName, captchaType,
+			CaptchaHandlerData handlerData = new CaptchaHandlerData(pendingDataId, chanName, captchaType,
 					requirement, boardName, threadNumber, description);
 			handler.obtainMessage(MESSAGE_REQUIRE_USER_CAPTCHA, handlerData).sendToTarget();
 			if (retry) {
 				handler.sendEmptyMessage(MESSAGE_SHOW_CAPTCHA_INVALID);
 			}
-			if (!pendingData.await()) {
+			if (!pendingData.await(handler, handlerData)) {
 				return null;
 			}
 			ChanPerformer.CaptchaData captchaData = pendingData.captchaData;
@@ -1067,32 +1109,32 @@ public class ForegroundManager implements Handler.Callback {
 			}
 			return captchaData;
 		} finally {
-			removePendingData(pendingDataIndex);
+			removePendingData(pendingDataId);
 		}
 	}
 
 	public Integer requireUserItemSingleChoice(int selected, CharSequence[] items, String descriptionText,
-			Bitmap descriptionImage) {
+			Bitmap descriptionImage) throws InterruptedException {
 		return requireUserSingleChoice(0, selected, items, null, descriptionText, descriptionImage, false);
 	}
 
 	public boolean[] requireUserItemMultipleChoice(boolean[] selected, CharSequence[] items, String descriptionText,
-			Bitmap descriptionImage) {
+			Bitmap descriptionImage) throws InterruptedException {
 		return requireUserChoice(0, selected, items, null, descriptionText, descriptionImage, true, false);
 	}
 
 	public Integer requireUserImageSingleChoice(int columns, int selected, Bitmap[] images,
-			String descriptionText, Bitmap descriptionImage) {
+			String descriptionText, Bitmap descriptionImage) throws InterruptedException {
 		return requireUserSingleChoice(columns, selected, null, images, descriptionText, descriptionImage, true);
 	}
 
 	public boolean[] requireUserImageMultipleChoice(int columns, boolean[] selected, Bitmap[] images,
-			String descriptionText, Bitmap descriptionImage) {
+			String descriptionText, Bitmap descriptionImage) throws InterruptedException {
 		return requireUserChoice(columns, selected, null, images, descriptionText, descriptionImage, true, true);
 	}
 
 	private Integer requireUserSingleChoice(int columns, int selected, CharSequence[] items, Bitmap[] images,
-			String descriptionText, Bitmap descriptionImage, boolean imageChoice) {
+			String descriptionText, Bitmap descriptionImage, boolean imageChoice) throws InterruptedException {
 		boolean[] selectedArray = null;
 		int length = items != null ? items.length : images != null ? images.length : 0;
 		if (selected >= 0 && selected < length) {
@@ -1113,7 +1155,8 @@ public class ForegroundManager implements Handler.Callback {
 	}
 
 	private boolean[] requireUserChoice(int columns, boolean[] selected, CharSequence[] items, Bitmap[] images,
-			String descriptionText, Bitmap descriptionImage, boolean multiple, boolean imageChoice) {
+			String descriptionText, Bitmap descriptionImage, boolean multiple, boolean imageChoice)
+			throws InterruptedException {
 		if (imageChoice && images == null) {
 			throw new NullPointerException("Images array is null");
 		}
@@ -1121,26 +1164,26 @@ public class ForegroundManager implements Handler.Callback {
 			throw new NullPointerException("Items array is null");
 		}
 		ChoicePendingData pendingData = new ChoicePendingData();
-		int pendingDataIndex = putPendingData(pendingData);
+		String pendingDataId = putPendingData(pendingData);
 		try {
-			ChoiceHandlerData handlerData = new ChoiceHandlerData(pendingDataIndex, columns, selected, images, items,
+			ChoiceHandlerData handlerData = new ChoiceHandlerData(pendingDataId, columns, selected, images, items,
 					descriptionText, descriptionImage, multiple);
 			handler.obtainMessage(MESSAGE_REQUIRE_USER_CHOICE, handlerData).sendToTarget();
-			return pendingData.await() ? pendingData.result : null;
+			return pendingData.await(handler, handlerData) ? pendingData.result : null;
 		} finally {
-			removePendingData(pendingDataIndex);
+			removePendingData(pendingDataId);
 		}
 	}
 
-	public String requireUserRecaptchaV2(String referer, String apiKey,
-			boolean invisible, boolean hcaptcha) throws HttpException {
+	public String requireUserRecaptchaV2(String referer, String apiKey, boolean invisible, boolean hcaptcha,
+			RecaptchaReader.ChallengeExtra challengeExtra) throws HttpException, InterruptedException {
 		RecaptchaV2PendingData pendingData = new RecaptchaV2PendingData();
-		int pendingDataIndex = putPendingData(pendingData);
+		String pendingDataId = putPendingData(pendingData);
 		try {
-			RecaptchaV2HandlerData handlerData = new RecaptchaV2HandlerData(pendingDataIndex,
-					referer, apiKey, invisible, hcaptcha);
+			RecaptchaV2HandlerData handlerData = new RecaptchaV2HandlerData(pendingDataId,
+					referer, apiKey, invisible, hcaptcha, challengeExtra);
 			handler.obtainMessage(MESSAGE_REQUIRE_USER_RECAPTCHA_V2, handlerData).sendToTarget();
-			if (!pendingData.await()) {
+			if (!pendingData.await(handler, handlerData)) {
 				return null;
 			}
 			if (pendingData.exception != null) {
@@ -1148,17 +1191,24 @@ public class ForegroundManager implements Handler.Callback {
 			}
 			return pendingData.response;
 		} finally {
-			removePendingData(pendingDataIndex);
+			removePendingData(pendingDataId);
 		}
 	}
 
-	public static void register(FragmentActivity activity) {
-		INSTANCE.activity = new WeakReference<>(activity);
-	}
-
-	public static void unregister(FragmentActivity activity) {
-		if (INSTANCE.getActivity() == activity) {
-			INSTANCE.activity = null;
+	public void register(@NonNull FragmentActivity activity) {
+		Objects.requireNonNull(activity);
+		if (this.activity != null) {
+			FragmentActivity oldActivity = this.activity.get();
+			if (oldActivity == activity) {
+				return;
+			}
+			if (oldActivity != null) {
+				oldActivity.getLifecycle().removeObserver(lifecycleObserver);
+			}
 		}
+		this.activity = new WeakReference<>(activity);
+		this.viewModel = new WeakReference<>(new ViewModelProvider(activity).get(InstanceViewModel.class));
+		activity.getLifecycle().addObserver(lifecycleObserver);
+		handleActivityResumeChecked(activity);
 	}
 }

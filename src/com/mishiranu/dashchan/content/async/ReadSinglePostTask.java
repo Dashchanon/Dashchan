@@ -1,69 +1,75 @@
 package com.mishiranu.dashchan.content.async;
 
-import android.os.SystemClock;
-import chan.content.ChanConfiguration;
+import android.util.Pair;
+import chan.content.Chan;
 import chan.content.ChanPerformer;
 import chan.content.ExtensionException;
 import chan.content.InvalidResponseException;
-import chan.content.model.Post;
 import chan.http.HttpException;
 import chan.http.HttpHolder;
-import chan.util.CommonUtils;
 import com.mishiranu.dashchan.content.model.ErrorItem;
 import com.mishiranu.dashchan.content.model.PostItem;
+import com.mishiranu.dashchan.content.model.PostNumber;
 import java.net.HttpURLConnection;
 
-public class ReadSinglePostTask extends HttpHolderTask<Void, Void, PostItem> {
+public class ReadSinglePostTask extends HttpHolderTask<Void, Pair<ErrorItem, PostItem>> {
 	private final Callback callback;
+	private final Chan chan;
 	private final String boardName;
-	private final String chanName;
-	private final String postNumber;
-
-	private ErrorItem errorItem;
+	private final String threadNumber;
+	private final PostNumber postNumber;
 
 	public interface Callback {
-		public void onReadSinglePostSuccess(PostItem postItem);
-		public void onReadSinglePostFail(ErrorItem errorItem);
+		void onReadSinglePostSuccess(PostItem postItem);
+		void onReadSinglePostFail(ErrorItem errorItem);
 	}
 
-	public ReadSinglePostTask(Callback callback, String chanName, String boardName, String postNumber) {
+	public ReadSinglePostTask(Callback callback, Chan chan,
+			String boardName, String threadNumber, PostNumber postNumber) {
+		super(chan);
 		this.callback = callback;
+		this.chan = chan;
 		this.boardName = boardName;
-		this.chanName = chanName;
+		this.threadNumber = threadNumber;
 		this.postNumber = postNumber;
 	}
 
 	@Override
-	protected PostItem doInBackground(HttpHolder holder, Void... params) {
-		long startTime = SystemClock.elapsedRealtime();
+	protected Pair<ErrorItem, PostItem> run(HttpHolder holder) {
 		try {
-			ChanPerformer performer = ChanPerformer.get(chanName);
-			ChanPerformer.ReadSinglePostResult result = performer.safe().onReadSinglePost(new ChanPerformer
+			String postNumber;
+			if (this.postNumber != null) {
+				postNumber = this.postNumber.toString();
+			} else {
+				postNumber = threadNumber;
+			}
+			ChanPerformer.ReadSinglePostResult result = chan.performer.safe().onReadSinglePost(new ChanPerformer
 					.ReadSinglePostData(boardName, postNumber, holder));
-			Post post = result != null ? result.post : null;
-			startTime = 0L;
-			return PostItem.createPost(post, chanName, boardName);
+			if (result == null || result.post == null) {
+				throw HttpException.createNotFoundException();
+			}
+			return new Pair<>(null, PostItem.createPost(result.post.post, chan,
+					boardName, result.post.threadNumber, result.post.originalPostNumber));
 		} catch (HttpException e) {
-			errorItem = e.getErrorItemAndHandle();
+			ErrorItem errorItem = e.getErrorItemAndHandle();
 			if (errorItem.httpResponseCode == HttpURLConnection.HTTP_NOT_FOUND ||
 					errorItem.httpResponseCode == HttpURLConnection.HTTP_GONE) {
 				errorItem = new ErrorItem(ErrorItem.Type.POST_NOT_FOUND);
 			}
+			return new Pair<>(errorItem, null);
 		} catch (ExtensionException | InvalidResponseException e) {
-			errorItem = e.getErrorItemAndHandle();
+			return new Pair<>(e.getErrorItemAndHandle(), null);
 		} finally {
-			ChanConfiguration.get(chanName).commit();
-			CommonUtils.sleepMaxRealtime(startTime, 500);
+			chan.configuration.commit();
 		}
-		return null;
 	}
 
 	@Override
-	protected void onPostExecute(PostItem result) {
-		if (result != null) {
-			callback.onReadSinglePostSuccess(result);
+	protected void onComplete(Pair<ErrorItem, PostItem> result) {
+		if (result.second != null) {
+			callback.onReadSinglePostSuccess(result.second);
 		} else {
-			callback.onReadSinglePostFail(errorItem);
+			callback.onReadSinglePostFail(result.first);
 		}
 	}
 }

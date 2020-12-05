@@ -1,63 +1,59 @@
 package com.mishiranu.dashchan.content.async;
 
-import chan.content.ChanConfiguration;
+import chan.content.Chan;
 import chan.content.ChanPerformer;
 import chan.content.ExtensionException;
 import chan.content.InvalidResponseException;
 import chan.content.model.BoardCategory;
 import chan.http.HttpException;
 import chan.http.HttpHolder;
+import com.mishiranu.dashchan.content.database.ChanDatabase;
 import com.mishiranu.dashchan.content.model.ErrorItem;
 
-public class ReadBoardsTask extends HttpHolderTask<Void, Long, Boolean> {
-	private final String chanName;
+public class ReadBoardsTask extends HttpHolderTask<Void, ErrorItem> {
 	private final Callback callback;
-
-	private BoardCategory[] boardCategories;
-	private ErrorItem errorItem;
+	private final Chan chan;
 
 	public interface Callback {
-		public void onReadBoardsSuccess(BoardCategory[] boardCategories);
-		public void onReadBoardsFail(ErrorItem errorItem);
+		void onReadBoardsSuccess();
+		void onReadBoardsFail(ErrorItem errorItem);
 	}
 
-	public ReadBoardsTask(String chanName, Callback callback) {
-		this.chanName = chanName;
+	public ReadBoardsTask(Callback callback, Chan chan) {
+		super(chan);
 		this.callback = callback;
+		this.chan = chan;
 	}
 
 	@Override
-	protected Boolean doInBackground(HttpHolder holder, Void... params) {
+	protected ErrorItem run(HttpHolder holder) {
 		try {
-			ChanPerformer.ReadBoardsResult result = ChanPerformer.get(chanName).safe()
+			ChanPerformer.ReadBoardsResult result = chan.performer.safe()
 					.onReadBoards(new ChanPerformer.ReadBoardsData(holder));
 			BoardCategory[] boardCategories = result != null ? result.boardCategories : null;
 			if (boardCategories != null && boardCategories.length == 0) {
 				boardCategories = null;
 			}
 			if (boardCategories != null) {
-				ChanConfiguration.get(chanName).updateFromBoards(boardCategories);
+				chan.configuration.updateFromBoards(boardCategories);
 			}
-			this.boardCategories = boardCategories;
-			return true;
+			if (!ChanDatabase.getInstance().setBoards(chan.name, boardCategories)) {
+				return new ErrorItem(ErrorItem.Type.EMPTY_RESPONSE);
+			}
+			return null;
 		} catch (ExtensionException | HttpException | InvalidResponseException e) {
-			errorItem = e.getErrorItemAndHandle();
-			return false;
+			return e.getErrorItemAndHandle();
 		} finally {
-			ChanConfiguration.get(chanName).commit();
+			chan.configuration.commit();
 		}
 	}
 
 	@Override
-	public void onPostExecute(Boolean success) {
-		if (success) {
-			if (boardCategories != null) {
-				callback.onReadBoardsSuccess(boardCategories);
-			} else {
-				callback.onReadBoardsFail(new ErrorItem(ErrorItem.Type.EMPTY_RESPONSE));
-			}
+	protected void onComplete(ErrorItem result) {
+		if (result == null) {
+			callback.onReadBoardsSuccess();
 		} else {
-			callback.onReadBoardsFail(errorItem);
+			callback.onReadBoardsFail(result);
 		}
 	}
 }

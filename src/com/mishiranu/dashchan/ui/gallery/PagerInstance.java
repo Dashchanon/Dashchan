@@ -2,7 +2,6 @@ package com.mishiranu.dashchan.ui.gallery;
 
 import android.view.View;
 import android.widget.FrameLayout;
-import android.widget.TextView;
 import com.mishiranu.dashchan.content.ImageLoader;
 import com.mishiranu.dashchan.content.model.GalleryItem;
 import com.mishiranu.dashchan.graphics.DecoderDrawable;
@@ -12,8 +11,44 @@ import com.mishiranu.dashchan.media.GifDecoder;
 import com.mishiranu.dashchan.media.JpegData;
 import com.mishiranu.dashchan.widget.CircularProgressBar;
 import com.mishiranu.dashchan.widget.PhotoView;
+import com.mishiranu.dashchan.widget.ViewFactory;
 
 public class PagerInstance {
+	public enum LoadState {PREVIEW_OR_LOADING, COMPLETE, ERROR}
+
+	public static class MediaSummary {
+		public int width;
+		public int height;
+		public long size;
+
+		public MediaSummary(int width, int height, long size) {
+			this.width = width;
+			this.height = height;
+			this.size = size;
+		}
+
+		public MediaSummary(GalleryItem galleryItem) {
+			this(galleryItem.width, galleryItem.height, galleryItem.size);
+		}
+
+		public boolean updateDimensions(int width, int height) {
+			if (width > 0 && height > 0 && (this.width != width || this.height != height)) {
+				this.width = width;
+				this.height = height;
+				return true;
+			}
+			return false;
+		}
+
+		public boolean updateSize(long size) {
+			if (size > 0 && this.size != size) {
+				this.size = size;
+				return true;
+			}
+			return false;
+		}
+	}
+
 	public final GalleryInstance galleryInstance;
 	public final Callback callback;
 
@@ -30,13 +65,12 @@ public class PagerInstance {
 
 	public static class ViewHolder {
 		public GalleryItem galleryItem;
+		public MediaSummary mediaSummary;
 		public PhotoView photoView;
 		public FrameLayout surfaceParent;
 		public CircularProgressBar progressBar;
 		public View playButton;
-
-		public View errorView;
-		public TextView errorText;
+		public ViewFactory.ErrorHolder errorHolder;
 
 		public SimpleBitmapDrawable simpleBitmapDrawable;
 		public DecoderDrawable decoderDrawable;
@@ -46,7 +80,7 @@ public class PagerInstance {
 		public boolean photoViewThumbnail;
 		public ImageLoader.Target thumbnailTarget;
 
-		public boolean fullLoaded;
+		public LoadState loadState = LoadState.PREVIEW_OR_LOADING;
 		public Object decodeBitmapTask;
 
 		public void recyclePhotoView() {
@@ -73,6 +107,6 @@ public class PagerInstance {
 	}
 
 	public interface Callback {
-		public void showError(ViewHolder holder, String message);
+		void showError(ViewHolder holder, String message);
 	}
 }

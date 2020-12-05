@@ -3,6 +3,8 @@ package com.mishiranu.dashchan.content.service.webview;
 import android.annotation.SuppressLint;
 import android.app.Service;
 import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.net.Uri;
 import android.net.http.SslError;
 import android.os.Handler;
@@ -21,10 +23,15 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import chan.http.HttpClient;
+import com.mishiranu.dashchan.C;
 import com.mishiranu.dashchan.R;
 import com.mishiranu.dashchan.util.IOUtils;
 import com.mishiranu.dashchan.util.WebViewUtils;
 import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.util.HashMap;
 import java.util.LinkedList;
 
 public class WebViewService extends Service {
@@ -62,9 +69,16 @@ public class WebViewService extends Service {
 	private CookieRequest cookieRequest;
 	private Thread captchaThread;
 
+	private static boolean captureImageFileInit;
+	private static File captureImageFile;
+
+	private static final int DRAW_TO_FILE_INTERVAL = 2000;
+
 	private static final int MESSAGE_HANDLE_NEXT = 1;
 	private static final int MESSAGE_HANDLE_FINISH = 2;
-	private static final int MESSAGE_HANDLE_CAPTCHA = 3;
+	private static final int MESSAGE_HANDLE_AFTER_INTERRUPT = 3;
+	private static final int MESSAGE_HANDLE_CAPTCHA = 4;
+	private static final int MESSAGE_DRAW_TO_FILE = 5;
 
 	private final Handler handler = new Handler(Looper.getMainLooper(), message -> {
 		if (webView == null) {
@@ -76,7 +90,7 @@ public class WebViewService extends Service {
 				return true;
 			}
 			case MESSAGE_HANDLE_FINISH: {
-				CookieRequest cookieRequest = WebViewService.this.cookieRequest;
+				CookieRequest cookieRequest = this.cookieRequest;
 				if (cookieRequest != null) {
 					synchronized (cookieRequest) {
 						if (!cookieRequest.ready) {
@@ -84,14 +98,22 @@ public class WebViewService extends Service {
 							cookieRequest.notifyAll();
 						}
 					}
-					WebViewService.this.cookieRequest = null;
+					this.cookieRequest = null;
 				}
 				handleNextCookieRequest();
 				return true;
 			}
+			case MESSAGE_HANDLE_AFTER_INTERRUPT: {
+				CookieRequest cookieRequest = (CookieRequest) message.obj;
+				if (cookieRequest == this.cookieRequest) {
+					this.cookieRequest = null;
+					handleNextCookieRequest();
+				}
+				return true;
+			}
 			case MESSAGE_HANDLE_CAPTCHA: {
 				CookieRequest cookieRequest = (CookieRequest) message.obj;
-				if (cookieRequest == WebViewService.this.cookieRequest) {
+				if (cookieRequest == this.cookieRequest) {
 					message.getTarget().removeMessages(MESSAGE_HANDLE_FINISH);
 					if (cookieRequest.recaptchaV2Result != null) {
 						webView.loadUrl("javascript:handleResult('" + cookieRequest.recaptchaV2Result + "')");
@@ -99,6 +121,22 @@ public class WebViewService extends Service {
 					} else {
 						message.getTarget().sendEmptyMessage(MESSAGE_HANDLE_FINISH);
 					}
+				}
+				return true;
+			}
+			case MESSAGE_DRAW_TO_FILE: {
+				if (captureImageFile != null && webView != null) {
+					Bitmap bitmap = Bitmap.createBitmap(webView.getLayoutParams().width,
+							webView.getLayoutParams().height, Bitmap.Config.ARGB_8888);
+					webView.draw(new Canvas(bitmap));
+					try (FileOutputStream output = new FileOutputStream(captureImageFile)) {
+						bitmap.compress(Bitmap.CompressFormat.PNG, 100, output);
+					} catch (IOException e) {
+						// Ignore exception
+					} finally {
+						bitmap.recycle();
+					}
+					message.getTarget().sendEmptyMessageDelayed(MESSAGE_DRAW_TO_FILE, DRAW_TO_FILE_INTERVAL);
 				}
 				return true;
 			}
@@ -209,7 +247,7 @@ public class WebViewService extends Service {
 		}
 	}
 
-	@SuppressWarnings({"unused", "RedundantSuppression"})
+	@SuppressWarnings("unused")
 	private final Object javascriptInterface = new Object() {
 		@JavascriptInterface
 		public void onRequestRecaptcha(String apiKey) {
@@ -250,10 +288,15 @@ public class WebViewService extends Service {
 	private void handleNextCookieRequest() {
 		if (cookieRequest == null) {
 			synchronized (cookieRequests) {
-				if (!cookieRequests.isEmpty()) {
+				while (!cookieRequests.isEmpty()) {
 					cookieRequest = cookieRequests.removeFirst();
+					// Ignore interrupted requests
+					if (!cookieRequest.ready) {
+						break;
+					}
 				}
 			}
+			handler.removeMessages(MESSAGE_DRAW_TO_FILE);
 			webView.stopLoading();
 			WebViewUtils.clearAll(webView);
 			CookieRequest cookieRequest = this.cookieRequest;
@@ -266,6 +309,9 @@ public class WebViewService extends Service {
 						webView.loadUrl(cookieRequest.uriString);
 					}
 				});
+				if (captureImageFile != null) {
+					handler.sendEmptyMessageDelayed(MESSAGE_DRAW_TO_FILE, DRAW_TO_FILE_INTERVAL);
+				}
 			} else {
 				webView.loadUrl("about:blank");
 			}
@@ -275,31 +321,70 @@ public class WebViewService extends Service {
 	@Override
 	public IBinder onBind(Intent intent) {
 		return new IWebViewService.Stub() {
+			private final HashMap<String, CookieRequest> interruptedRequests = new HashMap<>();
+
 			@Override
-			public boolean loadWithCookieResult(String uriString, String userAgent,
+			public boolean loadWithCookieResult(String requestId, String uriString, String userAgent,
 					boolean proxySocks, String proxyHost, int proxyPort, boolean verifyCertificate, long timeout,
 					WebViewExtra extra, IRequestCallback requestCallback) throws RemoteException {
 				HttpClient.ProxyData proxyData = proxyHost != null
 						? new HttpClient.ProxyData(proxySocks, proxyHost, proxyPort) : null;
 				CookieRequest cookieRequest = new CookieRequest(uriString, userAgent, proxyData,
 						verifyCertificate, timeout, extra, requestCallback);
-				synchronized (cookieRequest) {
+				synchronized (interruptedRequests) {
+					if (interruptedRequests.containsKey(requestId)) {
+						interruptedRequests.remove(requestId);
+						return false;
+					} else {
+						interruptedRequests.put(requestId, cookieRequest);
+					}
+				}
+				try {
 					synchronized (cookieRequests) {
 						cookieRequests.add(cookieRequest);
 					}
-					handler.sendEmptyMessage(MESSAGE_HANDLE_NEXT);
-					while (!cookieRequest.ready) {
-						try {
-							cookieRequest.wait();
-						} catch (InterruptedException e) {
-							Thread.currentThread().interrupt();
-							throw new RemoteException("interrupted");
+					synchronized (cookieRequest) {
+						handler.sendEmptyMessage(MESSAGE_HANDLE_NEXT);
+						while (!cookieRequest.ready) {
+							try {
+								cookieRequest.wait();
+							} catch (InterruptedException e) {
+								Thread.currentThread().interrupt();
+								throw new RemoteException("interrupted");
+							}
 						}
 					}
+					return cookieRequest.finished;
+				} finally {
+					synchronized (interruptedRequests) {
+						interruptedRequests.remove(requestId);
+					}
 				}
-				return cookieRequest.finished;
+			}
+
+			@Override
+			public void interrupt(String requestId) {
+				synchronized (interruptedRequests) {
+					CookieRequest cookieRequest = interruptedRequests.get(requestId);
+					if (cookieRequest != null) {
+						synchronized (cookieRequest) {
+							cookieRequest.ready = true;
+							cookieRequest.notifyAll();
+						}
+						handler.obtainMessage(MESSAGE_HANDLE_AFTER_INTERRUPT, cookieRequest).sendToTarget();
+					} else {
+						interruptedRequests.put(requestId, null);
+					}
+				}
 			}
 		};
+	}
+
+	@SuppressWarnings("deprecation")
+	private static void disableCacheCompat(WebView webView) {
+		if (!C.API_R) {
+			webView.getSettings().setAppCacheEnabled(false);
+		}
 	}
 
 	@SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
@@ -307,10 +392,21 @@ public class WebViewService extends Service {
 	public void onCreate() {
 		super.onCreate();
 
+		if (!captureImageFileInit) {
+			captureImageFileInit = true;
+			File file = new File(getExternalCacheDir().getParentFile(), "files/webview.png");
+			if (file.exists()) {
+				captureImageFile = file;
+				if (C.API_LOLLIPOP) {
+					WebView.enableSlowWholeDocumentDraw();
+				}
+			}
+		}
+
 		webView = new WebView(this);
 		webView.getSettings().setJavaScriptEnabled(true);
 		webView.getSettings().setCacheMode(WebSettings.LOAD_NO_CACHE);
-		webView.getSettings().setAppCacheEnabled(false);
+		disableCacheCompat(webView);
 		webView.addJavascriptInterface(javascriptInterface, "jsi");
 		webView.setWebViewClient(new ServiceClient());
 		webView.setWebChromeClient(new WebChromeClient() {
@@ -326,10 +422,17 @@ public class WebViewService extends Service {
 			}
 		});
 		webView.setLayoutParams(new ViewGroup.LayoutParams(480, 270));
+		int initialScale = 25;
+		if (captureImageFile != null) {
+			int factor = 4;
+			webView.getLayoutParams().width *= factor;
+			webView.getLayoutParams().height *= factor;
+			initialScale *= factor;
+		}
 		int measureSpec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED);
 		webView.measure(measureSpec, measureSpec);
 		webView.layout(0, 0, webView.getLayoutParams().width, webView.getLayoutParams().height);
-		webView.setInitialScale(25);
+		webView.setInitialScale(initialScale);
 	}
 
 	@Override

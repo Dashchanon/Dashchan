@@ -25,8 +25,7 @@
 			android:layout_marginRight="@dimen/dialog_padding_text_half"
 			android:layout_marginBottom="8dp"
 			android:paddingLeft="@dimen/dialog_padding_text_half"
-			android:paddingRight="@dimen/dialog_padding_text_half"
-			android:fontFamily="sans-serif-medium" />
+			android:paddingRight="@dimen/dialog_padding_text_half" />
 
 		<LinearLayout
 			android:layout_width="match_parent"
@@ -100,6 +99,13 @@
 				android:layout_width="wrap_content"
 				android:layout_height="wrap_content"
 				android:text="@string/find_in_names"
+				android:textAppearance="?android:attr/textAppearanceSmall" />
+
+			<CheckBox
+				android:id="@+id/autohide_file_name"
+				android:layout_width="wrap_content"
+				android:layout_height="wrap_content"
+				android:text="@string/find_in_file_names"
 				android:textAppearance="?android:attr/textAppearanceSmall" />
 
 		</LinearLayout>

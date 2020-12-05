@@ -4,10 +4,7 @@ import android.content.Context;
 import android.graphics.PorterDuff;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.StateListDrawable;
-import android.os.SystemClock;
-import android.view.MotionEvent;
 import android.view.View;
-import android.view.ViewGroup;
 import android.view.ViewParent;
 import android.widget.AdapterView;
 import androidx.recyclerview.widget.LinearLayoutManager;
@@ -85,14 +82,13 @@ public class ListViewUtils {
 		return holder != null && clazz.isAssignableFrom(holder.getClass()) ? (T) holder : null;
 	}
 
-	public static void cancelListFling(ViewGroup viewGroup) {
-		MotionEvent motionEvent;
-		motionEvent = MotionEvent.obtain(0, SystemClock.uptimeMillis(), MotionEvent.ACTION_DOWN, 0, 0, 0);
-		viewGroup.onTouchEvent(motionEvent);
-		motionEvent.recycle();
-		motionEvent = MotionEvent.obtain(0, SystemClock.uptimeMillis(), MotionEvent.ACTION_CANCEL, 0, 0, 0);
-		viewGroup.onTouchEvent(motionEvent);
-		motionEvent.recycle();
+	// Unlimited pool size for immediate scrolls to improve performance
+	public static class UnlimitedRecycledViewPool extends RecyclerView.RecycledViewPool {
+		@Override
+		public void putRecycledView(RecyclerView.ViewHolder scrap) {
+			setMaxRecycledViews(scrap.getItemViewType(), Integer.MAX_VALUE);
+			super.putRecycledView(scrap);
+		}
 	}
 
 	private static class TopLinearSmoothScroller extends LinearSmoothScroller {

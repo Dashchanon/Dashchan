@@ -19,6 +19,7 @@ public class C {
 	public static final boolean API_OREO = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O;
 	public static final boolean API_PIE = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P;
 	public static final boolean API_Q = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q;
+	public static final boolean API_R = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R;
 
 	public static final boolean USE_SAF = API_MARSHMALLOW;
 
@@ -48,8 +49,8 @@ public class C {
 		IMAGE_EXTENSIONS = immutableSet("jpg", "jpe", "jpeg", "png", "apng", "gif", "webp", "bmp",
 				WEB_VIEW_BITMAP_DECODER_SUPPORTED ? "svg" : null);
 		AUDIO_EXTENSIONS = immutableSet("mp3", "ogg", "flac", "wav");
-		VIDEO_EXTENSIONS = immutableSet("webm", "mp4");
-		OPENABLE_VIDEO_EXTENSIONS = immutableSet("webm", "mp4");
+		VIDEO_EXTENSIONS = immutableSet("webm", "mkv", "mp4");
+		OPENABLE_VIDEO_EXTENSIONS = immutableSet("webm", "mkv", "mp4");
 		HashMap<String, String> extensionTransformation = new HashMap<>();
 		extensionTransformation.put("jpg", "jpeg");
 		extensionTransformation.put("jpe", "jpeg");
@@ -65,13 +66,13 @@ public class C {
 	public static final String ACTION_BROWSER = "com.mishiranu.dashchan.action.BROWSER";
 
 	public static final int REQUEST_CODE_ATTACH = 1;
-	public static final int REQUEST_CODE_UNINSTALL = 2;
-	public static final int REQUEST_CODE_OPEN_URI_TREE = 3;
+	public static final int REQUEST_CODE_OPEN_URI_TREE = 2;
 
 	public static final int NOTIFICATION_ID_POSTING = 1;
 	public static final int NOTIFICATION_ID_DOWNLOADING = 2;
 	public static final int NOTIFICATION_ID_AUDIO_PLAYER = 3;
 	public static final int NOTIFICATION_ID_UPDATES = 4;
+	public static final int NOTIFICATION_ID_REPLIES = 5;
 
 	public static final String NOTIFICATION_CHANNEL_POSTING = "posting";
 	public static final String NOTIFICATION_CHANNEL_POSTING_COMPLETE = "postingComplete";
@@ -79,14 +80,13 @@ public class C {
 	public static final String NOTIFICATION_CHANNEL_DOWNLOADING_COMPLETE = "downloadingComplete";
 	public static final String NOTIFICATION_CHANNEL_AUDIO_PLAYER = "audioPlayer";
 	public static final String NOTIFICATION_CHANNEL_UPDATES = "updates";
+	public static final String NOTIFICATION_CHANNEL_REPLIES = "replies";
 
 	public static final String EXTRA_BOARD_NAME = "com.mishiranu.dashchan.extra.BOARD_NAME";
 	public static final String EXTRA_CHAN_NAME = "com.mishiranu.dashchan.extra.CHAN_NAME";
 	public static final String EXTRA_FAIL_RESULT = "com.mishiranu.dashchan.extra.FAIL_RESULT";
-	public static final String EXTRA_FROM_CLIENT = "com.mishiranu.dashchan.extra.FROM_CLIENT";
-	public static final String EXTRA_NAVIGATION_FLAGS = "com.mishiranu.dashchan.extra.NAVIGATION_FLAGS";
 	public static final String EXTRA_POST_NUMBER = "com.mishiranu.dashchan.extra.POST_NUMBER";
-	public static final String EXTRA_SEARCH_QUERY = "com.mishiranu.dashchan.extra.SEARCH_QUERY";
+	public static final String EXTRA_FROM_CLIENT = "com.mishiranu.dashchan.extra.FROM_CLIENT";
 	public static final String EXTRA_THREAD_NUMBER = "com.mishiranu.dashchan.extra.THREAD_NUMBER";
 	public static final String EXTRA_UPDATE_DATA_MAP = "com.mishiranu.dashchan.extra.UPDATE_DATA_MAP";
 }

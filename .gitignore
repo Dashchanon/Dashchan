@@ -11,9 +11,10 @@
 !/icon.sh
 !/icon.svg
 !/jni
+!/lang
+!/metadata
 !/proguard-rules.pro
 !/README.md
 !/res
 !/src
-!/src-api
 !/update

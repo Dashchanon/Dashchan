@@ -1,20 +1,16 @@
 package com.mishiranu.dashchan.ui.preference;
 
-import android.annotation.TargetApi;
-import android.app.Activity;
-import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.net.Uri;
-import android.os.Build;
 import android.os.Bundle;
 import android.text.InputType;
 import android.view.View;
 import androidx.annotation.NonNull;
 import androidx.fragment.app.DialogFragment;
-import androidx.fragment.app.Fragment;
+import androidx.lifecycle.ViewModelProvider;
+import chan.content.Chan;
 import chan.content.ChanConfiguration;
-import chan.content.ChanLocator;
 import chan.content.ChanManager;
 import chan.content.ChanPerformer;
 import chan.content.ExtensionException;
@@ -24,30 +20,33 @@ import chan.http.HttpException;
 import chan.http.HttpHolder;
 import chan.util.CommonUtils;
 import chan.util.StringUtils;
-import com.mishiranu.dashchan.C;
 import com.mishiranu.dashchan.R;
 import com.mishiranu.dashchan.content.Preferences;
-import com.mishiranu.dashchan.content.async.AsyncManager;
+import com.mishiranu.dashchan.content.async.HttpHolderTask;
+import com.mishiranu.dashchan.content.async.TaskViewModel;
+import com.mishiranu.dashchan.content.database.ChanDatabase;
 import com.mishiranu.dashchan.content.model.ErrorItem;
 import com.mishiranu.dashchan.content.net.RelayBlockResolver;
 import com.mishiranu.dashchan.ui.FragmentHandler;
 import com.mishiranu.dashchan.ui.preference.core.CheckPreference;
-import com.mishiranu.dashchan.ui.preference.core.MultipleEditTextPreference;
+import com.mishiranu.dashchan.ui.preference.core.MultipleEditPreference;
 import com.mishiranu.dashchan.ui.preference.core.Preference;
 import com.mishiranu.dashchan.ui.preference.core.PreferenceFragment;
-import com.mishiranu.dashchan.util.ToastUtils;
+import com.mishiranu.dashchan.util.ConcurrentUtils;
+import com.mishiranu.dashchan.widget.ClickableToast;
 import com.mishiranu.dashchan.widget.ProgressDialog;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
-public class ChanFragment extends PreferenceFragment {
+public class ChanFragment extends PreferenceFragment implements FragmentHandler.Callback {
 	private static final String EXTRA_CHAN_NAME = "chanName";
 
-	private Preference<String[]> captchaPassPreference;
-	private Preference<String[]> userAuthorizationPreference;
+	private Preference<List<String>> captchaPassPreference;
+	private Preference<List<String>> userAuthorizationPreference;
 	private Preference<?> cookiePreference;
 
 	private static final String VALUE_CUSTOM_DOMAIN = "custom_domain\n";
@@ -75,14 +74,14 @@ public class ChanFragment extends PreferenceFragment {
 	@Override
 	public void onViewCreated(@NonNull View view, Bundle savedInstanceState) {
 		super.onViewCreated(view, savedInstanceState);
+
 		String chanName = getChanName();
+		Chan chan = Chan.get(chanName);
+		ChanConfiguration.Board board = chan.configuration.safe().obtainBoard(null);
+		ChanConfiguration.Deleting deleting = board.allowDeleting
+				? chan.configuration.safe().obtainDeleting(null) : null;
 
-		ChanConfiguration configuration = ChanConfiguration.get(chanName);
-		ChanLocator locator = ChanLocator.get(chanName);
-		ChanConfiguration.Board board = configuration.safe().obtainBoard(null);
-		ChanConfiguration.Deleting deleting = board.allowDeleting ? configuration.safe().obtainDeleting(null) : null;
-
-		if (!configuration.getOption(ChanConfiguration.OPTION_SINGLE_BOARD_MODE)) {
+		if (!chan.configuration.getOption(ChanConfiguration.OPTION_SINGLE_BOARD_MODE)) {
 			addEdit(Preferences.KEY_DEFAULT_BOARD_NAME.bind(chanName), null,
 					R.string.default_starting_board, p -> {
 						String text = p.getValue();
@@ -90,7 +89,7 @@ public class ChanFragment extends PreferenceFragment {
 							String boardName = StringUtils.validateBoardName(text);
 							if (boardName != null) {
 								text = StringUtils.formatBoardTitle(chanName, boardName,
-										ChanConfiguration.get(chanName).getBoardTitle(boardName));
+										Chan.get(chanName).configuration.getBoardTitle(boardName));
 							} else {
 								text = null;
 							}
@@ -103,7 +102,7 @@ public class ChanFragment extends PreferenceFragment {
 					R.string.load_catalog, R.string.load_catalog__summary);
 		}
 		if (deleting != null && deleting.password) {
-			Preferences.getPassword(chanName); // Ensure password existence
+			Preferences.getPassword(chan); // Ensure password existence
 			addEdit(Preferences.KEY_PASSWORD.bind(chanName), null,
 					R.string.password_for_removal, R.string.password_for_removal__summary,
 					getString(R.string.password), InputType.TYPE_CLASS_TEXT |
@@ -111,61 +110,70 @@ public class ChanFragment extends PreferenceFragment {
 					.setOnAfterChangeListener(p -> {
 						String value = p.getValue();
 						if (StringUtils.isEmpty(value)) {
-							p.setValue(Preferences.getPassword(getChanName()));
-							ToastUtils.show(requireContext(), R.string.new_password_was_generated);
+							p.setValue(Preferences.getPassword(Chan.get(chanName)));
+							ClickableToast.show(R.string.new_password_was_generated);
 						}
 					});
 		}
-		Collection<String> captchaTypes = configuration.getSupportedCaptchaTypes();
+		Collection<String> captchaTypes = chan.configuration.getSupportedCaptchaTypes();
 		if (captchaTypes != null && captchaTypes.size() > 1) {
-			String[] values = Preferences.getCaptchaTypeValues(captchaTypes);
-			addList(Preferences.KEY_CAPTCHA.bind(chanName), values,
-					Preferences.getCaptchaTypeDefaultValue(chanName), R.string.captcha_type,
-					Preferences.getCaptchaTypeEntries(chanName, captchaTypes));
+			addList(Preferences.KEY_CAPTCHA.bind(chanName), Preferences.getCaptchaTypeValues(captchaTypes),
+					Preferences.getCaptchaTypeDefaultValue(chan), R.string.captcha_type,
+					Preferences.getCaptchaTypeEntries(chan, captchaTypes));
 		}
-		if (configuration.getOption(ChanConfiguration.OPTION_ALLOW_CAPTCHA_PASS)) {
-			ChanConfiguration.Authorization authorization = configuration.safe().obtainCaptchaPass();
+		if (chan.configuration.getOption(ChanConfiguration.OPTION_ALLOW_CAPTCHA_PASS)) {
+			ChanConfiguration.Authorization authorization = chan.configuration.safe().obtainCaptchaPass();
 			if (authorization != null && authorization.fieldsCount > 0) {
 				captchaPassPreference = addMultipleEdit(Preferences.KEY_CAPTCHA_PASS.bind(chanName),
-						R.string.captcha_pass, R.string.captcha_pass__summary, authorization.hints,
+						R.string.captcha_pass, R.string.captcha_pass__summary,
+						authorization.hints != null ? Arrays.asList(authorization.hints) : null,
 						createInputTypes(authorization.fieldsCount,
-								InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD));
+								InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD),
+						new MultipleEditPreference.ListValueCodec(authorization.fieldsCount));
 				captchaPassPreference.setOnAfterChangeListener(p -> {
-					String[] values = p.getValue();
+					List<String> values = p.getValue();
 					if (Preferences.checkHasMultipleValues(values)) {
-						new AuthorizationFragment(getChanName(), AuthorizationType.CAPTCHA_PASS, values).show(this);
+						AuthorizationDialog dialog = new AuthorizationDialog(getChanName(),
+								AuthorizationType.CAPTCHA_PASS, values);
+						dialog.show(getChildFragmentManager(), AuthorizationDialog.class.getName());
 					}
 				});
 			}
 		}
-		if (configuration.getOption(ChanConfiguration.OPTION_ALLOW_USER_AUTHORIZATION)) {
-			ChanConfiguration.Authorization authorization = configuration.safe().obtainUserAuthorization();
+		if (chan.configuration.getOption(ChanConfiguration.OPTION_ALLOW_USER_AUTHORIZATION)) {
+			ChanConfiguration.Authorization authorization = chan.configuration.safe().obtainUserAuthorization();
 			if (authorization != null && authorization.fieldsCount > 0) {
 				userAuthorizationPreference = addMultipleEdit(Preferences.KEY_USER_AUTHORIZATION.bind(chanName),
-						R.string.user_authorization, 0, authorization.hints,
+						R.string.user_authorization, 0,
+						authorization.hints != null ? Arrays.asList(authorization.hints) : null,
 						createInputTypes(authorization.fieldsCount,
-								InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD));
+								InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD),
+						new MultipleEditPreference.ListValueCodec(authorization.fieldsCount));
 				userAuthorizationPreference.setOnAfterChangeListener(p -> {
-					String[] values = p.getValue();
+					List<String> values = p.getValue();
 					if (Preferences.checkHasMultipleValues(values)) {
-						new AuthorizationFragment(getChanName(), AuthorizationType.USER, values).show(this);
+						AuthorizationDialog dialog = new AuthorizationDialog(getChanName(),
+								AuthorizationType.USER, values);
+						dialog.show(getChildFragmentManager(), AuthorizationDialog.class.getName());
 					}
 				});
 			}
 		}
-		LinkedHashMap<String, Boolean> customPreferences = configuration.getCustomPreferences();
+		LinkedHashMap<String, Boolean> customPreferences = chan.configuration.getCustomPreferences();
 		if (customPreferences != null) {
 			for (LinkedHashMap.Entry<String, Boolean> preferenceHolder : customPreferences.entrySet()) {
 				String key = preferenceHolder.getKey();
 				boolean defaultValue = preferenceHolder.getValue();
-				ChanConfiguration.CustomPreference customPreference = configuration.safe().obtainCustomPreference(key);
+				ChanConfiguration.CustomPreference customPreference =
+						chan.configuration.safe().obtainCustomPreference(key);
 				if (customPreference != null && customPreference.title != null) {
 					CheckPreference preference = addCheck(false, key, defaultValue,
 							customPreference.title, customPreference.summary);
-					preference.setValue(configuration.get(null, key, defaultValue));
+					preference.setValue(chan.configuration.get(null, key, defaultValue));
 					preference.setOnAfterChangeListener(p -> {
-						configuration.set(null, preference.key, p.getValue());
-						configuration.commit();
+						Chan callbackChan = Chan.get(chanName);
+						callbackChan.configuration.set(null, preference.key, p.getValue());
+						callbackChan.configuration.commit();
 					});
 				}
 			}
@@ -174,29 +182,26 @@ public class ChanFragment extends PreferenceFragment {
 		cookiePreference.setOnClickListener(p -> ((FragmentHandler) requireActivity())
 				.pushFragment(new CookiesFragment(chanName)));
 
-		ArrayList<String> domains = locator.getChanHosts(true);
-		boolean localMode = configuration.getOption(ChanConfiguration.OPTION_LOCAL_MODE) || domains.isEmpty();
-		boolean httpsConfigurable = locator.isHttpsConfigurable();
-		boolean canReadThreadPartially = configuration.getOption(ChanConfiguration.OPTION_READ_THREAD_PARTIALLY);
+		ArrayList<String> domains = chan.locator.getChanHosts(true);
+		boolean localMode = chan.configuration.getOption(ChanConfiguration.OPTION_LOCAL_MODE) || domains.isEmpty();
+		boolean httpsConfigurable = chan.locator.isHttpsConfigurable();
+		boolean canReadThreadPartially = chan.configuration.getOption(ChanConfiguration.OPTION_READ_THREAD_PARTIALLY);
 		if (!localMode || httpsConfigurable || canReadThreadPartially) {
 			addHeader(R.string.connection);
 		}
 		if (!localMode) {
-			anotherDomainMode = !domains.contains(locator.getPreferredHost()) || domains.size() == 1 ||
+			anotherDomainMode = !domains.contains(chan.locator.getPreferredHost()) || domains.size() == 1 ||
 					savedInstanceState != null && savedInstanceState.getBoolean(EXTRA_ANOTHER_DOMAIN_MODE);
 			if (anotherDomainMode) {
 				addAnotherDomainPreference(domains.get(0));
 			} else {
-				String[] domainsArray = CommonUtils.toArray(domains, String.class);
-				String[] entries = new String[domainsArray.length + 1];
-				System.arraycopy(domainsArray, 0, entries, 0, domainsArray.length);
-				entries[entries.length - 1] = getString(R.string.another);
-				String[] values = new String[domainsArray.length + 1];
-				values[0] = "";
-				System.arraycopy(domainsArray, 1, values, 1, domainsArray.length - 1);
-				values[values.length - 1] = VALUE_CUSTOM_DOMAIN;
+				ArrayList<CharSequence> entries = new ArrayList<>(domains);
+				entries.add(getString(R.string.another));
+				ArrayList<String> values = new ArrayList<>(domains);
+				values.add(VALUE_CUSTOM_DOMAIN);
+				values.set(0, "");
 				Preference<String> domainPreference = addList(Preferences.KEY_DOMAIN.bind(chanName), values,
-						values[0], R.string.domain_name, entries);
+						values.get(0), R.string.domain_name, entries);
 				domainPreference.setOnAfterChangeListener(p -> clearSpecialCookies());
 				domainPreference.setOnBeforeChangeListener((preference, value) -> {
 					if (VALUE_CUSTOM_DOMAIN.equals(value)) {
@@ -217,16 +222,18 @@ public class ChanFragment extends PreferenceFragment {
 					.setOnAfterChangeListener(p -> clearSpecialCookies());
 		}
 		if (!localMode) {
-			MultipleEditTextPreference proxyPreference = addMultipleEdit(Preferences.KEY_PROXY.bind(chanName),
-					R.string.proxy, "%s:%s", new String[] {getString(R.string.address),
-					getString(R.string.port), null}, new int[] {InputType.TYPE_CLASS_TEXT |
-					InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD, InputType.TYPE_CLASS_NUMBER |
-					InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD, 0});
-			proxyPreference.setValues(2, Preferences.ENTRIES_PROXY_2, Preferences.VALUES_PROXY_2);
+			MultipleEditPreference<Map<String, String>> proxyPreference = addMultipleEdit
+					(Preferences.KEY_PROXY.bind(chanName), R.string.proxy, "%s:%s",
+							Arrays.asList(getString(R.string.address), getString(R.string.port), null),
+							Arrays.asList(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD,
+									InputType.TYPE_CLASS_NUMBER | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD, 0),
+							new MultipleEditPreference.MapValueCodec(Preferences.KEYS_PROXY));
+			proxyPreference.setValues(Preferences.KEYS_PROXY.indexOf(Preferences.SUB_KEY_PROXY_TYPE),
+					Preferences.ENTRIES_PROXY_TYPE, Preferences.VALUES_PROXY_TYPE);
 			proxyPreference.setOnAfterChangeListener(p -> {
 				boolean success = HttpClient.getInstance().checkProxyValid(p.getValue());
 				if (!success) {
-					ToastUtils.show(requireContext(), R.string.enter_valid_data);
+					ClickableToast.show(R.string.enter_valid_data);
 					proxyPreference.performClick();
 				}
 			});
@@ -239,12 +246,14 @@ public class ChanFragment extends PreferenceFragment {
 
 		addHeader(R.string.additional);
 		addButton(R.string.uninstall_extension, 0).setOnClickListener(p -> {
-			String packageName = ChanManager.getInstance().getExtensionPackageName(getChanName());
-			@SuppressWarnings("deprecation")
-			Intent intent = new Intent(Intent.ACTION_UNINSTALL_PACKAGE)
-					.setData(Uri.parse("package:" + packageName))
-					.putExtra(Intent.EXTRA_RETURN_RESULT, true);
-			startActivityForResult(intent, C.REQUEST_CODE_UNINSTALL);
+			Chan innerChan = Chan.get(chanName);
+			if (innerChan.name != null) {
+				@SuppressWarnings("deprecation")
+				Intent intent = new Intent(Intent.ACTION_UNINSTALL_PACKAGE)
+						.setData(Uri.parse("package:" + innerChan.packageName))
+						.putExtra(Intent.EXTRA_RETURN_RESULT, true);
+				startActivity(intent);
+			}
 		});
 	}
 
@@ -261,19 +270,28 @@ public class ChanFragment extends PreferenceFragment {
 	public void onActivityCreated(Bundle savedInstanceState) {
 		super.onActivityCreated(savedInstanceState);
 
-		ChanConfiguration configuration = ChanConfiguration.get(getChanName());
-		((FragmentHandler) requireActivity()).setTitleSubtitle(configuration.getTitle(), null);
-		if (!ChanManager.getInstance().isExistingChanName(getChanName())) {
-			((FragmentHandler) requireActivity()).removeFragment();
-		}
+		Chan chan = Chan.get(getChanName());
+		((FragmentHandler) requireActivity()).setTitleSubtitle(chan.configuration.getTitle(), null);
 	}
 
 	@Override
 	public void onResume() {
 		super.onResume();
 
-		// Check every time returned from cookies fragment
-		removeCookiePreferenceIfNotNeeded();
+		if (!ChanManager.getInstance().isExistingChanName(getChanName())) {
+			((FragmentHandler) requireActivity()).removeFragment();
+		} else {
+			// Check every time returned from cookies fragment
+			removeCookiePreferenceIfNotNeeded();
+		}
+	}
+
+	@Override
+	public void onChansChanged(Collection<String> changed, Collection<String> removed) {
+		if (changed.contains(getChanName()) || removed.contains(getChanName())) {
+			// Don't bother with updating fragment
+			((FragmentHandler) requireActivity()).removeFragment();
+		}
 	}
 
 	@Override
@@ -284,8 +302,7 @@ public class ChanFragment extends PreferenceFragment {
 
 	private void removeCookiePreferenceIfNotNeeded() {
 		if (cookiePreference != null) {
-			ChanConfiguration configuration = ChanConfiguration.get(getChanName());
-			if (!configuration.hasCookies()) {
+			if (!ChanDatabase.getInstance().hasCookies(getChanName())) {
 				removePreference(cookiePreference);
 				cookiePreference = null;
 			}
@@ -293,13 +310,13 @@ public class ChanFragment extends PreferenceFragment {
 	}
 
 	private void clearSpecialCookies() {
-		Map<String, String> cookies = RelayBlockResolver.getInstance().getCookies(getChanName());
+		Chan chan = Chan.get(getChanName());
+		Map<String, String> cookies = RelayBlockResolver.getInstance().getCookies(chan);
 		if (!cookies.isEmpty()) {
-			ChanConfiguration configuration = ChanConfiguration.get(getChanName());
 			for (String cookie : cookies.keySet()) {
-				configuration.storeCookie(cookie, null, null);
+				chan.configuration.storeCookie(cookie, null, null);
 			}
-			configuration.commit();
+			chan.configuration.commit();
 		}
 		removeCookiePreferenceIfNotNeeded();
 	}
@@ -318,36 +335,23 @@ public class ChanFragment extends PreferenceFragment {
 		return preference;
 	}
 
-	@Override
-	public void onActivityResult(int requestCode, int resultCode, Intent data) {
-		if (requestCode == C.REQUEST_CODE_UNINSTALL && resultCode == Activity.RESULT_OK) {
-			MessageDialog.create(this, getString(R.string.changes_after_restart__sentence), true);
-		}
-		super.onActivityResult(requestCode, resultCode, data);
-	}
-
 	private enum AuthorizationType {CAPTCHA_PASS, USER}
 
-	public static class AuthorizationFragment extends DialogFragment implements AsyncManager.Callback {
-		private static final String TASK_CHECK_AUTHORIZATION = "check_authorization";
-
+	public static class AuthorizationDialog extends DialogFragment {
 		private static final String EXTRA_CHAN_NAME = "chanName";
 		private static final String EXTRA_AUTHORIZATION_TYPE = "authorizationType";
 		private static final String EXTRA_AUTHORIZATION_DATA = "authorizationData";
 
-		public AuthorizationFragment() {}
+		public AuthorizationDialog() {}
 
-		public AuthorizationFragment(String chanName,
-				AuthorizationType authorizationType, String[] authorizationData) {
+		public AuthorizationDialog(String chanName,
+				AuthorizationType authorizationType, List<String> authorizationData) {
 			Bundle args = new Bundle();
 			args.putString(EXTRA_CHAN_NAME, chanName);
 			args.putString(EXTRA_AUTHORIZATION_TYPE, authorizationType.name());
-			args.putStringArray(EXTRA_AUTHORIZATION_DATA, authorizationData);
+			args.putStringArrayList(EXTRA_AUTHORIZATION_DATA, authorizationData != null
+					? new ArrayList<>(authorizationData) : null);
 			setArguments(args);
-		}
-
-		public void show(Fragment parent) {
-			show(parent.getChildFragmentManager(), getClass().getName());
 		}
 
 		@NonNull
@@ -361,44 +365,24 @@ public class ChanFragment extends PreferenceFragment {
 		@Override
 		public void onActivityCreated(Bundle savedInstanceState) {
 			super.onActivityCreated(savedInstanceState);
-			AsyncManager.get(this).startTask(TASK_CHECK_AUTHORIZATION, this, null, false);
-		}
 
-		@Override
-		public void onCancel(@NonNull DialogInterface dialog) {
-			super.onCancel(dialog);
-			AsyncManager.get(this).cancelTask(TASK_CHECK_AUTHORIZATION, this);
-		}
-
-		@Override
-		public AsyncManager.Holder onCreateAndExecuteTask(String name, HashMap<String, Object> extra) {
-			Bundle args = requireArguments();
-			CheckAuthorizationTask task = new CheckAuthorizationTask(args.getString(EXTRA_CHAN_NAME),
-					AuthorizationType.valueOf(args.getString(EXTRA_AUTHORIZATION_TYPE)),
-					args.getStringArray(EXTRA_AUTHORIZATION_DATA));
-			task.executeOnExecutor(CheckAuthorizationTask.THREAD_POOL_EXECUTOR);
-			return task.getHolder();
-		}
-
-		@TargetApi(Build.VERSION_CODES.JELLY_BEAN_MR1)
-		@Override
-		public void onFinishTaskExecution(String name, AsyncManager.Holder holder) {
-			dismiss();
-			boolean valid = holder.nextArgument();
-			ErrorItem errorItem = holder.nextArgument();
-			boolean expandPreference;
-			if (errorItem == null) {
-				ToastUtils.show(requireContext(), valid ? R.string.validation_completed
-						: R.string.invalid_authorization_data);
-				expandPreference = !valid;
-			} else {
-				ToastUtils.show(requireContext(), errorItem);
-				expandPreference = true;
+			CheckAuthorizationViewModel viewModel = new ViewModelProvider(this).get(CheckAuthorizationViewModel.class);
+			if (!viewModel.hasTaskOrValue()) {
+				Bundle args = requireArguments();
+				Chan chan = Chan.get(args.getString(EXTRA_CHAN_NAME));
+				CheckAuthorizationTask task = new CheckAuthorizationTask(viewModel, chan,
+						AuthorizationType.valueOf(args.getString(EXTRA_AUTHORIZATION_TYPE)),
+						args.getStringArrayList(EXTRA_AUTHORIZATION_DATA));
+				task.execute(ConcurrentUtils.PARALLEL_EXECUTOR);
+				viewModel.attach(task);
 			}
-			if (expandPreference) {
-				Fragment fragment = getParentFragment();
-				if (fragment instanceof ChanFragment) {
-					ChanFragment chanFragment = ((ChanFragment) fragment);
+			viewModel.observe(this, result -> {
+				dismiss();
+				if (result == CheckAuthorizationTask.SUCCESS) {
+					ClickableToast.show(R.string.validation_completed);
+				} else {
+					ClickableToast.show(result);
+					ChanFragment chanFragment = (ChanFragment) getParentFragment();
 					Preference<?> preference = null;
 					switch (AuthorizationType.valueOf(requireArguments().getString(EXTRA_AUTHORIZATION_TYPE))) {
 						case CAPTCHA_PASS: {
@@ -414,36 +398,32 @@ public class ChanFragment extends PreferenceFragment {
 						preference.performClick();
 					}
 				}
-			}
-		}
-
-		@Override
-		public void onRequestTaskCancel(String name, Object task) {
-			((CheckAuthorizationTask) task).cancel();
+			});
 		}
 	}
 
-	private static class CheckAuthorizationTask extends AsyncManager.SimpleTask<Void, Void, Void> {
-		private final HttpHolder holder = new HttpHolder();
+	public static class CheckAuthorizationViewModel extends TaskViewModel<CheckAuthorizationTask, ErrorItem> {}
 
-		private final String chanName;
+	private static class CheckAuthorizationTask extends HttpHolderTask<Void, ErrorItem> {
+		public static final ErrorItem SUCCESS = new ErrorItem("");
+
+		private final CheckAuthorizationViewModel viewModel;
+		private final Chan chan;
 		private final AuthorizationType authorizationType;
-		private final String[] authorizationData;
+		private final List<String> authorizationData;
 
-		private boolean valid;
-		private ErrorItem errorItem;
-
-		public CheckAuthorizationTask(String chanName,
-				AuthorizationType authorizationType, String[] authorizationData) {
-			this.chanName = chanName;
+		public CheckAuthorizationTask(CheckAuthorizationViewModel viewModel,
+				Chan chan, AuthorizationType authorizationType, List<String> authorizationData) {
+			super(chan);
+			this.viewModel = viewModel;
+			this.chan = chan;
 			this.authorizationType = authorizationType;
 			this.authorizationData = authorizationData;
 		}
 
 		@Override
-		public Void doInBackground(Void... params) {
+		protected ErrorItem run(HttpHolder holder) {
 			try {
-				ChanPerformer performer = ChanPerformer.get(chanName);
 				int type = -1;
 				switch (authorizationType) {
 					case CAPTCHA_PASS: {
@@ -455,27 +435,21 @@ public class ChanFragment extends PreferenceFragment {
 						break;
 					}
 				}
-				ChanPerformer.CheckAuthorizationResult result = performer.safe().onCheckAuthorization
-						(new ChanPerformer.CheckAuthorizationData(type, authorizationData, holder));
-				valid = result != null && result.success;
+				ChanPerformer.CheckAuthorizationResult result = chan.performer.safe()
+						.onCheckAuthorization(new ChanPerformer.CheckAuthorizationData(type,
+								CommonUtils.toArray(authorizationData, String.class), holder));
+				return result != null && result.success ? SUCCESS
+						: new ErrorItem(ErrorItem.Type.INVALID_AUTHORIZATION_DATA);
 			} catch (ExtensionException | HttpException | InvalidResponseException e) {
-				errorItem = e.getErrorItemAndHandle();
+				return e.getErrorItemAndHandle();
 			} finally {
-				holder.cleanup();
-				ChanConfiguration.get(chanName).commit();
+				chan.configuration.commit();
 			}
-			return null;
 		}
 
 		@Override
-		protected void onStoreResult(AsyncManager.Holder holder, Void result) {
-			holder.storeResult(valid, errorItem);
-		}
-
-		@Override
-		public void cancel() {
-			cancel(true);
-			holder.interrupt();
+		protected void onComplete(ErrorItem result) {
+			viewModel.handleResult(result);
 		}
 	}
 }

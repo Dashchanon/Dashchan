@@ -1,8 +1,10 @@
 package com.mishiranu.dashchan.content.net;
 
 import android.net.Uri;
+import chan.content.Chan;
 import chan.content.ChanLocator;
-import chan.content.model.EmbeddedAttachment;
+import chan.util.StringUtils;
+import com.mishiranu.dashchan.content.model.Post;
 import java.util.Arrays;
 import java.util.List;
 import java.util.regex.Pattern;
@@ -16,27 +18,27 @@ public enum EmbeddedType {
 				"www.youtube.com", "watch", "v", embeddedCode);
 		Uri thumbnailUri = locator.buildPathWithSchemeHost(true,
 				"img.youtube.com", "vi", embeddedCode, "default.jpg");
-		return new EmbeddedAttachment(fileUri, thumbnailUri, "YouTube",
-				EmbeddedAttachment.ContentType.VIDEO, false, null);
+		return Post.Attachment.Embedded.createExternal(true, fileUri, thumbnailUri, "YouTube",
+				Post.Attachment.Embedded.ContentType.VIDEO, false, null);
 	}),
 	VIMEO(Pattern.compile("(?:https?://)(?:player\\.)?vimeo.com/(?:video/)?(?:channels/staffpicks/)?(\\d+)"),
 			1, Arrays.asList("vimeo"), (locator, embeddedCode) -> {
 		Uri fileUri = locator.buildPathWithSchemeHost(true, "vimeo.com", embeddedCode);
-		return new EmbeddedAttachment(fileUri, null, "Vimeo",
-				EmbeddedAttachment.ContentType.VIDEO, false, null);
+		return Post.Attachment.Embedded.createExternal(true, fileUri, null, "Vimeo",
+				Post.Attachment.Embedded.ContentType.VIDEO, false, null);
 	}),
 	VOCAROO(Pattern.compile("(?:https?://)(?:www\\.)?" +
 			"(?:media\\.vocaroo\\.com|vocaroo\\.com|voca.ro)/(?:player\\.swf\\?playMediaID=|i/|" +
 			"media_command\\.php\\?media=|mp3/|)([\\w\\-]{11,12})"),
 			1, Arrays.asList("vocaroo", "voca.ro"), (locator, embeddedCode) -> {
 		Uri fileUri = locator.buildPathWithHost("media.vocaroo.com", "mp3", embeddedCode);
-		String forcedName = "Vocaroo_" + embeddedCode + ".mp3";
-		return new EmbeddedAttachment(fileUri, null, "Vocaroo",
-				EmbeddedAttachment.ContentType.AUDIO, true, forcedName);
+		String forcedName = "vocaroo-" + embeddedCode + ".mp3";
+		return Post.Attachment.Embedded.createExternal(true, fileUri, null, "Vocaroo",
+				Post.Attachment.Embedded.ContentType.AUDIO, true, forcedName);
 	});
 
 	private interface AttachmentBuilder {
-		EmbeddedAttachment obtain(ChanLocator locator, String embeddedCode);
+		Post.Attachment.Embedded obtain(ChanLocator locator, String embeddedCode);
 	}
 
 	private final Pattern pattern;
@@ -52,17 +54,15 @@ public enum EmbeddedType {
 	}
 
 	private boolean test(String text) {
-		if (text == null) {
+		if (StringUtils.isEmpty(text)) {
 			return false;
 		}
-		boolean success = false;
 		for (String test : this.test) {
 			if (text.contains(test)) {
-				success = true;
-				break;
+				return true;
 			}
 		}
-		return success;
+		return false;
 	}
 
 	public String get(ChanLocator locator, String text) {
@@ -73,17 +73,17 @@ public enum EmbeddedType {
 		return test(text) ? locator.getUniqueGroupValues(text, pattern, index) : null;
 	}
 
-	public EmbeddedAttachment obtainAttachment(ChanLocator locator, String embeddedCode) {
+	public Post.Attachment.Embedded obtainAttachment(ChanLocator locator, String embeddedCode) {
 		return builder.obtain(locator, embeddedCode);
 	}
 
-	public static EmbeddedAttachment extractAttachment(String data) {
-		if (data != null) {
-			ChanLocator locator = ChanLocator.getDefault();
+	public static Post.Attachment.Embedded extractAttachment(String data) {
+		if (!StringUtils.isEmpty(data)) {
+			Chan chan = Chan.getFallback();
 			for (EmbeddedType embeddedType : EmbeddedType.values()) {
-				String embeddedCode = embeddedType.get(locator, data);
-				if (embeddedCode != null) {
-					return embeddedType.obtainAttachment(locator, embeddedCode);
+				String embeddedCode = embeddedType.get(chan.locator, data);
+				if (!StringUtils.isEmpty(embeddedCode)) {
+					return embeddedType.obtainAttachment(chan.locator, embeddedCode);
 				}
 			}
 		}

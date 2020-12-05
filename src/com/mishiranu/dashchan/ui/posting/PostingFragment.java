@@ -5,7 +5,6 @@ import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.ComponentName;
 import android.content.Context;
-import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.ServiceConnection;
 import android.content.res.ColorStateList;
@@ -47,9 +46,9 @@ import android.widget.TextView;
 import androidx.annotation.NonNull;
 import androidx.core.view.ViewCompat;
 import androidx.core.widget.TextViewCompat;
-import androidx.fragment.app.Fragment;
+import androidx.lifecycle.ViewModelProvider;
+import chan.content.Chan;
 import chan.content.ChanConfiguration;
-import chan.content.ChanLocator;
 import chan.content.ChanMarkup;
 import chan.content.ChanPerformer;
 import chan.text.CommentEditor;
@@ -58,18 +57,19 @@ import chan.util.StringUtils;
 import com.mishiranu.dashchan.C;
 import com.mishiranu.dashchan.R;
 import com.mishiranu.dashchan.content.Preferences;
-import com.mishiranu.dashchan.content.async.AsyncManager;
 import com.mishiranu.dashchan.content.async.ReadCaptchaTask;
 import com.mishiranu.dashchan.content.async.SendPostTask;
+import com.mishiranu.dashchan.content.async.TaskViewModel;
 import com.mishiranu.dashchan.content.model.ErrorItem;
 import com.mishiranu.dashchan.content.model.FileHolder;
+import com.mishiranu.dashchan.content.model.PostNumber;
 import com.mishiranu.dashchan.content.service.PostingService;
 import com.mishiranu.dashchan.content.storage.DraftsStorage;
 import com.mishiranu.dashchan.graphics.RoundedCornersDrawable;
 import com.mishiranu.dashchan.graphics.TransparentTileDrawable;
 import com.mishiranu.dashchan.media.JpegData;
-import com.mishiranu.dashchan.ui.ActivityHandler;
 import com.mishiranu.dashchan.ui.CaptchaForm;
+import com.mishiranu.dashchan.ui.ContentFragment;
 import com.mishiranu.dashchan.ui.FragmentHandler;
 import com.mishiranu.dashchan.ui.posting.dialog.AttachmentOptionsDialog;
 import com.mishiranu.dashchan.ui.posting.dialog.AttachmentRatingDialog;
@@ -79,24 +79,24 @@ import com.mishiranu.dashchan.ui.posting.text.CommentEditWatcher;
 import com.mishiranu.dashchan.ui.posting.text.MarkupButtonProvider;
 import com.mishiranu.dashchan.ui.posting.text.NameEditWatcher;
 import com.mishiranu.dashchan.ui.posting.text.QuoteEditWatcher;
+import com.mishiranu.dashchan.util.ConcurrentUtils;
 import com.mishiranu.dashchan.util.GraphicsUtils;
 import com.mishiranu.dashchan.util.IOUtils;
 import com.mishiranu.dashchan.util.ResourceUtils;
-import com.mishiranu.dashchan.util.ToastUtils;
 import com.mishiranu.dashchan.util.ViewUtils;
 import com.mishiranu.dashchan.widget.ClickableToast;
 import com.mishiranu.dashchan.widget.DropdownView;
+import com.mishiranu.dashchan.widget.ExpandedLayout;
 import com.mishiranu.dashchan.widget.ProgressDialog;
 import com.mishiranu.dashchan.widget.ThemeEngine;
 import com.mishiranu.dashchan.widget.ViewFactory;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 
-public class PostingFragment extends Fragment implements ActivityHandler, CaptchaForm.Callback, AsyncManager.Callback,
+public class PostingFragment extends ContentFragment implements FragmentHandler.Callback, CaptchaForm.Callback,
 		ReadCaptchaTask.Callback, PostingDialogCallback {
 	private static final String EXTRA_CHAN_NAME = "chanName";
 	private static final String EXTRA_BOARD_NAME = "boardName";
@@ -104,7 +104,6 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 	private static final String EXTRA_REPLY_DATA_LIST = "replyDataList";
 
 	private static final String EXTRA_CAPTCHA_DRAFT = "captchaDraft";
-	private static final String TASK_READ_CAPTCHA = "read_captcha";
 
 	public PostingFragment() {}
 
@@ -131,9 +130,9 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 	}
 
 	public boolean check(String chanName, String boardName, String threadNumber) {
-		return StringUtils.equals(getChanName(), chanName) &&
-				StringUtils.equals(getBoardName(), boardName) &&
-				StringUtils.equals(getThreadNumber(), threadNumber);
+		return CommonUtils.equals(getChanName(), chanName) &&
+				CommonUtils.equals(getBoardName(), boardName) &&
+				CommonUtils.equals(getThreadNumber(), threadNumber);
 	}
 
 	private boolean allowPosting;
@@ -148,7 +147,7 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 	private List<Pair<String, String>> attachmentRatingItems;
 
 	private String captchaType;
-	private ChanPerformer.CaptchaState captchaState;
+	private ReadCaptchaTask.CaptchaState captchaState;
 	private ChanPerformer.CaptchaData captchaData;
 	private String loadedCaptchaType;
 	private ChanConfiguration.Captcha.Input loadedCaptchaInput;
@@ -179,6 +178,7 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 
 	private final ArrayList<AttachmentHolder> attachments = new ArrayList<>();
 
+	private boolean allowDialog = true;
 	private boolean sendButtonEnabled = true;
 
 	private PostingService.Binder postingBinder;
@@ -200,7 +200,7 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 
 	@Override
 	public View onCreateView(@NonNull LayoutInflater inflater, ViewGroup container, Bundle savedInstanceState) {
-		FrameLayout rootView = new FrameLayout(container.getContext());
+		ExpandedLayout rootView = new ExpandedLayout(container.getContext(), true);
 		rootView.setLayoutParams(new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
 				ViewGroup.LayoutParams.MATCH_PARENT));
 		inflater.inflate(R.layout.activity_posting, rootView);
@@ -211,20 +211,19 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 	public void onViewCreated(@NonNull View view, Bundle savedInstanceState) {
 		super.onViewCreated(view, savedInstanceState);
 
-		ChanConfiguration configuration = ChanConfiguration.get(getChanName());
-		postingConfiguration = configuration.safe().obtainPosting(getBoardName(), getThreadNumber() == null);
+		Chan chan = Chan.get(getChanName());
+		postingConfiguration = chan.configuration.safe().obtainPosting(getBoardName(), getThreadNumber() == null);
 		if (postingConfiguration != null) {
-			allowPosting = true;
+			allowPosting = chan.configuration.safe().obtainBoard(getBoardName()).allowPosting;
 		} else {
 			postingConfiguration = new ChanConfiguration.Posting();
 			allowPosting = false;
 		}
 
 		DraftsStorage draftsStorage = DraftsStorage.getInstance();
-		captchaType = configuration.getCaptchaType();
+		captchaType = chan.configuration.getCaptchaType();
 		if (allowPosting) {
-			ChanMarkup markup = ChanMarkup.get(getChanName());
-			commentEditor = markup.safe().obtainCommentEditor(getBoardName());
+			commentEditor = chan.markup.safe().obtainCommentEditor(getBoardName());
 		}
 		float density = ResourceUtils.obtainDensity(view);
 		int screenWidthDp = getResources().getConfiguration().screenWidthDp;
@@ -326,12 +325,7 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 		EditText captchaInputView = footerContainer.findViewById(R.id.captcha_input);
 		if (C.API_LOLLIPOP) {
 			captchaInputParentView.setPadding(0, longFooter ? (int) (8f * density) : 0, 0, (int) (8f * density));
-			LinearLayout.LayoutParams layoutParams = (LinearLayout.LayoutParams) captchaInputView.getLayoutParams();
-			if (captchaInputView.getLayoutDirection() == View.LAYOUT_DIRECTION_RTL) {
-				layoutParams.leftMargin = (int) (4f * density);
-			} else {
-				layoutParams.rightMargin = (int) (4f * density);
-			}
+			ViewUtils.setNewMarginRelative(captchaInputView, null, null, (int) (4f * density), null);
 		} else {
 			int[] attrs = {android.R.attr.dividerHorizontal, android.R.attr.dividerVertical};
 			TypedArray typedArray = view.getContext().obtainStyledAttributes(null, attrs);
@@ -342,11 +336,9 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 			captchaInputParentView.setDividerDrawable(typedArray.getDrawable(1));
 			captchaInputParentView.setShowDividers(LinearLayout.SHOW_DIVIDER_MIDDLE);
 			typedArray.recycle();
-			LinearLayout.LayoutParams layoutParams = (LinearLayout.LayoutParams) captchaInputView.getLayoutParams();
-			layoutParams.leftMargin = (int) (8f * density);
-			layoutParams.rightMargin = (int) (8f * density);
+			ViewUtils.setNewMargin(captchaInputView, (int) (8f * density), null, (int) (8f * density), null);
 		}
-		ChanConfiguration.Captcha captcha = configuration.safe().obtainCaptcha(captchaType);
+		ChanConfiguration.Captcha captcha = chan.configuration.safe().obtainCaptcha(captchaType);
 		captchaForm = new CaptchaForm(this, true, !longFooter,
 				footerContainer, captchaInputParentView, captchaInputView, captcha);
 		if (C.API_LOLLIPOP) {
@@ -488,7 +480,7 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 				}
 				if (captchaDraft.loadedValidity != null) {
 					ChanConfiguration.Captcha.Validity loadedCaptchaValidity = captchaDraft.loadedValidity;
-					if (captchaDraft.captchaState != ChanPerformer.CaptchaState.CAPTCHA ||
+					if (captchaDraft.captchaState != ReadCaptchaTask.CaptchaState.CAPTCHA ||
 							captchaValidity.compareTo(loadedCaptchaValidity) >= 0) {
 						// Allow only reducing of validity
 						captchaValidity = loadedCaptchaValidity;
@@ -501,17 +493,17 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 						break;
 					}
 					case IN_THREAD: {
-						canLoadState = StringUtils.equals(getBoardName(), captchaDraft.boardName)
-								&& StringUtils.equals(getThreadNumber(), captchaDraft.threadNumber);
+						canLoadState = CommonUtils.equals(getBoardName(), captchaDraft.boardName)
+								&& CommonUtils.equals(getThreadNumber(), captchaDraft.threadNumber);
 						break;
 					}
 					case IN_BOARD_SEPARATELY: {
-						canLoadState = StringUtils.equals(getBoardName(), captchaDraft.boardName)
+						canLoadState = CommonUtils.equals(getBoardName(), captchaDraft.boardName)
 								&& ((getThreadNumber() == null) == (captchaDraft.threadNumber == null));
 						break;
 					}
 					case IN_BOARD: {
-						canLoadState = StringUtils.equals(getBoardName(), captchaDraft.boardName);
+						canLoadState = CommonUtils.equals(getBoardName(), captchaDraft.boardName);
 						break;
 					}
 					case LONG_LIFETIME: {
@@ -519,15 +511,16 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 						break;
 					}
 				}
-				if (canLoadState && StringUtils.equals(captchaType, captchaDraft.captchaType)) {
-					if (captchaDraft.captchaState == ChanPerformer.CaptchaState.CAPTCHA && captchaDraft.image != null) {
-						showCaptcha(ChanPerformer.CaptchaState.CAPTCHA, captchaDraft.captchaData, null,
+				if (canLoadState && CommonUtils.equals(captchaType, captchaDraft.captchaType)) {
+					if (captchaDraft.captchaState == ReadCaptchaTask.CaptchaState.CAPTCHA &&
+							captchaDraft.image != null) {
+						showCaptcha(ReadCaptchaTask.CaptchaState.CAPTCHA, captchaDraft.captchaData, null,
 								captchaDraft.loadedInput, captchaDraft.loadedValidity,
 								captchaDraft.image, captchaDraft.large, captchaDraft.blackAndWhite);
 						captchaForm.setText(captchaDraft.text);
 						captchaRestoreSuccess = true;
-					} else if (canLoadState && (captchaDraft.captchaState == ChanPerformer.CaptchaState.SKIP
-							|| captchaDraft.captchaState == ChanPerformer.CaptchaState.PASS)) {
+					} else if (canLoadState && (captchaDraft.captchaState == ReadCaptchaTask.CaptchaState.SKIP
+							|| captchaDraft.captchaState == ReadCaptchaTask.CaptchaState.PASS)) {
 						showCaptcha(captchaDraft.captchaState, captchaDraft.captchaData, null, null,
 								captchaDraft.loadedValidity, null, false, false);
 						captchaRestoreSuccess = true;
@@ -549,9 +542,9 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 			for (int i = 0; i < replyDataList.size(); i++) {
 				boolean lastLink = i == replyDataList.size() - 1;
 				Replyable.ReplyData data = replyDataList.get(i);
-				String postNumber = data.postNumber;
+				PostNumber postNumber = data.postNumber;
 				String comment = data.comment;
-				if (!StringUtils.isEmpty(postNumber)) {
+				if (postNumber != null) {
 					String link = ">>" + postNumber;
 					// Check if user replies to the same post
 					int index = builder.lastIndexOf(link, commentCarriage);
@@ -656,11 +649,9 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 				? R.string.new_thread : R.string.new_post), null);
 		requireActivity().bindService(new Intent(requireContext(), PostingService.class),
 				postingConnection, Context.BIND_AUTO_CREATE);
-	}
 
-	@Override
-	public void onTerminate() {
-		AsyncManager.get(this).cancelTask(TASK_READ_CAPTCHA, this);
+		CaptchaViewModel viewModel = new ViewModelProvider(this).get(CaptchaViewModel.class);
+		viewModel.observe(getViewLifecycleOwner(), this);
 	}
 
 	private DraftsStorage.PostDraft obtainPostDraft() {
@@ -730,6 +721,16 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 		}
 	}
 
+	@Override
+	public void onChansChanged(Collection<String> changed, Collection<String> removed) {
+		if (changed.contains(getChanName()) || removed.contains(getChanName())) {
+			updatePostingConfigurationIfNeeded();
+			if (!allowPosting) {
+				((FragmentHandler) requireActivity()).removeFragment();
+			}
+		}
+	}
+
 	// Should be called both from onDestroyView (1) and onSaveInstanceState (2).
 	// 1: Ensures draft is saved when user leaves posting screen.
 	// 2: Ensures draft is saved when activity is recreated.
@@ -775,7 +776,7 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 				for (int i = 0; i < userIconItems.size(); i++) {
 					Pair<String, String> iconItem = userIconItems.get(i);
 					items.add(iconItem.second);
-					if (StringUtils.equals(lastUserIcon, iconItem.first)) {
+					if (CommonUtils.equals(lastUserIcon, iconItem.first)) {
 						lastUserIconIndex = i;
 					}
 				}
@@ -786,10 +787,10 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 				iconView.setVisibility(View.GONE);
 			}
 			boolean needPassword = false;
-			ChanConfiguration chanConfiguration = ChanConfiguration.get(getChanName());
-			ChanConfiguration.Board board = chanConfiguration.safe().obtainBoard(getChanName());
+			Chan chan = Chan.get(getChanName());
+			ChanConfiguration.Board board = chan.configuration.safe().obtainBoard(getChanName());
 			if (board.allowDeleting) {
-				ChanConfiguration.Deleting deleting = chanConfiguration.safe().obtainDeleting(getChanName());
+				ChanConfiguration.Deleting deleting = chan.configuration.safe().obtainDeleting(getChanName());
 				needPassword = deleting != null && deleting.password;
 			}
 			nameView.setVisibility(posting.allowName ? View.VISIBLE : View.GONE);
@@ -803,7 +804,8 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 					? View.VISIBLE : View.GONE);
 			boolean showPersonalDataBlock = !Preferences.isHidePersonalData();
 			if (showPersonalDataBlock) {
-				showPersonalDataBlock = posting.allowName || posting.allowEmail || needPassword || userIconItems != null;
+				showPersonalDataBlock = posting.allowName || posting.allowEmail ||
+						needPassword || userIconItems != null;
 			}
 			personalDataBlock.setVisibility(showPersonalDataBlock ? View.VISIBLE : View.GONE);
 			commentEditWatcher.updateConfiguration(postingConfiguration);
@@ -829,8 +831,8 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 			return false;
 		}
 		for (int i = 0; i < first.size(); i++) {
-			if (!StringUtils.equals(first.get(i).first, first.get(i).second)
-					|| !StringUtils.equals(first.get(i).second, first.get(i).second)) {
+			if (!CommonUtils.equals(first.get(i).first, first.get(i).second)
+					|| !CommonUtils.equals(first.get(i).second, first.get(i).second)) {
 				return false;
 			}
 		}
@@ -838,11 +840,15 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 	}
 
 	private void updatePostingConfigurationIfNeeded() {
+		Chan chan = Chan.get(getChanName());
 		ChanConfiguration.Posting oldPosting = postingConfiguration;
-		ChanConfiguration.Posting newPosting = ChanConfiguration.get(getChanName()).safe()
-				.obtainPosting(getBoardName(), getThreadNumber() == null);
+		ChanConfiguration.Posting newPosting = chan.configuration
+				.safe().obtainPosting(getBoardName(), getThreadNumber() == null);
 		if (newPosting == null) {
-			return;
+			allowPosting = false;
+			newPosting = new ChanConfiguration.Posting();
+		} else {
+			allowPosting = chan.configuration.safe().obtainBoard(getBoardName()).allowPosting;
 		}
 		boolean views = oldPosting.allowName != newPosting.allowName || oldPosting.allowEmail != newPosting.allowEmail
 				|| oldPosting.allowTripcode != newPosting.allowTripcode
@@ -850,7 +856,7 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 				|| oldPosting.optionSpoiler != newPosting.optionSpoiler
 				|| oldPosting.optionOriginalPoster != newPosting.optionOriginalPoster
 				|| oldPosting.maxCommentLength != newPosting.maxCommentLength
-				|| !StringUtils.equals(oldPosting.maxCommentLengthEncoding, newPosting.maxCommentLengthEncoding)
+				|| !CommonUtils.equals(oldPosting.maxCommentLengthEncoding, newPosting.maxCommentLengthEncoding)
 				|| !compareListOfPairs(oldPosting.userIcons, newPosting.userIcons);
 		boolean attachmentOptions = oldPosting.attachmentSpoiler != newPosting.attachmentSpoiler
 				|| !compareListOfPairs(oldPosting.attachmentRatings, newPosting.attachmentRatings);
@@ -940,7 +946,7 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 				try {
 					startActivityForResult(intent, C.REQUEST_CODE_ATTACH);
 				} catch (ActivityNotFoundException e) {
-					ToastUtils.show(requireContext(), R.string.unknown_address);
+					ClickableToast.show(R.string.unknown_address);
 				}
 				break;
 			}
@@ -980,7 +986,7 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 
 	private void updateSendButtonState() {
 		sendButton.setEnabled(sendButtonEnabled && captchaState != null &&
-				captchaState != ChanPerformer.CaptchaState.NEED_LOAD);
+				captchaState != ReadCaptchaTask.CaptchaState.NEED_LOAD);
 	}
 
 	private String getTextIfVisible(EditText editText) {
@@ -1001,7 +1007,7 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 		String email = getTextIfVisible(emailView);
 		String password = getTextIfVisible(passwordView);
 		if (password == null) {
-			password = Preferences.getPassword(getChanName());
+			password = Preferences.getPassword(Chan.get(getChanName()));
 		}
 		boolean optionSage = isCheckedIfVisible(sageCheckBox);
 		boolean optionSpoiler = isCheckedIfVisible(spoilerCheckBox);
@@ -1040,32 +1046,43 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 		if (array.size() > 0) {
 			attachments = CommonUtils.toArray(array, ChanPerformer.SendPostData.Attachment.class);
 		}
+		String captchaType = loadedCaptchaType != null ? loadedCaptchaType : this.captchaType;
 		ChanPerformer.CaptchaData captchaData = this.captchaData;
 		if (captchaData != null) {
+			captchaData = captchaData.copy();
 			captchaData.put(ChanPerformer.CaptchaData.INPUT, captchaForm.getInput());
 		}
-		String captchaType = loadedCaptchaType != null ? loadedCaptchaType : this.captchaType;
+		boolean captchaNeedLoad = captchaState == ReadCaptchaTask.CaptchaState.MAY_LOAD ||
+				captchaState == ReadCaptchaTask.CaptchaState.MAY_LOAD_SOLVING;
 		ChanPerformer.SendPostData data = new ChanPerformer.SendPostData(getBoardName(), getThreadNumber(),
 				subject, comment, name, email, password, attachments, optionSage, optionSpoiler, optionOriginalPoster,
-				userIcon, captchaType, captchaData, 15000, 45000);
+				userIcon, captchaType, captchaData, captchaNeedLoad, 15000, 45000);
 		DraftsStorage.getInstance().store(obtainPostDraft());
+		allowDialog = false;
 		if (postingBinder.executeSendPost(getChanName(), data)) {
 			sendButtonEnabled = false;
 			updateSendButtonState();
+			if (progressDialog != null) {
+				progressDialog.dismiss();
+				progressDialog = null;
+			}
+			onSendPostMinimize();
+		} else {
+			allowDialog = true;
 		}
 	}
 
 	private ProgressDialog progressDialog;
 
-	private final DialogInterface.OnCancelListener sendPostCancelListener = dialog -> {
+	private void onSendPostCancel() {
 		progressDialog = null;
 		postingBinder.cancelSendPost(getChanName(), getBoardName(), getThreadNumber());
-	};
+	}
 
-	private final DialogInterface.OnClickListener sendPostMinimizeListener = (dialog, which) -> {
+	private void onSendPostMinimize() {
 		progressDialog = null;
 		((FragmentHandler) requireActivity()).removeFragment();
-	};
+	}
 
 	private void dismissSendPost() {
 		if (progressDialog != null) {
@@ -1082,13 +1099,17 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 		@Override
 		public void onState(boolean progressMode, SendPostTask.ProgressState progressState,
 				int attachmentIndex, int attachmentsCount) {
-			if (progressDialog == null) {
+			if (allowDialog && progressDialog == null) {
 				progressDialog = new ProgressDialog(requireContext(), progressMode ? "%1$d / %2$d kB" : null);
-				progressDialog.setCancelable(true);
-				progressDialog.setOnCancelListener(sendPostCancelListener);
+				progressDialog.setOnCancelListener(d -> onSendPostCancel());
 				progressDialog.setButton(ProgressDialog.BUTTON_POSITIVE, getString(R.string.minimize),
-						sendPostMinimizeListener);
+						(d, w) -> onSendPostMinimize());
+				progressDialog.setButton(ProgressDialog.BUTTON_NEGATIVE, getString(android.R.string.cancel),
+						(d, w) -> onSendPostCancel());
 				progressDialog.show();
+			}
+			if (progressDialog == null) {
+				return;
 			}
 			switch (progressState) {
 				case CONNECTING: {
@@ -1138,11 +1159,11 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 	public void handleFailResult(PostingService.FailResult failResult) {
 		if (isResumed()) {
 			if (failResult.extra != null) {
-				ClickableToast.show(requireContext(), failResult.errorItem.toString(),
-						getString(R.string.details), false, () -> new SendPostFailDetailsDialog(failResult.extra)
-								.show(getChildFragmentManager(), SendPostFailDetailsDialog.TAG));
+				ClickableToast.show(failResult.errorItem.toString(), null, new ClickableToast
+						.Button(R.string.details, false, () -> new SendPostFailDetailsDialog(failResult.extra)
+						.show(getChildFragmentManager(), null)));
 			} else {
-				ClickableToast.show(requireContext(), failResult.errorItem.toString());
+				ClickableToast.show(failResult.errorItem);
 			}
 			if (failResult.errorItem.httpResponseCode == 0 && !failResult.keepCaptcha) {
 				refreshCaptcha(false, !failResult.captchaError, true);
@@ -1153,89 +1174,43 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 		}
 	}
 
-	private static final String EXTRA_FORCE_CAPTCHA = "forceCaptcha";
-	private static final String EXTRA_MAY_SHOW_LOAD_BUTTON = "mayShowLoadButton";
-
 	private void refreshCaptcha(boolean forceCaptcha, boolean mayShowLoadButton, boolean restart) {
+		boolean allowSolveAutomatically = !forceCaptcha ||
+				captchaState != ReadCaptchaTask.CaptchaState.MAY_LOAD_SOLVING;
 		captchaState = null;
 		loadedCaptchaType = null;
 		captchaLoadTime = 0L;
 		updateSendButtonState();
 		captchaForm.showLoading();
-		HashMap<String, Object> extra = new HashMap<>();
-		extra.put(EXTRA_FORCE_CAPTCHA, forceCaptcha);
-		extra.put(EXTRA_MAY_SHOW_LOAD_BUTTON, mayShowLoadButton);
-		AsyncManager.get(this).startTask(TASK_READ_CAPTCHA, this, extra, restart);
-	}
-
-	private static class ReadCaptchaHolder extends AsyncManager.Holder implements ReadCaptchaTask.Callback {
-		@Override
-		public void onReadCaptchaSuccess(ChanPerformer.CaptchaState captchaState, ChanPerformer.CaptchaData captchaData,
-				String captchaType, ChanConfiguration.Captcha.Input input, ChanConfiguration.Captcha.Validity validity,
-				Bitmap image, boolean large, boolean blackAndWhite) {
-			storeResult("onReadCaptchaSuccess", captchaState, captchaData, captchaType, input, validity,
-					image, large, blackAndWhite);
-		}
-
-		@Override
-		public void onReadCaptchaError(ErrorItem errorItem) {
-			storeResult("onReadCaptchaError", errorItem);
+		CaptchaViewModel viewModel = new ViewModelProvider(this).get(CaptchaViewModel.class);
+		if (restart || !viewModel.hasTaskOrValue()) {
+			Chan chan = Chan.get(getChanName());
+			List<String> captchaPass = forceCaptcha ? null : Preferences.getCaptchaPass(chan);
+			ReadCaptchaTask task = new ReadCaptchaTask(viewModel.callback, null, captchaType, null, captchaPass,
+					mayShowLoadButton, allowSolveAutomatically, chan, getBoardName(), getThreadNumber());
+			task.execute(ConcurrentUtils.PARALLEL_EXECUTOR);
+			viewModel.attach(task);
 		}
 	}
 
-	@Override
-	public AsyncManager.Holder onCreateAndExecuteTask(String name, HashMap<String, Object> extra) {
-		boolean forceCaptcha = (boolean) extra.get(EXTRA_FORCE_CAPTCHA);
-		boolean mayShowLoadButton = (boolean) extra.get(EXTRA_MAY_SHOW_LOAD_BUTTON);
-		String[] captchaPass = forceCaptcha ? null : Preferences.getCaptchaPass(getChanName());
-		ReadCaptchaHolder holder = new ReadCaptchaHolder();
-		ReadCaptchaTask task = new ReadCaptchaTask(holder, null, captchaType, null, captchaPass,
-				mayShowLoadButton, getChanName(), getBoardName(), getThreadNumber());
-		task.executeOnExecutor(ReadCaptchaTask.THREAD_POOL_EXECUTOR);
-		return holder.attach(task);
-	}
+	public static class CaptchaViewModel extends TaskViewModel.Proxy<ReadCaptchaTask, ReadCaptchaTask.Callback> {}
 
 	@Override
-	public void onFinishTaskExecution(String name, AsyncManager.Holder holder) {
-		String methodName = holder.nextArgument();
-		if ("onReadCaptchaSuccess".equals(methodName)) {
-			ChanPerformer.CaptchaState captchaState = holder.nextArgument();
-			ChanPerformer.CaptchaData captchaData = holder.nextArgument();
-			String captchaType = holder.nextArgument();
-			ChanConfiguration.Captcha.Input input = holder.nextArgument();
-			ChanConfiguration.Captcha.Validity validity = holder.nextArgument();
-			Bitmap image = holder.nextArgument();
-			boolean large = holder.nextArgument();
-			boolean blackAndWhite = holder.nextArgument();
-			onReadCaptchaSuccess(captchaState, captchaData, captchaType, input, validity, image, large, blackAndWhite);
-		} else if ("onReadCaptchaError".equals(methodName)) {
-			ErrorItem errorItem = holder.nextArgument();
-			onReadCaptchaError(errorItem);
-		}
-	}
-
-	@Override
-	public void onRequestTaskCancel(String name, Object task) {
-		((ReadCaptchaTask) task).cancel();
-	}
-
-	@Override
-	public void onReadCaptchaSuccess(ChanPerformer.CaptchaState captchaState, ChanPerformer.CaptchaData captchaData,
-			String captchaType, ChanConfiguration.Captcha.Input input, ChanConfiguration.Captcha.Validity validity,
-			Bitmap image, boolean large, boolean blackAndWhite) {
+	public void onReadCaptchaSuccess(ReadCaptchaTask.Result result) {
 		captchaLoadTime = SystemClock.elapsedRealtime();
-		showCaptcha(captchaState, captchaData, captchaType, input, validity, image, large, blackAndWhite);
+		showCaptcha(result.captchaState, result.captchaData, result.captchaType, result.input, result.validity,
+				result.image, result.large, result.blackAndWhite);
 		updatePostingConfigurationIfNeeded();
 	}
 
 	@Override
 	public void onReadCaptchaError(ErrorItem errorItem) {
-		ClickableToast.show(requireContext(), errorItem.toString());
+		ClickableToast.show(errorItem);
 		captchaForm.showError();
 		updatePostingConfigurationIfNeeded();
 	}
 
-	private void showCaptcha(ChanPerformer.CaptchaState captchaState, ChanPerformer.CaptchaData captchaData,
+	private void showCaptcha(ReadCaptchaTask.CaptchaState captchaState, ChanPerformer.CaptchaData captchaData,
 			String captchaType, ChanConfiguration.Captcha.Input input, ChanConfiguration.Captcha.Validity validity,
 			Bitmap image, boolean large, boolean blackAndWhite) {
 		this.captchaState = captchaState;
@@ -1248,7 +1223,7 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 		captchaBlackAndWhite = blackAndWhite;
 		loadedCaptchaType = captchaType;
 		if (captchaType != null) {
-			ChanConfiguration.Captcha captcha = ChanConfiguration.get(getChanName())
+			ChanConfiguration.Captcha captcha = Chan.get(getChanName()).configuration
 					.safe().obtainCaptcha(captchaType);
 			if (input == null) {
 				input = captcha.input;
@@ -1324,7 +1299,7 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 		}
 		int errorCount = addedCount - newCount;
 		if (errorCount > 0) {
-			ClickableToast.show(requireContext(), getResources().getQuantityString(R.plurals
+			ClickableToast.show(getResources().getQuantityString(R.plurals
 					.number_files_havent_been_attached__format, errorCount, errorCount));
 		}
 	}
@@ -1444,12 +1419,7 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 		LinearLayout.LayoutParams layoutParams = (LinearLayout.LayoutParams) imageView.getLayoutParams();
 		layoutParams.gravity = Gravity.CENTER_VERTICAL;
 		if (C.API_LOLLIPOP) {
-			int margin = (int) (-8f * density);
-			if (imageView.getLayoutDirection() == View.LAYOUT_DIRECTION_RTL) {
-				layoutParams.rightMargin = margin;
-			} else {
-				layoutParams.leftMargin = margin;
-			}
+			ViewUtils.setNewMarginRelative(imageView, (int) (-8f * density), 0, 0, 0);
 		}
 		imageView.setScaleType(ImageView.ScaleType.CENTER);
 		imageView.setImageDrawable(ResourceUtils.getDrawable(imageView.getContext(), attrResId, 0));
@@ -1510,7 +1480,7 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 		fileName.setEllipsize(TextUtils.TruncateAt.END);
 		if (C.API_LOLLIPOP) {
 			ViewUtils.setTextSizeScaled(fileName, 12);
-			fileName.setTypeface(GraphicsUtils.TYPEFACE_MEDIUM);
+			fileName.setTypeface(ResourceUtils.TYPEFACE_MEDIUM);
 		}
 		TextView fileSize = new TextView(controls.getContext());
 		textLayout.addView(fileSize, LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
@@ -1528,8 +1498,8 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 		View removeButton = addAttachmentButton(controls, minHeight,
 				R.attr.iconButtonCancel, attachmentRemoveListener);
 
-		AttachmentHolder holder = new AttachmentHolder(view, fileName, fileSize, options, imageView,
-				warningButton, ratingButton, removeButton);
+		AttachmentHolder holder = new AttachmentHolder(view, fileName, fileSize, imageView,
+				warningButton, ratingButton);
 		warningButton.setTag(holder);
 		ratingButton.setTag(holder);
 		removeButton.setTag(holder);
@@ -1562,7 +1532,6 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 		int size = fileHolder != null ? fileHolder.getSize() : 0;
 		String fileSize = StringUtils.formatFileSize(size, false);
 		Bitmap bitmap = null;
-		ChanLocator locator = ChanLocator.getDefault();
 		DisplayMetrics metrics = getResources().getDisplayMetrics();
 		int targetImageSize = Math.max(metrics.widthPixels, metrics.heightPixels);
 		if (fileHolder != null) {
@@ -1575,7 +1544,7 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 				fileSize += " " + fileHolder.getImageWidth() + '×' + fileHolder.getImageHeight();
 			}
 			if (bitmap == null) {
-				if (locator.isVideoExtension(fileHolder.getName())) {
+				if (Chan.getFallback().locator.isVideoExtension(fileHolder.getName())) {
 					MediaMetadataRetriever retriever = new MediaMetadataRetriever();
 					FileHolder.Descriptor descriptor = null;
 					try {
@@ -1704,7 +1673,7 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 			int maxButtonsWidth = lastWidth - textFormatView.getPaddingLeft() - textFormatView.getPaddingRight();
 			int buttonMarginLeft = (int) ((C.API_LOLLIPOP ? -4f : 0f) * density);
 			Pair<Integer, Integer> supportedAndDisplayedTags = MarkupButtonProvider
-					.obtainSupportedAndDisplayedTags(allowPosting ? ChanMarkup.get(getChanName()) : null,
+					.obtainSupportedAndDisplayedTags(allowPosting ? Chan.get(getChanName()).markup : null,
 							getBoardName(), density, maxButtonsWidth, buttonMarginLeft);
 			int supportedTags = supportedAndDisplayedTags.first;
 			int displayedTags = supportedAndDisplayedTags.second;
@@ -1749,7 +1718,7 @@ public class PostingFragment extends Fragment implements ActivityHandler, Captch
 				} else {
 					padding = 0;
 				}
-				getView().setPadding(0, padding, 0, 0);
+				((ExpandedLayout) getView()).setExtraTop(padding);
 			}
 		}
 	}

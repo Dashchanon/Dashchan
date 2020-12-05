@@ -2,7 +2,8 @@ package com.mishiranu.dashchan.ui.navigator;
 
 import android.os.Parcel;
 import android.os.Parcelable;
-import chan.util.StringUtils;
+import chan.content.Chan;
+import chan.util.CommonUtils;
 import com.mishiranu.dashchan.content.Preferences;
 import com.mishiranu.dashchan.ui.navigator.page.ArchivePage;
 import com.mishiranu.dashchan.ui.navigator.page.BoardsPage;
@@ -64,7 +65,7 @@ public final class Page implements Parcelable {
 
 	public boolean canRemoveFromStackIfDeep() {
 		if (content == Content.BOARDS) {
-			String boardName = Preferences.getDefaultBoardName(chanName);
+			String boardName = Preferences.getDefaultBoardName(Chan.get(chanName));
 			return boardName != null;
 		}
 		return content == Content.SEARCH || content == Content.ARCHIVE || content == Content.USER_BOARDS
@@ -87,7 +88,7 @@ public final class Page implements Parcelable {
 		if (this.content != content) {
 			return false;
 		}
-		if (!StringUtils.equals(this.chanName, chanName) && !(isMultiChanAllowed() && Preferences.isMergeChans())) {
+		if (!CommonUtils.equals(this.chanName, chanName) && !(isMultiChanAllowed() && Preferences.isMergeChans())) {
 			return false;
 		}
 		boolean compareContentTypeOnlyThis = false;
@@ -122,7 +123,7 @@ public final class Page implements Parcelable {
 		if (compareContentTypeOnlyThis || compareContentTypeOnlyCompared) {
 			return false;
 		}
-		return StringUtils.equals(this.boardName, boardName) && StringUtils.equals(this.threadNumber, threadNumber);
+		return CommonUtils.equals(this.boardName, boardName) && CommonUtils.equals(this.threadNumber, threadNumber);
 	}
 
 	@Override
@@ -133,10 +134,10 @@ public final class Page implements Parcelable {
 		if (o instanceof Page) {
 			Page page = (Page) o;
 			return content == page.content &&
-					StringUtils.equals(chanName, page.chanName) &&
-					StringUtils.equals(boardName, page.boardName) &&
-					StringUtils.equals(threadNumber, page.threadNumber) &&
-					StringUtils.equals(searchQuery, page.searchQuery);
+					CommonUtils.equals(chanName, page.chanName) &&
+					CommonUtils.equals(boardName, page.boardName) &&
+					CommonUtils.equals(threadNumber, page.threadNumber) &&
+					CommonUtils.equals(searchQuery, page.searchQuery);
 		}
 		return false;
 	}

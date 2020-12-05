@@ -1,16 +1,20 @@
 package com.mishiranu.dashchan.ui.gallery;
 
 import android.app.AlertDialog;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.drawable.Drawable;
 import android.net.Uri;
-import android.os.AsyncTask;
 import android.util.Pair;
+import androidx.fragment.app.FragmentManager;
+import chan.content.Chan;
 import com.mishiranu.dashchan.R;
 import com.mishiranu.dashchan.content.CacheManager;
+import com.mishiranu.dashchan.content.NetworkObserver;
 import com.mishiranu.dashchan.content.Preferences;
+import com.mishiranu.dashchan.content.async.ExecutorTask;
 import com.mishiranu.dashchan.content.async.ReadFileTask;
 import com.mishiranu.dashchan.content.model.ErrorItem;
 import com.mishiranu.dashchan.content.model.FileHolder;
@@ -20,11 +24,11 @@ import com.mishiranu.dashchan.graphics.SimpleBitmapDrawable;
 import com.mishiranu.dashchan.media.AnimatedPngDecoder;
 import com.mishiranu.dashchan.media.GifDecoder;
 import com.mishiranu.dashchan.media.JpegData;
+import com.mishiranu.dashchan.ui.InstanceDialog;
 import com.mishiranu.dashchan.util.ConcurrentUtils;
 import com.mishiranu.dashchan.util.Log;
-import com.mishiranu.dashchan.util.StringBlockBuilder;
-import com.mishiranu.dashchan.util.ViewUtils;
 import com.mishiranu.dashchan.widget.PhotoView;
+import com.mishiranu.dashchan.widget.SummaryLayout;
 import java.io.File;
 import java.io.IOException;
 import java.util.concurrent.Executor;
@@ -53,7 +57,8 @@ public class ImageUnit {
 	private void interruptHolder(PagerInstance.ViewHolder holder) {
 		if (holder != null) {
 			if (holder.decodeBitmapTask != null) {
-				((DecodeBitmapTask) holder.decodeBitmapTask).cancel(holder);
+				((DecodeBitmapTask) holder.decodeBitmapTask).cancel();
+				holder.progressBar.setVisible(false, true);
 				holder.decodeBitmapTask = null;
 			}
 		}
@@ -67,30 +72,31 @@ public class ImageUnit {
 		}
 	}
 
-	private static final Executor EXECUTOR = ConcurrentUtils.newSingleThreadPool(20000, "DecodeBitmapTask", null, 0);
+	private static final Executor EXECUTOR = ConcurrentUtils.newSingleThreadPool(20000, "DecodeBitmapTask", null);
 
 	private void applyImageFromFile(File file) {
 		PagerInstance.ViewHolder holder = instance.currentHolder;
 		if (attachReadBitmapCallback(holder)) {
 			return;
 		}
-		GalleryItem galleryItem = holder.galleryItem;
-		FileHolder fileHolder = FileHolder.obtain(file);
-		if (holder.decodeBitmapTask != null) {
-			((DecodeBitmapTask) holder.decodeBitmapTask).cancel(holder);
-		}
-		DecodeBitmapTask decodeBitmapTask = new DecodeBitmapTask(file, fileHolder);
-		decodeBitmapTask.executeOnExecutor(EXECUTOR);
-		holder.decodeBitmapTask = decodeBitmapTask;
-		if (galleryItem.size <= 0) {
-			galleryItem.size = (int) file.length();
+		if (holder.mediaSummary.updateSize(file.length())) {
 			instance.galleryInstance.callback.updateTitle();
 		}
+		FileHolder fileHolder = FileHolder.obtain(file);
+		if (holder.decodeBitmapTask != null) {
+			((DecodeBitmapTask) holder.decodeBitmapTask).cancel();
+			holder.progressBar.setVisible(false, true);
+		}
+		DecodeBitmapTask decodeBitmapTask = new DecodeBitmapTask(file, fileHolder);
+		decodeBitmapTask.execute(EXECUTOR);
+		holder.decodeBitmapTask = decodeBitmapTask;
 		PagerInstance.ViewHolder nextHolder = instance.scrollingLeft ? instance.leftHolder : instance.rightHolder;
-		if (nextHolder != null && Preferences.isLoadNearestImage()) {
+		if (nextHolder != null && Preferences.getLoadNearestImage()
+				.isNetworkAvailable(NetworkObserver.getInstance())) {
 			GalleryItem nextGalleryItem = nextHolder.galleryItem;
-			if (nextGalleryItem.isImage(instance.galleryInstance.locator)) {
-				Uri nextUri = nextGalleryItem.getFileUri(instance.galleryInstance.locator);
+			Chan chan = Chan.get(instance.galleryInstance.chanName);
+			if (nextGalleryItem.isImage(chan)) {
+				Uri nextUri = nextGalleryItem.getFileUri(chan);
 				File nextCachedFile = CacheManager.getInstance().getMediaFile(nextUri, true);
 				if (nextCachedFile != null && !nextCachedFile.exists()) {
 					loadImage(nextUri, nextCachedFile, nextHolder);
@@ -107,9 +113,10 @@ public class ImageUnit {
 			readFileTask.cancel();
 		}
 		readBitmapCallback = new ReadBitmapCallback(holder.galleryItem);
+		Chan chan = Chan.getPreferred(instance.galleryInstance.chanName, uri);
 		readFileTask = ReadFileTask.createCachedMediaFile(instance.galleryInstance.context, readBitmapCallback,
-				instance.galleryInstance.chanName, uri, cachedFile);
-		readFileTask.executeOnExecutor(ReadFileTask.THREAD_POOL_EXECUTOR);
+				chan, uri, cachedFile);
+		readFileTask.execute(ConcurrentUtils.PARALLEL_EXECUTOR);
 	}
 
 	private boolean attachReadBitmapCallback(PagerInstance.ViewHolder holder) {
@@ -195,38 +202,42 @@ public class ImageUnit {
 	}
 
 	public void viewTechnicalInfo() {
-		StringBlockBuilder builder = new StringBlockBuilder();
-		for (Pair<String, String> pair : instance.currentHolder.jpegData.getUserMetadata()) {
-			if (pair != null) {
-				builder.appendLine(pair.first + ": " + pair.second);
-			} else {
-				builder.appendEmptyLine();
-			}
-		}
-		String message = builder.toString();
-		AlertDialog.Builder dialogBuilder = new AlertDialog
-				.Builder(instance.galleryInstance.callback.getWindow().getContext())
-				.setTitle(R.string.technical_info).setMessage(message)
-				.setPositiveButton(android.R.string.ok, null);
-		String geolocation = instance.currentHolder.jpegData.getGeolocation(false);
-		if (geolocation != null) {
-			String fileName = instance.currentHolder.galleryItem.getFileName(instance.galleryInstance.locator);
-			Uri uri = new Uri.Builder().scheme("geo").appendQueryParameter("q",
-					geolocation + "(" + fileName + ")").build();
-			final Intent intent = new Intent(Intent.ACTION_VIEW).setData(uri);
-			if (!instance.galleryInstance.context.getPackageManager().queryIntentActivities(intent,
-					PackageManager.MATCH_DEFAULT_ONLY).isEmpty()) {
-				dialogBuilder.setNeutralButton(R.string.show_on_map,
-						(dialog, which) -> instance.galleryInstance.context.startActivity(intent));
-			}
-		}
-		AlertDialog dialog = dialogBuilder.create();
-		dialog.setOnShowListener(ViewUtils.ALERT_DIALOG_MESSAGE_SELECTABLE);
-		instance.galleryInstance.callback.getConfigurationLock().lockConfiguration(dialog);
-		dialog.show();
+		String fileName = instance.currentHolder.galleryItem
+				.getFileName(Chan.get(instance.galleryInstance.chanName));
+		showTechnicalInfo(instance.galleryInstance.callback.getChildFragmentManager(),
+				instance.currentHolder.jpegData, fileName);
 	}
 
-	private class DecodeBitmapTask extends AsyncTask<Void, Void, Void> {
+	private static void showTechnicalInfo(FragmentManager fragmentManager, JpegData jpegData, String fileName) {
+		new InstanceDialog(fragmentManager, null, provider -> {
+			Context context = GalleryInstance.getCallback(provider).getWindow().getContext();
+			AlertDialog.Builder dialogBuilder = new AlertDialog.Builder(context)
+					.setTitle(R.string.technical_info)
+					.setPositiveButton(android.R.string.ok, null);
+			String geolocation = jpegData.getGeolocation(false);
+			if (geolocation != null) {
+				Uri uri = new Uri.Builder().scheme("geo").appendQueryParameter("q",
+						geolocation + "(" + fileName + ")").build();
+				Intent intent = new Intent(Intent.ACTION_VIEW).setData(uri);
+				if (!context.getPackageManager().queryIntentActivities(intent,
+						PackageManager.MATCH_DEFAULT_ONLY).isEmpty()) {
+					dialogBuilder.setNeutralButton(R.string.show_on_map, (d, w) -> context.startActivity(intent));
+				}
+			}
+			AlertDialog dialog = dialogBuilder.create();
+			SummaryLayout layout = new SummaryLayout(dialog);
+			for (Pair<String, String> pair : jpegData.getUserMetadata()) {
+				if (pair != null) {
+					layout.add(pair.first, pair.second);
+				} else {
+					layout.addDivider();
+				}
+			}
+			return dialog;
+		});
+	}
+
+	private class DecodeBitmapTask extends ExecutorTask<Void, Void> {
 		private final File file;
 		private final FileHolder fileHolder;
 		private final PhotoView photoView;
@@ -249,7 +260,7 @@ public class ImageUnit {
 		}
 
 		@Override
-		protected Void doInBackground(Void... params) {
+		protected Void run() {
 			if (!fileHolder.isImage()) {
 				errorMessageId = R.string.image_is_corrupted;
 				return null;
@@ -297,34 +308,44 @@ public class ImageUnit {
 		}
 
 		@Override
-		protected void onPostExecute(Void result) {
+		protected void onComplete(Void result) {
 			PagerInstance.ViewHolder holder = instance.currentHolder;
 			holder.decodeBitmapTask = null;
 			holder.progressBar.setVisible(false, false);
 			if (bitmap != null || decoderDrawable != null || animatedPngDecoder != null || gifDecoder != null) {
+				int width;
+				int height;
 				if (animatedPngDecoder != null) {
 					holder.animatedPngDecoder = animatedPngDecoder;
-					setPhotoViewImage(holder, animatedPngDecoder.getDrawable(), true);
+					Drawable drawable = animatedPngDecoder.getDrawable();
+					width = drawable.getIntrinsicWidth();
+					height = drawable.getIntrinsicHeight();
+					setPhotoViewImage(holder, drawable, true);
 				} else if (gifDecoder != null) {
 					holder.gifDecoder = gifDecoder;
-					setPhotoViewImage(holder, gifDecoder.getDrawable(), true);
+					Drawable drawable = gifDecoder.getDrawable();
+					width = drawable.getIntrinsicWidth();
+					height = drawable.getIntrinsicHeight();
+					setPhotoViewImage(holder, drawable, true);
 				} else if (decoderDrawable != null) {
 					holder.decoderDrawable = decoderDrawable;
+					width = decoderDrawable.getIntrinsicWidth();
+					height = decoderDrawable.getIntrinsicHeight();
 					setPhotoViewImage(holder, decoderDrawable, decoderDrawable.hasAlpha());
 				} else {
 					holder.simpleBitmapDrawable = new SimpleBitmapDrawable(bitmap, true);
+					width = bitmap.getWidth();
+					height = bitmap.getHeight();
 					setPhotoViewImage(holder, holder.simpleBitmapDrawable, bitmap.hasAlpha());
 				}
-				holder.fullLoaded = true;
+				if (holder.mediaSummary.updateDimensions(width, height)) {
+					instance.galleryInstance.callback.updateTitle();
+				}
+				holder.loadState = PagerInstance.LoadState.COMPLETE;
 				instance.galleryInstance.callback.invalidateOptionsMenu();
 			} else {
 				instance.callback.showError(holder, instance.galleryInstance.context.getString(errorMessageId));
 			}
-		}
-
-		public void cancel(PagerInstance.ViewHolder holder) {
-			cancel(true);
-			holder.progressBar.setVisible(false, true);
 		}
 
 		private void setPhotoViewImage(PagerInstance.ViewHolder holder, Drawable drawable, boolean hasAlpha) {

@@ -16,82 +16,82 @@ allprojects {
 	}
 }
 
+tasks.withType(JavaCompile) {
+	options.compilerArgs << '-Xlint:unchecked' << '-Xlint:deprecation'
+}
+
 apply plugin: 'com.android.application'
 
 android {
-	compileSdkVersion 29
-	buildToolsVersion '29.0.3'
+	compileSdkVersion 30
+	buildToolsVersion '30.0.2'
 	ndkVersion '21.3.6528147'
 
 	defaultConfig {
-		versionCode 1037
-		versionName '3.0.3'
+		versionCode 1041
+		versionName '3.1.2'
 
 		minSdkVersion 16
-		targetSdkVersion 29
-		ndk.abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86'
+		targetSdkVersion 30
 
+		// noinspection UnnecessaryQualifiedReference
+		def versionsData = new groovy.json.JsonSlurper().parse(new File('metadata/versions.json'))
+		def versions = versionsData.versions.findAll { it.code == versionCode && it.name == versionName }
+		if (versions.size() != 1) {
+			throw new RuntimeException('Invalid metadata: ' + versions.size() + ' ' +
+					'version declarations for ' + versionCode + ' ' + versionName)
+		}
+
+		buildConfigField 'String', 'VERSION_DATE', '"' + versions[0].date + '"'
 		buildConfigField 'String', 'URI_UPDATES', '"//raw.githubusercontent.com/' +
 				'Mishiranu/Dashchan/master/update/data.json"'
 		buildConfigField 'String', 'URI_THEMES', '"//raw.githubusercontent.com/' +
 				'Mishiranu/Dashchan/master/update/themes.json"'
+		buildConfigField 'String', 'URI_VERSIONS', '"//raw.githubusercontent.com/' +
+				'Mishiranu/Dashchan/master/metadata/versions.json"'
 	}
 
 	sourceSets.main {
 		manifest.srcFile 'AndroidManifest.xml'
-		java.srcDirs = ['src', 'src-api']
+		java.srcDirs = ['src']
 		resources.srcDirs = []
 		aidl.srcDirs = ['src']
 		renderscript.srcDirs = ['src']
-		res.srcDirs = ['res']
+		res.srcDirs = ['res', 'lang']
 		assets.srcDirs = ['assets']
 		jni.srcDirs = []
-		jniLibs.srcDir 'libs'
+		jniLibs.srcDirs = []
 	}
 
 	def locales = sourceSets.main.res.srcDirs
 			.collectMany { (it.listFiles() ?: []) as Collection }
-			.findAll { it.getName().startsWith("values-") && new File(it, "strings.xml").exists() }
+			.findAll { it.getName().startsWith('values-') && new File(it, 'strings.xml').exists() }
 			.collect { it.getName().with { it.substring(it.indexOf('-') + 1) } }.sort()
 	defaultConfig {
 		buildConfigField 'String[]', 'LOCALES', '{"' + locales.join('", "') + '"}'
 		resConfigs locales
 	}
 
-	externalNativeBuild {
-		ndkBuild {
-			path 'jni/Android.mk'
-		}
-	}
+	defaultConfig.ndk.abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86'
+	externalNativeBuild.ndkBuild.path 'jni/Android.mk'
+	buildTypes.create('ndebug').debuggable true
 
 	if (file('keystore.properties').exists()) {
 		def keystoreProperties = new Properties()
 		keystoreProperties.load(new FileInputStream(file('keystore.properties')))
-
-		signingConfigs {
-			general {
-				storeFile file(keystoreProperties['store.file'])
-				storePassword keystoreProperties['store.password']
-				keyAlias keystoreProperties['key.alias']
-				keyPassword keystoreProperties['key.password']
-			}
+		signingConfigs.create('general') {
+			storeFile file(keystoreProperties['store.file'])
+			storePassword keystoreProperties['store.password']
+			keyAlias keystoreProperties['key.alias']
+			keyPassword keystoreProperties['key.password']
 		}
-
-		buildTypes.debug.signingConfig signingConfigs.general
-		buildTypes.release.signingConfig signingConfigs.general
+		buildTypes.all { signingConfig signingConfigs.general }
 	}
 
-	buildTypes {
-		debug {
-			minifyEnabled false
-		}
-		release {
-			minifyEnabled true
-		}
-		all {
-			crunchPngs false
-			proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
-		}
+	buildTypes.all {
+		crunchPngs false
+		minifyEnabled !debuggable
+		proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
 	}
 
 	packagingOptions {
@@ -116,8 +116,19 @@ android {
 
 dependencies {
 	compileOnly 'org.ccil.cowan.tagsoup:tagsoup:1.2.1'
+	implementation 'com.fasterxml.jackson.core:jackson-core:2.11.3'
 	implementation 'androidx.fragment:fragment:1.2.5'
 	implementation 'androidx.recyclerview:recyclerview:1.1.0'
 	implementation 'androidx.drawerlayout:drawerlayout:1.1.1'
 	implementation 'androidx.webkit:webkit:1.3.0'
+	implementation 'org.brotli:dec:0.1.2'
+}
+
+afterEvaluate {
+	task cxxClean(type: Delete) {
+		delete '.cxx'
+	}
+	tasks.getByName('clean').dependsOn(cxxClean)
+	tasks.findAll { it.name.startsWith('externalNativeBuildClean') }
+			.forEach { cxxClean.dependsOn(it) }
 }

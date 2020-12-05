@@ -17,7 +17,7 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.animation.Interpolator;
-import chan.util.StringUtils;
+import chan.util.CommonUtils;
 import com.mishiranu.dashchan.C;
 import com.mishiranu.dashchan.R;
 import com.mishiranu.dashchan.graphics.RoundedCornersDrawable;
@@ -50,10 +50,7 @@ public class AttachmentView extends View {
 	public AttachmentView(Context context, AttributeSet attrs) {
 		super(new ContextThemeWrapper(context, R.style.Theme_Gallery), attrs);
 
-		if (!C.API_PIE) {
-			// noinspection deprecation
-			setDrawingCacheEnabled(false);
-		}
+		disableDrawingCacheCompat();
 		ViewUtils.setSelectableItemBackground(this);
 		// Use old context to obtain background color.
 		backgroundColor = ResourceUtils.getColor(context, R.attr.colorAttachmentBackground);
@@ -65,6 +62,13 @@ public class AttachmentView extends View {
 			workColorMatrix = null;
 			colorMatrix1 = null;
 			colorMatrix2 = null;
+		}
+	}
+
+	@SuppressWarnings("deprecation")
+	private void disableDrawingCacheCompat() {
+		if (!C.API_PIE) {
+			setDrawingCacheEnabled(false);
 		}
 	}
 
@@ -95,7 +99,7 @@ public class AttachmentView extends View {
 
 	public void resetImage(String key, Overlay overlay) {
 		boolean invalidate = false;
-		if (!StringUtils.equals(this.key, key)) {
+		if (!CommonUtils.equals(this.key, key)) {
 			this.key = key;
 			if (bitmap != null || error) {
 				bitmap = null;
@@ -143,7 +147,7 @@ public class AttachmentView extends View {
 	}
 
 	public void handleLoadedImage(String key, Bitmap bitmap, boolean error, boolean instantly) {
-		if (this.bitmap == null && StringUtils.equals(this.key, key)) {
+		if (this.bitmap == null && CommonUtils.equals(this.key, key)) {
 			this.bitmap = bitmap;
 			this.error = bitmap == null && error;
 			imageApplyTime = instantly ? 0L : SystemClock.elapsedRealtime();
@@ -185,13 +189,15 @@ public class AttachmentView extends View {
 	}
 
 	public void applyRoundedCorners(int backgroundColor) {
-		float density = ResourceUtils.obtainDensity(this);
-		int radius = (int) (2f * density + 0.5f);
-		cornersDrawable = new RoundedCornersDrawable(radius);
-		cornersDrawable.setColor(backgroundColor);
-		if (getWidth() > 0) {
-			updateCornersBounds(getWidth(), getHeight());
+		if (cornersDrawable == null) {
+			float density = ResourceUtils.obtainDensity(this);
+			int radius = (int) (2f * density + 0.5f);
+			cornersDrawable = new RoundedCornersDrawable(radius);
+			if (getWidth() > 0) {
+				updateCornersBounds(getWidth(), getHeight());
+			}
 		}
+		cornersDrawable.setColor(backgroundColor);
 	}
 
 	@Override

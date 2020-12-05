@@ -1,68 +1,77 @@
 package com.mishiranu.dashchan.content.async;
 
-import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.SystemClock;
 import android.text.SpannableStringBuilder;
 import android.text.style.StrikethroughSpan;
-import android.text.style.StyleSpan;
 import android.text.style.UnderlineSpan;
+import android.util.Base64;
+import chan.content.Chan;
 import chan.content.ChanConfiguration;
-import chan.content.ChanLocator;
 import chan.content.ChanMarkup;
-import chan.content.model.Attachment;
-import chan.content.model.FileAttachment;
-import chan.content.model.Icon;
-import chan.content.model.Post;
-import chan.content.model.Posts;
 import chan.util.DataFile;
 import chan.util.StringUtils;
+import com.mishiranu.dashchan.content.model.Post;
+import com.mishiranu.dashchan.content.model.PostNumber;
 import com.mishiranu.dashchan.content.service.DownloadService;
 import com.mishiranu.dashchan.text.HtmlParser;
 import com.mishiranu.dashchan.text.WakabaLikeHtmlBuilder;
 import com.mishiranu.dashchan.text.style.GainedColorSpan;
 import com.mishiranu.dashchan.text.style.HeadingSpan;
+import com.mishiranu.dashchan.text.style.ItalicSpan;
 import com.mishiranu.dashchan.text.style.LinkSpan;
+import com.mishiranu.dashchan.text.style.MediumSpan;
 import com.mishiranu.dashchan.text.style.MonospaceSpan;
 import com.mishiranu.dashchan.text.style.OverlineSpan;
 import com.mishiranu.dashchan.text.style.QuoteSpan;
 import com.mishiranu.dashchan.text.style.ScriptSpan;
 import com.mishiranu.dashchan.text.style.SpoilerSpan;
+import com.mishiranu.dashchan.util.Hasher;
+import com.mishiranu.dashchan.util.MimeTypes;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.UnsupportedEncodingException;
+import java.net.URLConnection;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 
-public class SendLocalArchiveTask extends CancellableTask<Void, Integer, Object> implements ChanMarkup.MarkupExtra {
+public class SendLocalArchiveTask extends ExecutorTask<Integer, SendLocalArchiveTask.Result>
+		implements ChanMarkup.MarkupExtra {
 	private static final String DIRECTORY_ARCHIVE = "Archive";
 	private static final String DIRECTORY_FILES = "src";
 	private static final String DIRECTORY_THUMBNAILS = "thumb";
 
-	private final String chanName;
+	private final Callback callback;
+	private final Chan chan;
 	private final String boardName;
 	private final String threadNumber;
-	private final Posts posts;
+	private final Collection<Post> posts;
 	private final boolean saveThumbnails;
 	private final boolean saveFiles;
-	private final Callback callback;
 
-	public interface Callback {
-		public DownloadService.Binder getDownloadBinder();
-		public void onLocalArchivationProgressUpdate(int handledPostsCount);
-		public void onLocalArchivationComplete(boolean success);
+	public interface DownloadResult {
+		void run(DownloadService.Binder binder);
 	}
 
-	public SendLocalArchiveTask(String chanName, String boardName, String threadNumber,
-			Posts posts, boolean saveThumbnails, boolean saveFiles, Callback callback) {
-		this.chanName = chanName;
+	public interface Callback {
+		void onLocalArchivationProgressUpdate(int handledPostsCount);
+		void onLocalArchivationComplete(DownloadResult result);
+	}
+
+	public SendLocalArchiveTask(Callback callback, Chan chan, String boardName, String threadNumber,
+			Collection<Post> posts, boolean saveThumbnails, boolean saveFiles) {
+		this.callback = callback;
+		this.chan = chan;
 		this.boardName = boardName;
 		this.threadNumber = threadNumber;
 		this.posts = posts;
 		this.saveThumbnails = saveThumbnails;
 		this.saveFiles = saveFiles;
-		this.callback = callback;
 	}
 
 	@Override
@@ -89,49 +98,46 @@ public class SendLocalArchiveTask extends CancellableTask<Void, Integer, Object>
 	}
 
 	@Override
-	protected Result doInBackground(Void... params) {
-		String chanName = this.chanName;
+	protected Result run() {
+		Chan chan = this.chan;
 		String boardName = this.boardName;
 		String threadNumber = this.threadNumber;
-		Post[] posts = this.posts.getPosts();
+		Collection<Post> posts = this.posts;
 		Object[] decodeTo = new Object[2];
 		ArrayList<SpanItem> spanItems = new ArrayList<>();
-		ChanConfiguration configuration = ChanConfiguration.get(chanName);
-		ChanLocator locator = ChanLocator.get(configuration);
-		ChanMarkup markup = ChanMarkup.get(configuration);
-		String archiveName = chanName + '-' + boardName + '-' + threadNumber;
-		int totalFilesCount = 0;
+		String archiveName = chan.name + '-' + boardName + '-' + threadNumber;
 		ArrayList<String> existFilesLc = new ArrayList<>();
 		ArrayList<String> existThumbnailsLc = new ArrayList<>();
+		HashMap<String, String> iconNames = new HashMap<>();
+		Hasher hasher = Hasher.getInstanceSha256();
+		int totalFilesCount = 0;
 		for (Post post : posts) {
-			totalFilesCount += post.getAttachmentsCount();
+			totalFilesCount += post.attachments.size();
 		}
-		String defaultName = configuration.getDefaultName(boardName);
-		WakabaLikeHtmlBuilder htmlBuilder = new WakabaLikeHtmlBuilder(posts[0].getSubject(), chanName, boardName,
-				configuration .getBoardTitle(boardName), configuration.getTitle(),
-				locator.safe(false).createThreadUri(boardName, threadNumber), posts.length, totalFilesCount);
+		String defaultName = chan.configuration.getDefaultName(boardName);
+		WakabaLikeHtmlBuilder htmlBuilder = new WakabaLikeHtmlBuilder(posts.iterator().next().subject,
+				boardName, chan.configuration.getBoardTitle(boardName), chan.configuration.getTitle(),
+				chan.locator.safe(false).createThreadUri(boardName, threadNumber), posts.size(), totalFilesCount);
 		ArrayList<DownloadService.DownloadItem> filesToDownload = new ArrayList<>();
 		ArrayList<DownloadService.DownloadItem> thumbnailsToDownload = new ArrayList<>();
 		for (Post post : posts) {
-			String number = post.getPostNumber();
-			String name = StringUtils.emptyIfNull(post.getName()).trim();
-			String identifier = post.getIdentifier();
-			String tripcode = post.getTripcode();
-			String capcode = post.getCapcode();
-			String email = post.getEmail();
-			String subject = post.getSubject();
-			String comment = post.getWorkComment();
-			long timestamp = post.getTimestamp();
+			PostNumber number = post.number;
+			String name = StringUtils.emptyIfNull(post.name).trim();
+			String identifier = post.identifier;
+			String tripcode = post.tripcode;
+			String capcode = post.capcode;
+			String email = post.email;
+			String subject = post.subject;
+			String comment = post.comment;
+			long timestamp = post.timestamp;
 			boolean sage = post.isSage();
 			boolean originalPoster = post.isOriginalPoster();
-			boolean deleted = post.isDeleted();
+			boolean deleted = post.deleted;
 			boolean useDefaultName = name.equals(defaultName) || name.isEmpty();
 			if (name.isEmpty()) {
 				name = defaultName;
 			}
-			int attachmentsCount = post.getAttachmentsCount();
-			int iconsCount = post.getIconsCount();
-			CharSequence charSequence = HtmlParser.spanify(comment, markup, null, this);
+			CharSequence charSequence = HtmlParser.spanify(comment, chan.markup.getMarkup(), null, null, this);
 			spanItems.clear();
 			SpannableStringBuilder spannable = new SpannableStringBuilder(charSequence);
 			replaceSpannable(spannable, '<', "&lt;");
@@ -147,13 +153,12 @@ public class SendLocalArchiveTask extends CancellableTask<Void, Integer, Object>
 					if (what == ChanMarkup.TAG_SPECIAL_LINK) {
 						String text = spannable.subSequence(start, end).toString();
 						if (text.startsWith("&gt;&gt;")) {
-							Uri uri = locator.validateClickedUriString((String) decodeTo[1], boardName, threadNumber);
-							if (threadNumber.equals(locator.safe(false).getThreadNumber(uri))) {
-								String postNumber = locator.safe(false).getPostNumber(uri);
-								if (postNumber == null) {
-									postNumber = threadNumber;
-								}
-								extra = "#" + postNumber;
+							Uri uri = chan.locator.validateClickedUriString((String) decodeTo[1],
+									boardName, threadNumber);
+							if (threadNumber.equals(chan.locator.safe(false).getThreadNumber(uri))) {
+								PostNumber postNumber = chan.locator.safe(false).getPostNumber(uri);
+								String postNumberString = postNumber == null ? threadNumber : postNumber.toString();
+								extra = "#" + postNumberString;
 							} else {
 								extra = uri.toString();
 							}
@@ -192,47 +197,79 @@ public class SendLocalArchiveTask extends CancellableTask<Void, Integer, Object>
 				}
 			}
 			comment = builder.toString().replaceAll("\r", "").replaceAll("\n", "<br />");
-			htmlBuilder.addPost(number, subject, name, identifier, tripcode, capcode, email,
+			htmlBuilder.addPost(number.toString(), subject, name, identifier, tripcode, capcode, email,
 					sage, originalPoster, timestamp, deleted, useDefaultName, comment);
-			if (iconsCount > 0) {
-				for (int i = 0; i < iconsCount; i++) {
-					Icon icon = post.getIconAt(i);
-					Uri uri = icon.getUri(locator);
-					if (uri != null) {
-						htmlBuilder.addIcon(locator.convert(uri), icon.getTitle());
+			for (Post.Icon icon : post.icons) {
+				if (icon.uri != null && !StringUtils.isEmpty(icon.title)) {
+					Uri iconUri = chan.locator.convert(icon.uri);
+					String simpleUri = iconUri.buildUpon().scheme(null).authority(null).build().toString();
+					String pathHash = Base64.encodeToString(hasher.calculate(simpleUri), 0, 12,
+							Base64.NO_WRAP | Base64.URL_SAFE);
+					String iconNameWithoutExtension = "icon-" + pathHash;
+					String iconName = iconNames.get(iconNameWithoutExtension);
+					boolean downloadIcon = false;
+					if (iconName == null) {
+						String extension = null;
+						if (ChanConfiguration.SCHEME_CHAN.equals(iconUri.getScheme())) {
+							ByteArrayOutputStream output = new ByteArrayOutputStream();
+							try {
+								if (chan.configuration.readResourceUri(iconUri, output)) {
+									byte[] bytes = output.toByteArray();
+									String contentType = URLConnection
+											.guessContentTypeFromStream(new ByteArrayInputStream(bytes));
+									if (contentType != null) {
+										extension = MimeTypes.toExtension(contentType);
+									}
+								}
+							} catch (IOException e) {
+								// Ignore
+							}
+						} else {
+							extension = StringUtils.getFileExtension(iconUri.getPath());
+						}
+						iconName = iconNameWithoutExtension;
+						if (!StringUtils.isEmpty(extension)) {
+							iconName += "." + extension;
+						}
+						iconNames.put(iconNameWithoutExtension, iconName);
+						downloadIcon = true;
+					}
+					String iconPath = archiveName + "/" + DIRECTORY_THUMBNAILS + "/" + iconName;
+					htmlBuilder.addIcon(iconPath, icon.title);
+					if (downloadIcon && saveThumbnails) {
+						thumbnailsToDownload.add(new DownloadService.DownloadItem(chan.name, iconUri, iconName, null));
 					}
 				}
 			}
-			for (int i = 0; i < attachmentsCount; i++) {
-				Attachment attachment = post.getAttachmentAt(i);
-				if (attachment instanceof FileAttachment) {
-					FileAttachment fileAttachment = (FileAttachment) attachment;
-					Uri fileUri = fileAttachment.getFileUri(locator);
-					Uri thumbnailUri = fileAttachment.getThumbnailUri(locator);
+			for (Post.Attachment attachment : post.attachments) {
+				if (attachment instanceof Post.Attachment.File) {
+					Post.Attachment.File file = (Post.Attachment.File) attachment;
+					Uri fileUri = chan.locator.convert(chan.locator.fixRelativeFileUri(file.fileUri));
+					Uri thumbnailUri = chan.locator.convert(chan.locator.fixRelativeFileUri(file.thumbnailUri));
 					if (fileUri == null) {
 						fileUri = thumbnailUri;
 					}
 					if (fileUri != null) {
-						String fileName = locator.createAttachmentFileName(fileUri);
+						String fileName = chan.locator.createAttachmentFileName(fileUri);
 						fileName = chooseFileName(existFilesLc, fileName);
 						String filePath = archiveName + "/" + DIRECTORY_FILES + "/" + fileName;
 						String thumbnailName = null;
 						String thumbnailPath = null;
 						if (thumbnailUri != null) {
-							thumbnailName = locator.createAttachmentFileName(thumbnailUri);
+							thumbnailName = chan.locator.createAttachmentFileName(thumbnailUri);
 							thumbnailName = chooseFileName(existThumbnailsLc, thumbnailName);
 							thumbnailPath = archiveName + "/" + DIRECTORY_THUMBNAILS + "/" + thumbnailName;
 						}
-						String originalName = fileAttachment.getNormalizedOriginalName(fileName);
-						htmlBuilder.addFile(filePath, thumbnailPath, originalName, fileAttachment.getSize(),
-								fileAttachment.getWidth(), fileAttachment.getHeight());
+						String originalName = StringUtils.getNormalizedOriginalName(file.originalName, fileName);
+						htmlBuilder.addFile(filePath, thumbnailPath, originalName, file.size,
+								file.width, file.height);
 						if (saveFiles) {
-							filesToDownload.add(new DownloadService.DownloadItem(chanName,
-									fileUri, fileName));
+							filesToDownload.add(new DownloadService.DownloadItem(chan.name,
+									fileUri, fileName, null));
 						}
 						if (saveThumbnails && thumbnailUri != null) {
-							thumbnailsToDownload.add(new DownloadService.DownloadItem(chanName,
-									thumbnailUri, thumbnailName));
+							thumbnailsToDownload.add(new DownloadService.DownloadItem(chan.name,
+									thumbnailUri, thumbnailName, null));
 						}
 					}
 				}
@@ -247,14 +284,14 @@ public class SendLocalArchiveTask extends CancellableTask<Void, Integer, Object>
 	}
 
 	@Override
-	protected void onProgressUpdate(Integer... values) {
-		callback.onLocalArchivationProgressUpdate(values[0]);
+	protected void onProgress(Integer value) {
+		callback.onLocalArchivationProgressUpdate(value);
 	}
 
 	@SuppressWarnings("CharsetObjectCanBeUsed")
 	@Override
-	protected void onPostExecute(Object resultObject) {
-		Result result = (Result) resultObject;
+	protected void onComplete(Result result) {
+		DownloadResult downloadResult = null;
 		if (result != null) {
 			byte[] htmlBytes;
 			try {
@@ -262,17 +299,20 @@ public class SendLocalArchiveTask extends CancellableTask<Void, Integer, Object>
 			} catch (UnsupportedEncodingException e) {
 				throw new RuntimeException(e);
 			}
-			performDownload(".nomedia", new ByteArrayInputStream(new byte[0]));
-			performDownload(result.archiveName + ".html", new ByteArrayInputStream(htmlBytes));
-			performDownload(result.archiveName + "/" + DIRECTORY_THUMBNAILS, result.thumbnailsToDownload);
-			performDownload(result.archiveName + "/" + DIRECTORY_FILES, result.filesToDownload);
+			ArrayList<DownloadResult> results = new ArrayList<>();
+			results.add(createDownload(".nomedia", new ByteArrayInputStream(new byte[0])));
+			results.add(createDownload(result.archiveName + ".html", new ByteArrayInputStream(htmlBytes)));
+			results.add(createDownload(result.archiveName + "/" + DIRECTORY_THUMBNAILS, result.thumbnailsToDownload));
+			results.add(createDownload(result.archiveName + "/" + DIRECTORY_FILES, result.filesToDownload));
+			downloadResult = binder -> {
+				try (DownloadService.Accumulate ignored = binder.accumulate()) {
+					for (DownloadResult innerDownloadResult : results) {
+						innerDownloadResult.run(binder);
+					}
+				}
+			};
 		}
-		callback.onLocalArchivationComplete(result != null);
-	}
-
-	@Override
-	public void cancel() {
-		cancel(true);
+		callback.onLocalArchivationComplete(downloadResult);
 	}
 
 	private long lastNotifyIncrement = 0L;
@@ -283,27 +323,23 @@ public class SendLocalArchiveTask extends CancellableTask<Void, Integer, Object>
 		long t = SystemClock.elapsedRealtime();
 		if (t - lastNotifyIncrement >= 100) {
 			lastNotifyIncrement = t;
-			publishProgress(progress);
+			notifyProgress(progress);
 		}
 	}
 
-	private void performDownload(String name, InputStream input) {
-		DownloadService.Binder binder = callback.getDownloadBinder();
-		if (binder != null) {
-			binder.downloadDirect(DataFile.Target.DOWNLOADS,
-					DIRECTORY_ARCHIVE, name, input);
-		}
+	private static DownloadResult createDownload(String name, InputStream input) {
+		return binder -> binder.downloadDirect(DataFile.Target.DOWNLOADS, DIRECTORY_ARCHIVE, name, input);
 	}
 
-	private void performDownload(String path, List<DownloadService.DownloadItem> downloadItems) {
-		DownloadService.Binder binder = callback.getDownloadBinder();
-		if (path != null && downloadItems.size() > 0 && binder != null) {
-			binder.downloadDirect(DataFile.Target.DOWNLOADS,
-					DIRECTORY_ARCHIVE + "/" + path, false, downloadItems);
-		}
+	private static DownloadResult createDownload(String path, List<DownloadService.DownloadItem> downloadItems) {
+		return binder -> {
+			if (path != null && downloadItems.size() > 0) {
+				binder.downloadDirect(DataFile.Target.DOWNLOADS, DIRECTORY_ARCHIVE + "/" + path, false, downloadItems);
+			}
+		};
 	}
 
-	private static class Result {
+	public static class Result {
 		public final String html;
 		public final String archiveName;
 		public final List<DownloadService.DownloadItem> filesToDownload;
@@ -413,22 +449,17 @@ public class SendLocalArchiveTask extends CancellableTask<Void, Integer, Object>
 		result[1] = null;
 		if (span instanceof LinkSpan) {
 			result[0] = ChanMarkup.TAG_SPECIAL_LINK;
-			result[1] = ((LinkSpan) span).getUriString();
+			result[1] = ((LinkSpan) span).uriString;
 		} else if (span instanceof SpoilerSpan) {
 			result[0] = ChanMarkup.TAG_SPOILER;
 		} else if (span instanceof QuoteSpan) {
 			result[0] = ChanMarkup.TAG_QUOTE;
 		} else if (span instanceof ScriptSpan) {
 			result[0] = ((ScriptSpan) span).isSuperscript() ? ChanMarkup.TAG_SUPERSCRIPT : ChanMarkup.TAG_SUBSCRIPT;
-		} else if (span instanceof StyleSpan) {
-			int style = ((StyleSpan) span).getStyle();
-			if (style == Typeface.BOLD) {
-				result[0] = ChanMarkup.TAG_BOLD;
-			} else {
-				if (style == Typeface.ITALIC) {
-					result[0] = ChanMarkup.TAG_ITALIC;
-				}
-			}
+		} else if (span instanceof MediumSpan) {
+			result[0] = ChanMarkup.TAG_BOLD;
+		} else if (span instanceof ItalicSpan) {
+			result[0] = ChanMarkup.TAG_ITALIC;
 		} else if (span instanceof UnderlineSpan) {
 			result[0] = ChanMarkup.TAG_UNDERLINE;
 		} else if (span instanceof OverlineSpan) {

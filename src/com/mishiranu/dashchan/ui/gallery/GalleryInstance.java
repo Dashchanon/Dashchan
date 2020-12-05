@@ -2,37 +2,42 @@ package com.mishiranu.dashchan.ui.gallery;
 
 import android.content.Context;
 import android.view.Window;
-import chan.content.ChanLocator;
+import androidx.fragment.app.FragmentManager;
+import androidx.lifecycle.ViewModelStoreOwner;
 import com.mishiranu.dashchan.content.model.GalleryItem;
-import com.mishiranu.dashchan.util.ConfigurationLock;
+import com.mishiranu.dashchan.ui.InstanceDialog;
 import java.util.List;
 
 public class GalleryInstance {
-	public static final int FLAG_LOCKED_USER = 0x00000001;
-	public static final int FLAG_LOCKED_GRID = 0x00000002;
-	public static final int FLAG_LOCKED_ERROR = 0x00000004;
+	public interface Flags {
+		int LOCKED_USER = 0x00000001;
+		int LOCKED_GRID = 0x00000002;
+		int LOCKED_ERROR = 0x00000004;
+	}
 
 	public final Context context;
 	public final Callback callback;
 	public final int actionBarColor;
 
 	public final String chanName;
-	public final ChanLocator locator;
 	public final List<GalleryItem> galleryItems;
 
 	public GalleryInstance(Context context, Callback callback, int actionBarColor,
-			String chanName, ChanLocator locator, List<GalleryItem> galleryItems) {
+			String chanName, List<GalleryItem> galleryItems) {
 		this.context = context;
 		this.callback = callback;
 		this.actionBarColor = actionBarColor;
 		this.chanName = chanName;
-		this.locator = locator;
 		this.galleryItems = galleryItems;
 	}
 
-	public interface Callback {
+	public static Callback getCallback(InstanceDialog.Provider provider) {
+		return (Callback) provider.getParentFragment();
+	}
+
+	public interface Callback extends ViewModelStoreOwner {
 		Window getWindow();
-		ConfigurationLock getConfigurationLock();
+		FragmentManager getChildFragmentManager();
 
 		void downloadGalleryItem(GalleryItem galleryItem);
 		void downloadGalleryItems(List<GalleryItem> galleryItems);

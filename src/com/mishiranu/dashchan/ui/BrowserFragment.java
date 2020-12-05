@@ -2,9 +2,11 @@ package com.mishiranu.dashchan.ui;
 
 import android.annotation.SuppressLint;
 import android.app.AlertDialog;
+import android.app.Dialog;
 import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
@@ -26,24 +28,25 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 import androidx.annotation.NonNull;
-import androidx.fragment.app.Fragment;
+import androidx.fragment.app.DialogFragment;
+import chan.content.Chan;
 import chan.content.ChanLocator;
-import chan.content.ChanManager;
 import chan.util.StringUtils;
 import com.mishiranu.dashchan.R;
 import com.mishiranu.dashchan.content.Preferences;
 import com.mishiranu.dashchan.util.AnimationUtils;
 import com.mishiranu.dashchan.util.NavigationUtils;
 import com.mishiranu.dashchan.util.ResourceUtils;
-import com.mishiranu.dashchan.util.ToastUtils;
 import com.mishiranu.dashchan.util.WebViewUtils;
+import com.mishiranu.dashchan.widget.ClickableToast;
+import com.mishiranu.dashchan.widget.ExpandedLayout;
 import com.mishiranu.dashchan.widget.ThemeEngine;
+import java.util.UUID;
 
-public class BrowserFragment extends Fragment implements ActivityHandler, DownloadListener {
+public class BrowserFragment extends ContentFragment implements DownloadListener {
 	private static final String EXTRA_URI = "uri";
 
-	public BrowserFragment() {
-	}
+	public BrowserFragment() {}
 
 	public BrowserFragment(Uri uri) {
 		Bundle args = new Bundle();
@@ -54,23 +57,26 @@ public class BrowserFragment extends Fragment implements ActivityHandler, Downlo
 	private WebView webView;
 	private ProgressView progressView;
 
+	private String navigationDrawerLocker;
+
 	@Override
 	public View onCreateView(@NonNull LayoutInflater inflater, ViewGroup container, Bundle savedInstanceState) {
-		webView = new WebView(requireContext());
-		progressView = new ProgressView(requireContext());
+		ExpandedLayout layout = new ExpandedLayout(container.getContext(), true);
+		webView = new WebView(layout.getContext());
+		layout.addView(webView, FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT);
+		progressView = new ProgressView(layout.getContext());
 		float density = ResourceUtils.obtainDensity(this);
-		FrameLayout frameLayout = new FrameLayout(requireContext());
-		frameLayout.addView(webView, FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT);
-		frameLayout.addView(progressView, FrameLayout.LayoutParams.MATCH_PARENT, (int) (3f * density + 0.5f));
-		frameLayout.setLayoutParams(new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-				ViewGroup.LayoutParams.MATCH_PARENT));
-		return frameLayout;
+		layout.addView(progressView, FrameLayout.LayoutParams.MATCH_PARENT, (int) (3f * density + 0.5f));
+		return layout;
 	}
 
 	@SuppressLint("SetJavaScriptEnabled")
 	@Override
 	public void onViewCreated(@NonNull View view, Bundle savedInstanceState) {
 		super.onViewCreated(view, savedInstanceState);
+
+		navigationDrawerLocker = "browser-" + UUID.randomUUID();
+		((FragmentHandler) requireActivity()).setNavigationAreaLocked(navigationDrawerLocker, true);
 
 		WebSettings settings = webView.getSettings();
 		settings.setBuiltInZoomControls(true);
@@ -87,9 +93,9 @@ public class BrowserFragment extends Fragment implements ActivityHandler, Downlo
 			switch (hitTestResult.getType()) {
 				case WebView.HitTestResult.IMAGE_TYPE:
 				case WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE: {
-					final Uri uri = Uri.parse(hitTestResult.getExtra());
-					ChanLocator locator = ChanLocator.getDefault();
-					if (locator.isWebScheme(uri) && locator.isImageExtension(uri.getPath())) {
+					Chan chan = Chan.getFallback();
+					Uri uri = Uri.parse(hitTestResult.getExtra());
+					if (chan.locator.isWebScheme(uri) && chan.locator.isImageExtension(uri.getPath())) {
 						NavigationUtils.openImageVideo(requireContext(), uri);
 					}
 					return true;
@@ -107,6 +113,7 @@ public class BrowserFragment extends Fragment implements ActivityHandler, Downlo
 	public void onDestroyView() {
 		super.onDestroyView();
 
+		((FragmentHandler) requireActivity()).setNavigationAreaLocked(navigationDrawerLocker, false);
 		webView.stopLoading();
 		webView.destroy();
 		webView = null;
@@ -198,7 +205,7 @@ public class BrowserFragment extends Fragment implements ActivityHandler, Downlo
 			startActivity(new Intent(Intent.ACTION_VIEW).setData(Uri.parse(url))
 					.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
 		} catch (ActivityNotFoundException e) {
-			ToastUtils.show(requireContext(), R.string.unknown_address);
+			ClickableToast.show(R.string.unknown_address);
 		}
 	}
 
@@ -207,29 +214,31 @@ public class BrowserFragment extends Fragment implements ActivityHandler, Downlo
 		@Override
 		public boolean shouldOverrideUrlLoading(WebView view, String url) {
 			Uri uri = Uri.parse(url);
-			String chanName = ChanManager.getInstance().getChanNameByHost(uri.getHost());
-			if (chanName != null) {
-				ChanLocator locator = ChanLocator.get(chanName);
+			Chan chan = Chan.getPreferred(null, uri);
+			if (chan.name != null) {
 				ChanLocator.NavigationData navigationData;
-				if (locator.safe(true).isBoardUri(uri)) {
-					navigationData = new ChanLocator.NavigationData(ChanLocator.NavigationData.TARGET_THREADS,
-							locator.safe(true).getBoardName(uri), null, null, null);
-				} else if (locator.safe(true).isThreadUri(uri)) {
-					navigationData = new ChanLocator.NavigationData(ChanLocator.NavigationData.TARGET_POSTS,
-							locator.safe(true).getBoardName(uri), locator.safe(true).getThreadNumber(uri),
-							locator.safe(true).getPostNumber(uri), null);
+				if (chan.locator.safe(true).isBoardUri(uri)) {
+					navigationData = new ChanLocator.NavigationData(ChanLocator.NavigationData.Target.THREADS,
+							chan.locator.safe(true).getBoardName(uri), null, null, null);
+				} else if (chan.locator.safe(true).isThreadUri(uri)) {
+					navigationData = new ChanLocator.NavigationData(ChanLocator.NavigationData.Target.POSTS,
+							chan.locator.safe(true).getBoardName(uri), chan.locator.safe(true).getThreadNumber(uri),
+							chan.locator.safe(true).getPostNumber(uri), null);
 				} else {
-					navigationData = locator.safe(true).handleUriClickSpecial(uri);
+					navigationData = chan.locator.safe(true).handleUriClickSpecial(uri);
 				}
 				if (navigationData != null) {
-					AlertDialog alertDialog = new AlertDialog.Builder(requireContext())
-							.setMessage(R.string.follow_the_link__sentence)
-							.setNegativeButton(android.R.string.cancel, null)
-							.setPositiveButton(android.R.string.ok, (dialog, which) -> startActivity(NavigationUtils
-									.obtainTargetIntent(requireContext(), chanName, navigationData,
-											NavigationUtils.FLAG_RETURNABLE)))
-							.show();
-					((FragmentHandler) requireActivity()).getConfigurationLock().lockConfiguration(alertDialog);
+					LinkDialog dialog = new LinkDialog(chan.name, navigationData);
+					dialog.show(getChildFragmentManager(), LinkDialog.class.getName());
+					return true;
+				}
+			}
+			if (!chan.locator.isWebScheme(uri)) {
+				Intent intent = new Intent(Intent.ACTION_VIEW).setData(uri)
+						.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+				if (!requireContext().getPackageManager().queryIntentActivities(intent,
+						PackageManager.MATCH_DEFAULT_ONLY).isEmpty()) {
+					requireContext().startActivity(intent);
 					return true;
 				}
 			}
@@ -247,11 +256,38 @@ public class BrowserFragment extends Fragment implements ActivityHandler, Downlo
 		@Override
 		public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError error) {
 			if (Preferences.isVerifyCertificate()) {
-				ToastUtils.show(requireContext(), R.string.invalid_certificate);
+				ClickableToast.show(R.string.invalid_certificate);
 				super.onReceivedSslError(view, handler, error);
 			} else {
 				handler.proceed();
 			}
+		}
+	}
+
+	public static class LinkDialog extends DialogFragment {
+		private static final String EXTRA_CHAN_NAME = "chanName";
+		private static final String EXTRA_NAVIGATION_DATA = "navigationData";
+
+		public LinkDialog() {}
+
+		public LinkDialog(String chanName, ChanLocator.NavigationData navigationData) {
+			Bundle args = new Bundle();
+			args.putString(EXTRA_CHAN_NAME, chanName);
+			args.putParcelable(EXTRA_NAVIGATION_DATA, navigationData);
+			setArguments(args);
+		}
+
+		@NonNull
+		@Override
+		public Dialog onCreateDialog(Bundle savedInstanceState) {
+			String chanName = requireArguments().getString(EXTRA_CHAN_NAME);
+			ChanLocator.NavigationData navigationData = requireArguments().getParcelable(EXTRA_NAVIGATION_DATA);
+			return new AlertDialog.Builder(requireContext())
+					.setMessage(R.string.follow_the_link__sentence)
+					.setNegativeButton(android.R.string.cancel, null)
+					.setPositiveButton(android.R.string.ok, (dialog, which) -> ((FragmentHandler)
+							requireActivity()).navigateTargetAllowReturn(chanName, navigationData))
+					.create();
 		}
 	}
 

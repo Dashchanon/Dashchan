@@ -12,12 +12,11 @@ import android.graphics.drawable.ColorDrawable;
 import android.net.Uri;
 import android.os.SystemClock;
 import android.text.Layout;
-import android.text.Spannable;
 import android.text.SpannableString;
+import android.text.SpannableStringBuilder;
 import android.text.style.BackgroundColorSpan;
-import android.util.Pair;
-import android.util.SparseIntArray;
-import android.view.Gravity;
+import android.text.style.RelativeSizeSpan;
+import android.text.style.TypefaceSpan;
 import android.view.LayoutInflater;
 import android.view.MotionEvent;
 import android.view.View;
@@ -26,23 +25,25 @@ import android.view.ViewGroup;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.TextView;
+import androidx.core.view.ViewCompat;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
-import chan.content.ChanLocator;
+import chan.content.Chan;
 import chan.util.StringUtils;
 import com.mishiranu.dashchan.C;
 import com.mishiranu.dashchan.R;
 import com.mishiranu.dashchan.content.ImageLoader;
 import com.mishiranu.dashchan.content.Preferences;
 import com.mishiranu.dashchan.content.model.AttachmentItem;
-import com.mishiranu.dashchan.content.model.GalleryItem;
+import com.mishiranu.dashchan.content.model.Post;
 import com.mishiranu.dashchan.content.model.PostItem;
+import com.mishiranu.dashchan.content.model.PostNumber;
 import com.mishiranu.dashchan.graphics.ColorScheme;
 import com.mishiranu.dashchan.text.style.LinkSpan;
 import com.mishiranu.dashchan.text.style.LinkSuffixSpan;
 import com.mishiranu.dashchan.ui.gallery.GalleryOverlay;
+import com.mishiranu.dashchan.ui.posting.Replyable;
 import com.mishiranu.dashchan.util.AnimationUtils;
-import com.mishiranu.dashchan.util.GraphicsUtils;
 import com.mishiranu.dashchan.util.ListViewUtils;
 import com.mishiranu.dashchan.util.PostDateFormatter;
 import com.mishiranu.dashchan.util.ResourceUtils;
@@ -53,22 +54,20 @@ import com.mishiranu.dashchan.widget.CommentTextView;
 import com.mishiranu.dashchan.widget.LinebreakLayout;
 import com.mishiranu.dashchan.widget.PostLinearLayout;
 import com.mishiranu.dashchan.widget.ThemeEngine;
+import com.mishiranu.dashchan.widget.ThreadDescriptionView;
+import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 
 public class ViewUnit {
 	private final UiManager uiManager;
 	private final PostDateFormatter postDateFormatter;
-
-	private final int thumbnailWidth;
-	private final int multipleAttachmentInfoWidth;
-
-	private final int commentMaxLines;
-	private final int commentAdditionalHeight;
+	private final List<CommentTextView.ExtraButton> extraButtons;
+	private final Lazy<PostViewHolder.Dimensions> postDimensions = new Lazy<>();
 
 	private static final float ALPHA_HIDDEN_POST = 0.2f;
 	private static final float ALPHA_DELETED_POST = 0.5f;
@@ -79,73 +78,143 @@ public class ViewUnit {
 		this.uiManager = uiManager;
 		postDateFormatter = new PostDateFormatter(context);
 
-		Configuration configuration = context.getResources().getConfiguration();
-		float density = ResourceUtils.obtainDensity(context);
-		// Define header height, image width and max comment field height
-		View view = LayoutInflater.from(context).inflate(R.layout.list_item_post, null);
-		View head = view.findViewById(R.id.head);
-		TextView comment = view.findViewById(R.id.comment);
-		View bottomBar = view.findViewById(R.id.bottom_bar);
-		ViewUtils.applyScaleSize(head.findViewById(R.id.subject), head.findViewById(R.id.number),
-				head.findViewById(R.id.name), head.findViewById(R.id.index), head.findViewById(R.id.date),
-				head.findViewById(R.id.attachment_info), comment, bottomBar.findViewById(R.id.bottom_bar_replies),
-				bottomBar.findViewById(R.id.bottom_bar_expand), bottomBar.findViewById(R.id.bottom_bar_open_thread));
-		int widthMeasureSpec = View.MeasureSpec.makeMeasureSpec((int) (320 * density + 0.5f), View.MeasureSpec.AT_MOST);
-		int heightMeasureSpec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED);
-		view.measure(widthMeasureSpec, heightMeasureSpec);
-		commentMaxLines = Preferences.getPostMaxLines();
-		commentAdditionalHeight = bottomBar.getMeasuredHeight();
-		thumbnailWidth = head.getMeasuredHeight();
-		int additionalAttachmentInfoWidthDp = 64; // approximately equal to thumbnail width + right padding
-		int minAttachmentInfoWidthDp = additionalAttachmentInfoWidthDp + 68;
-		int maxAttachmentInfoWidthDp = additionalAttachmentInfoWidthDp + 84;
-		int attachmentInfoWidthDp = configuration.smallestScreenWidthDp * minAttachmentInfoWidthDp / 320;
-		attachmentInfoWidthDp = Math.max(Math.min(attachmentInfoWidthDp, maxAttachmentInfoWidthDp),
-				minAttachmentInfoWidthDp);
-		attachmentInfoWidthDp -= additionalAttachmentInfoWidthDp;
-		multipleAttachmentInfoWidth = (int) (attachmentInfoWidthDp * density + 0.5f);
+		extraButtons = Arrays
+				.asList(new CommentTextView.ExtraButton(context.getString(R.string.quote__verb),
+						R.attr.iconActionPaste, (view, text, click) -> {
+					PostViewHolder holder = ListViewUtils.getViewHolder(view, PostViewHolder.class);
+					UiManager.ConfigurationSet configurationSet = holder.getConfigurationSet();
+					if (configurationSet.replyable != null && configurationSet.replyable.onRequestReply(false)) {
+						if (click) {
+							configurationSet.replyable.onRequestReply(true, new Replyable
+									.ReplyData(holder.getPostItem().getPostNumber(), text.toPreparedString(view)));
+						}
+						return true;
+					}
+					return false;
+				}), new CommentTextView.ExtraButton(context.getString(R.string.web_browser),
+						R.attr.iconActionForward, (view, text, click) -> {
+					Uri uri = extractUri(text.toString());
+					if (uri != null) {
+						if (click) {
+							PostViewHolder holder = ListViewUtils.getViewHolder(view, PostViewHolder.class);
+							UiManager.ConfigurationSet configurationSet = holder.getConfigurationSet();
+							CommentTextView.LinkListener linkListener = configurationSet.linkListener != null
+									? configurationSet.linkListener : defaultLinkListener;
+							linkListener.onLinkClick(view, uri, CommentTextView.LinkListener.Extra.EMPTY, true);
+						}
+						return true;
+					}
+					return false;
+				}), new CommentTextView.ExtraButton(context.getString(R.string.add_theme),
+						R.attr.iconActionAddRule, (view, text, click) -> {
+					ThemeEngine.Theme theme = ThemeEngine.fastParseThemeFromText(context, text.toString());
+					if (theme != null) {
+						if (click) {
+							uiManager.navigator().navigateSetTheme(theme);
+						}
+						return true;
+					}
+					return false;
+				}));
+	}
+
+	private static Uri extractUri(String text) {
+		String fixedText = StringUtils.fixParsedUriString(text);
+		if (text.equals(fixedText)) {
+			if (!text.matches("[a-z]+:.*")) {
+				text = "http://" + text.replaceAll("^/+", "");
+			}
+			Uri uri = Uri.parse(text);
+			if (uri != null) {
+				if (StringUtils.isEmpty(uri.getAuthority())) {
+					uri = uri.buildUpon().scheme("http").build();
+				}
+				String host = uri.getHost();
+				if (host != null && host.matches(".+\\..+") && Chan.getFallback().locator.isWebScheme(uri)) {
+					return uri;
+				}
+			}
+		}
+		return null;
 	}
 
 	private final CommentTextView.LinkListener defaultLinkListener = new CommentTextView.LinkListener() {
 		@Override
-		public void onLinkClick(CommentTextView view, String chanName, Uri uri, boolean confirmed) {
+		public void onLinkClick(CommentTextView view, Uri uri, Extra extra, boolean confirmed) {
 			UiManager.Holder holder = ListViewUtils.getViewHolder(view, UiManager.Holder.class);
-			uiManager.interaction().handleLinkClick(holder.getConfigurationSet(), chanName, uri, confirmed);
+			uiManager.interaction().handleLinkClick(holder.getConfigurationSet(), uri, extra, confirmed);
 		}
 
 		@Override
-		public void onLinkLongClick(CommentTextView view, String chanName, Uri uri) {
-			uiManager.interaction().handleLinkLongClick(uri);
+		public void onLinkLongClick(CommentTextView view, Uri uri, Extra extra) {
+			UiManager.Holder holder = ListViewUtils.getViewHolder(view, UiManager.Holder.class);
+			uiManager.interaction().handleLinkLongClick(holder.getConfigurationSet(), uri);
 		}
 	};
 
-	private final CommentTextView.CommentListener commentListener = new CommentTextView.CommentListener() {
-		@Override
-		public void onRequestSiblingsInvalidate(CommentTextView view) {
-			uiManager.sendPostItemMessage(view, UiManager.Message.INVALIDATE_COMMENT_VIEW);
-		}
-
-		@Override
-		public String onPrepareToCopy(CommentTextView view, Spannable text, int start, int end) {
-			return uiManager.interaction().getCopyReadyComment(text, start, end);
-		}
-	};
-
-	public RecyclerView.ViewHolder createThreadViewHolder(ViewGroup parent,
-			UiManager.ConfigurationSet configurationSet, boolean cell) {
-		return new ThreadViewHolder(parent, configurationSet, uiManager, cell);
+	private void onSpanStateChanged(CommentTextView view) {
+		uiManager.sendPostItemMessage(view, UiManager.Message.INVALIDATE_COMMENT_VIEW);
 	}
 
-	public void bindThreadView(RecyclerView.ViewHolder viewHolder, PostItem postItem) {
+	private final CommentTextView.SpanStateListener spanStateListener = this::onSpanStateChanged;
+
+	private final CommentTextView.PrepareToCopyListener prepareToCopyListener =
+			(view, text, start, end) -> InteractionUnit.getCopyReadyComment(text, start, end);
+
+	public enum ViewType {THREAD, THREAD_HIDDEN, THREAD_CARD, THREAD_CARD_HIDDEN, THREAD_CARD_CELL, POST, POST_HIDDEN}
+	private enum ThreadViewType {LIST, CARD, CELL}
+
+	private final ListViewUtils.UnlimitedRecycledViewPool threadsPostsViewPool =
+			new ListViewUtils.UnlimitedRecycledViewPool();
+
+	public void bindThreadsPostRecyclerView(RecyclerView recyclerView) {
+		recyclerView.setRecycledViewPool(threadsPostsViewPool);
+		((LinearLayoutManager) recyclerView.getLayoutManager()).setRecycleChildrenOnDetach(true);
+	}
+
+	public RecyclerView.ViewHolder createView(ViewGroup parent, ViewType viewType) {
+		switch (viewType) {
+			case THREAD: {
+				return new ThreadViewHolder(parent, uiManager, ThreadViewType.LIST);
+			}
+			case THREAD_HIDDEN: {
+				return new HiddenViewHolder(parent, false, true);
+			}
+			case THREAD_CARD: {
+				return new ThreadViewHolder(parent, uiManager, ThreadViewType.CARD);
+			}
+			case THREAD_CARD_HIDDEN: {
+				return new HiddenViewHolder(parent, true, true);
+			}
+			case THREAD_CARD_CELL: {
+				return new ThreadViewHolder(parent, uiManager, ThreadViewType.CELL);
+			}
+			case POST: {
+				return new PostViewHolder(parent, uiManager, postDimensions);
+			}
+			case POST_HIDDEN: {
+				return new HiddenViewHolder(parent, false, false);
+			}
+			default: {
+				throw new IllegalArgumentException();
+			}
+		}
+	}
+
+	public void bindThreadView(RecyclerView.ViewHolder viewHolder,
+			PostItem postItem, UiManager.ConfigurationSet configurationSet) {
 		Context context = uiManager.getContext();
 		ColorScheme colorScheme = ThemeEngine.getColorScheme(context);
 		ThreadViewHolder holder = (ThreadViewHolder) viewHolder;
-		holder.postItem = postItem;
+		Chan chan = Chan.get(configurationSet.chanName);
+		holder.configure(postItem, configurationSet);
 
-		holder.stateSage.setVisibility(postItem.getBumpLimitReachedState(0) == PostItem.BumpLimitState.REACHED
-				? View.VISIBLE : View.GONE);
-		holder.stateSticky.setVisibility(postItem.isSticky() ? View.VISIBLE : View.GONE);
-		holder.stateClosed.setVisibility(postItem.isClosed() ? View.VISIBLE : View.GONE);
+		boolean bumpLimitReached = postItem.getBumpLimitReachedState(chan, 0) == PostItem.BumpLimitState.REACHED;
+		PostState.Predicate.Data stateData = new PostState.Predicate.Data(postItem, configurationSet, bumpLimitReached);
+		for (int i = 0; i < PostState.THREAD_ITEM_STATES.size(); i++) {
+			boolean visible = PostState.THREAD_ITEM_STATES.get(i).predicate.apply(stateData);
+			holder.stateImages[i].setVisibility(visible ? View.VISIBLE : View.GONE);
+		}
 
 		String subject = postItem.getSubject();
 		if (!StringUtils.isEmpty(subject)) {
@@ -164,13 +233,14 @@ public class ViewUnit {
 		}
 		holder.comment.setText(comment);
 		holder.comment.setVisibility(holder.comment.getText().length() > 0 ? View.VISIBLE : View.GONE);
-		holder.description.setText(postItem.formatThreadCardDescription(context, false));
+		holder.description.clear();
+		postItem.formatThreadCardDescription(context.getResources(), false, holder.description::append);
 
 		List<AttachmentItem> attachmentItems = postItem.getAttachmentItems();
 		if (attachmentItems != null) {
 			AttachmentItem attachmentItem = attachmentItems.get(0);
 			boolean needShowMultipleIcon = attachmentItems.size() > 1;
-			attachmentItem.configureAndLoad(holder.thumbnail, needShowMultipleIcon, false);
+			attachmentItem.configureAndLoad(holder.thumbnail, chan, needShowMultipleIcon, false);
 			holder.thumbnailClickListener.update(0, true, GalleryOverlay.NavigatePostMode.DISABLED);
 			holder.thumbnailLongClickListener.update(attachmentItem);
 			holder.thumbnail.setSfwMode(Preferences.isSfwMode());
@@ -184,27 +254,36 @@ public class ViewUnit {
 		holder.thumbnail.setOnLongClickListener(holder.thumbnailLongClickListener);
 	}
 
-	public void bindThreadCellView(RecyclerView.ViewHolder viewHolder, PostItem postItem, int contentHeight) {
+	public void bindThreadCellView(RecyclerView.ViewHolder viewHolder,
+			PostItem postItem, UiManager.ConfigurationSet configurationSet, boolean small, int contentHeight) {
 		Context context = uiManager.getContext();
 		ColorScheme colorScheme = ThemeEngine.getColorScheme(context);
 		ThreadViewHolder holder = (ThreadViewHolder) viewHolder;
-		holder.postItem = postItem;
+		Chan chan = Chan.get(configurationSet.chanName);
+		holder.configure(postItem, configurationSet);
 
 		List<AttachmentItem> attachmentItems = postItem.getAttachmentItems();
-		boolean hidden = postItem.isHidden(holder.configurationSet.hidePerformer);
+		boolean hidden = postItem.getHideState().hidden;
 		((View) holder.threadContent.getParent()).setAlpha(hidden ? ALPHA_HIDDEN_POST : 1f);
 		String subject = postItem.getSubject();
 		if (!StringUtils.isEmptyOrWhitespace(subject) && !hidden) {
 			holder.subject.setVisibility(View.VISIBLE);
-			holder.subject.setText(subject.trim());
+			holder.subject.setSingleLine(!small);
+			SpannableStringBuilder builder = new SpannableStringBuilder(subject.trim());
+			if (!small) {
+				builder.setSpan(new RelativeSizeSpan(4f / 3f), 0, builder.length(),
+						SpannableStringBuilder.SPAN_EXCLUSIVE_EXCLUSIVE);
+				builder.setSpan(new TypefaceSpan("sans-serif-light"), 0, builder.length(),
+						SpannableStringBuilder.SPAN_EXCLUSIVE_EXCLUSIVE);
+			}
+			holder.subject.setText(builder);
 		} else {
 			holder.subject.setVisibility(View.GONE);
 		}
 		CharSequence comment = null;
 		if (hidden) {
 			comment = postItem.getHideReason();
-		}
-		if (comment == null) {
+		} else if (!small || attachmentItems == null) {
 			int parentWidth = (int) (ResourceUtils.obtainDensity(holder.itemView) *
 					holder.itemView.getResources().getConfiguration().screenWidthDp);
 			comment = postItem.getThreadCommentShort(parentWidth / 2,
@@ -213,12 +292,13 @@ public class ViewUnit {
 		}
 		holder.comment.setText(comment);
 		holder.comment.setVisibility(StringUtils.isEmpty(comment) ? View.GONE : View.VISIBLE);
-		holder.description.setText(postItem.formatThreadCardDescription(context, true));
+		holder.description.clear();
+		postItem.formatThreadCardDescription(context.getResources(), true, holder.description::append);
 
 		if (attachmentItems != null && !hidden) {
 			AttachmentItem attachmentItem = attachmentItems.get(0);
 			boolean needShowMultipleIcon = attachmentItems.size() > 1;
-			attachmentItem.configureAndLoad(holder.thumbnail, needShowMultipleIcon, false);
+			attachmentItem.configureAndLoad(holder.thumbnail, chan, needShowMultipleIcon, false);
 			holder.thumbnailClickListener.update(0, true, GalleryOverlay.NavigatePostMode.DISABLED);
 			holder.thumbnailLongClickListener.update(attachmentItem);
 			holder.thumbnail.setSfwMode(Preferences.isSfwMode());
@@ -234,14 +314,19 @@ public class ViewUnit {
 		holder.threadContent.getLayoutParams().height = contentHeight;
 	}
 
-	public RecyclerView.ViewHolder createThreadHiddenView(ViewGroup parent,
-			UiManager.ConfigurationSet configurationSet) {
-		return new HiddenViewHolder(parent, configurationSet, true);
+	public void bindThreadViewReloadAttachment(RecyclerView.ViewHolder viewHolder, AttachmentItem attachmentItem) {
+		ThreadViewHolder holder = (ThreadViewHolder) viewHolder;
+		List<AttachmentItem> attachmentItems = holder.getPostItem().getAttachmentItems();
+		if (attachmentItems != null && !attachmentItems.isEmpty() && attachmentItems.get(0) == attachmentItem) {
+			Chan chan = Chan.get(holder.getConfigurationSet().chanName);
+			attachmentItem.startLoad(holder.thumbnail, chan, true);
+		}
 	}
 
-	public void bindThreadHiddenView(RecyclerView.ViewHolder viewHolder, PostItem postItem) {
+	public void bindThreadHiddenView(RecyclerView.ViewHolder viewHolder,
+			PostItem postItem, UiManager.ConfigurationSet configurationSet) {
 		HiddenViewHolder holder = (HiddenViewHolder) viewHolder;
-		holder.postItem = postItem;
+		holder.configure(postItem, configurationSet);
 		String description = postItem.getHideReason();
 		if (description == null) {
 			description = postItem.getSubjectOrComment();
@@ -249,78 +334,68 @@ public class ViewUnit {
 		holder.comment.setText(description);
 	}
 
-	public RecyclerView.ViewHolder createPostView(ViewGroup parent,
-			UiManager.ConfigurationSet configurationSet) {
-		return new PostViewHolder(parent, configurationSet, uiManager, thumbnailWidth);
-	}
-
-	public void bindPostView(RecyclerView.ViewHolder viewHolder, PostItem postItem, UiManager.DemandSet demandSet) {
+	public void bindPostView(RecyclerView.ViewHolder viewHolder,
+			PostItem postItem, UiManager.ConfigurationSet configurationSet, UiManager.DemandSet demandSet) {
 		ColorScheme colorScheme = ThemeEngine.getColorScheme(uiManager.getContext());
 		PostViewHolder holder = (PostViewHolder) viewHolder;
-		holder.notifyUnbind();
-		holder.postItem = postItem;
+		Chan chan = Chan.get(configurationSet.chanName);
+		holder.resetAnimations();
+		holder.configure(postItem, configurationSet);
+		holder.selection = demandSet.selection;
 
-		String chanName = postItem.getChanName();
 		String boardName = postItem.getBoardName();
 		String threadNumber = postItem.getThreadNumber();
-		String postNumber = postItem.getPostNumber();
+		PostNumber postNumber = postItem.getPostNumber();
 		boolean bumpLimitReached = false;
-		PostItem.BumpLimitState bumpLimitReachedState = postItem.getBumpLimitReachedState(0);
+		PostItem.BumpLimitState bumpLimitReachedState = postItem.getBumpLimitReachedState(chan, 0);
 		if (bumpLimitReachedState == PostItem.BumpLimitState.REACHED) {
 			bumpLimitReached = true;
 		} else if (bumpLimitReachedState == PostItem.BumpLimitState.NEED_COUNT &&
-				holder.configurationSet.postsProvider != null) {
+				configurationSet.postsProvider != null) {
 			int postsCount = 0;
-			for (PostItem itPostItem : holder.configurationSet.postsProvider) {
+			for (PostItem itPostItem : configurationSet.postsProvider) {
 				if (!itPostItem.isDeleted()) {
 					postsCount++;
 				}
 			}
-			bumpLimitReached = postItem.getBumpLimitReachedState(postsCount) == PostItem.BumpLimitState.REACHED;
+			bumpLimitReached = postItem.getBumpLimitReachedState(chan, postsCount) == PostItem.BumpLimitState.REACHED;
 		}
 		holder.number.setText("#" + postNumber);
-		holder.states[0] = postItem.isUserPost() && Preferences.isShowMyPosts();
-		holder.states[1] = postItem.isOriginalPoster();
-		holder.states[2] = postItem.isSage() || bumpLimitReached;
-		holder.states[3] = !StringUtils.isEmpty(postItem.getEmail());
-		holder.states[4] = postItem.isSticky();
-		holder.states[5] = postItem.isClosed();
-		holder.states[6] = postItem.isCyclical();
-		holder.states[7] = postItem.isPosterWarned();
-		holder.states[8] = postItem.isPosterBanned();
-		for (int i = 0; i < holder.stateImages.length; i++) {
-			holder.stateImages[i].setVisibility(holder.states[i] ? View.VISIBLE : View.GONE);
+		PostState.Predicate.Data stateData = new PostState.Predicate.Data(postItem, configurationSet, bumpLimitReached);
+		for (int i = 0; i < PostState.POST_ITEM_STATES.size(); i++) {
+			boolean visible = PostState.POST_ITEM_STATES.get(i).predicate.apply(stateData);
+			holder.stateImages[i].setVisibility(visible ? View.VISIBLE : View.GONE);
 		}
 		viewHolder.itemView.setAlpha(postItem.isDeleted() ? ALPHA_DELETED_POST : 1f);
 
-		CharSequence name = postItem.getFullName();
+		CharSequence name = postItem.getFullName(chan);
 		colorScheme.apply(postItem.getFullNameSpans());
 		holder.name.setText(makeHighlightedText(demandSet.highlightText, name));
 		holder.date.setText(postItem.getDateTime(postDateFormatter));
 
 		String subject = postItem.getSubject();
-		CharSequence comment = !StringUtils.isEmpty(holder.configurationSet.repliesToPost)
-				? postItem.getComment(holder.configurationSet.repliesToPost) : postItem.getComment();
+		CharSequence comment = configurationSet.repliesToPost != null
+				? postItem.getComment(chan, configurationSet.repliesToPost) : postItem.getComment(chan);
 				colorScheme.apply(postItem.getCommentSpans());
 		LinkSuffixSpan[] linkSuffixSpans = postItem.getLinkSuffixSpansAfterComment();
-		if (linkSuffixSpans != null && holder.configurationSet.userPostNumbers != null) {
+		if (linkSuffixSpans != null) {
 			boolean showMyPosts = Preferences.isShowMyPosts();
 			for (LinkSuffixSpan span : linkSuffixSpans) {
 				span.setSuffix(LinkSuffixSpan.SUFFIX_USER_POST, showMyPosts &&
-						holder.configurationSet.userPostNumbers.contains(span.getPostNumber()));
+						configurationSet.postStateProvider.isUserPost(span.getPostNumber()));
 			}
 		}
 		LinkSpan[] linkSpans = postItem.getLinkSpansAfterComment();
 		if (linkSpans != null) {
-			HashSet<String> referencesTo = postItem.getReferencesTo();
 			for (LinkSpan linkSpan : linkSpans) {
-				String linkPostNumber = linkSpan.getPostNumber();
-				if (linkPostNumber != null) {
+				if (linkSpan.postNumber != null) {
 					boolean hidden = false;
-					if (referencesTo != null && referencesTo.contains(linkPostNumber)
-							&& holder.configurationSet.postsProvider != null) {
-						PostItem linkPostItem = holder.configurationSet.postsProvider.findPostItem(linkPostNumber);
-						hidden = linkPostItem != null && linkPostItem.isHidden(holder.configurationSet.hidePerformer);
+					if (postItem.getReferencesTo().contains(linkSpan.postNumber)
+							&& configurationSet.postsProvider != null) {
+						PostItem linkPostItem = configurationSet.postsProvider.findPostItem(linkSpan.postNumber);
+						if (linkPostItem != null) {
+							hidden = configurationSet.postStateProvider.isHiddenResolve(linkPostItem);
+						}
 					}
 					linkSpan.setHidden(hidden);
 				}
@@ -329,9 +404,9 @@ public class ViewUnit {
 		holder.comment.setSpoilersEnabled(!Preferences.isShowSpoilers());
 		holder.comment.setSubjectAndComment(makeHighlightedText(demandSet.highlightText, subject),
 				makeHighlightedText(demandSet.highlightText, comment));
-		holder.comment.setReplyable(holder.configurationSet.replyable, postNumber);
-		holder.comment.setLinkListener(holder.configurationSet.linkListener != null
-				? holder.configurationSet.linkListener : defaultLinkListener, chanName, boardName, threadNumber);
+		holder.comment.setLinkListener(configurationSet.linkListener != null
+				? configurationSet.linkListener : defaultLinkListener,
+				configurationSet.chanName, boardName, threadNumber);
 		holder.comment.setVisibility(subject.length() > 0 || comment.length() > 0 ? View.VISIBLE : View.GONE);
 		holder.comment.bindSelectionPaddingView(demandSet.lastInList ? holder.textSelectionPadding : null);
 
@@ -360,9 +435,15 @@ public class ViewUnit {
 			holder.bottomBarExpand.setVisibility(View.GONE);
 			holder.bottomBarOpenThread.setVisibility(demandSet.showOpenThreadButton ? View.VISIBLE : View.GONE);
 		}
-		if (holder.configurationSet.mayCollapse && commentMaxLines > 0 && !postItem.isExpanded()) {
-			holder.comment.setLinesLimit(commentMaxLines, commentAdditionalHeight);
-		} else {
+		boolean resetLimit = true;
+		if (configurationSet.mayCollapse && !configurationSet.postStateProvider.isExpanded(postNumber)) {
+			int maxLines = Preferences.getPostMaxLines();
+			if (maxLines > 0) {
+				resetLimit = false;
+				holder.comment.setLinesLimit(maxLines, holder.dimensions.commentAdditionalHeight);
+			}
+		}
+		if (resetLimit) {
 			holder.comment.setLinesLimit(0, 0);
 		}
 		holder.bottomBarExpand.setVisibility(View.GONE);
@@ -378,27 +459,7 @@ public class ViewUnit {
 		holder.bottomBarExpand.setClickable(viewsEnabled);
 		holder.bottomBarOpenThread.setEnabled(viewsEnabled);
 		holder.bottomBarOpenThread.setClickable(viewsEnabled);
-		if (viewsEnabled && postItem.isUnread()) {
-			switch (Preferences.getHighlightUnreadMode()) {
-				case Preferences.HIGHLIGHT_UNREAD_AUTOMATICALLY: {
-					holder.newPostAnimation = new NewPostAnimation(holder.layout, postItem,
-							colorScheme.highlightBackgroundColor);
-					break;
-				}
-				case Preferences.HIGHLIGHT_UNREAD_MANUALLY: {
-					holder.layout.setSecondaryBackgroundColor(colorScheme.highlightBackgroundColor);
-					break;
-				}
-				default: {
-					holder.layout.setSecondaryBackground(null);
-					break;
-				}
-			}
-		} else if (demandSet.selection == UiManager.Selection.SELECTED) {
-			holder.layout.setSecondaryBackgroundColor(colorScheme.highlightBackgroundColor);
-		} else {
-			holder.layout.setSecondaryBackground(null);
-		}
+		holder.installBackground();
 	}
 
 	public void bindPostViewInvalidateComment(RecyclerView.ViewHolder viewHolder) {
@@ -406,14 +467,30 @@ public class ViewUnit {
 		holder.comment.invalidateAllSpans();
 	}
 
-	public RecyclerView.ViewHolder createPostHiddenView(ViewGroup parent,
-			UiManager.ConfigurationSet configurationSet) {
-		return new HiddenViewHolder(parent, configurationSet, false);
+	public void bindPostViewReloadAttachment(RecyclerView.ViewHolder viewHolder, AttachmentItem attachmentItem) {
+		PostViewHolder holder = (PostViewHolder) viewHolder;
+		List<AttachmentItem> attachmentItems = holder.getPostItem().getAttachmentItems();
+		AttachmentView attachmentView = null;
+		if (attachmentItems != null) {
+			int index = attachmentItems.indexOf(attachmentItem);
+			if (index >= 0) {
+				if (holder.attachmentViewCount >= 2) {
+					attachmentView = holder.attachmentHolders.get(index).thumbnail;
+				} else {
+					attachmentView = holder.thumbnail;
+				}
+			}
+		}
+		if (attachmentView != null) {
+			Chan chan = Chan.get(holder.getConfigurationSet().chanName);
+			attachmentItem.startLoad(attachmentView, chan, true);
+		}
 	}
 
-	public void bindPostHiddenView(RecyclerView.ViewHolder viewHolder, PostItem postItem) {
+	public void bindPostHiddenView(RecyclerView.ViewHolder viewHolder,
+			PostItem postItem, UiManager.ConfigurationSet configurationSet) {
 		HiddenViewHolder holder = (HiddenViewHolder) viewHolder;
-		holder.postItem = postItem;
+		holder.configure(postItem, configurationSet);
 		holder.index.setText(postItem.getOrdinalIndexString());
 		holder.number.setText("#" + postItem.getPostNumber());
 		String description = postItem.getHideReason();
@@ -421,18 +498,20 @@ public class ViewUnit {
 			description = postItem.getSubjectOrComment();
 		}
 		holder.comment.setText(description);
-		postItem.setUnread(false);
+		configurationSet.postStateProvider.setRead(postItem.getPostNumber());
 	}
 
-	private static int getPostBackgroundColor(UiManager uiManager, UiManager.ConfigurationSet configurationSet) {
-		ColorScheme colorScheme = ThemeEngine.getColorScheme(uiManager.getContext());
+	private static int getPostBackgroundColor(Context context, UiManager.ConfigurationSet configurationSet) {
+		ColorScheme colorScheme = ThemeEngine.getColorScheme(context);
 		return configurationSet.isDialog ? colorScheme.dialogBackgroundColor : colorScheme.windowBackgroundColor;
 	}
 
 	@SuppressLint("InflateParams")
 	private void handlePostViewAttachments(PostViewHolder holder) {
+		PostItem postItem = holder.getPostItem();
+		UiManager.ConfigurationSet configurationSet = holder.getConfigurationSet();
 		Context context = uiManager.getContext();
-		PostItem postItem = holder.postItem;
+		Chan chan = Chan.get(configurationSet.chanName);
 		List<AttachmentItem> attachmentItems = postItem.getAttachmentItems();
 		if (attachmentItems != null && !attachmentItems.isEmpty()) {
 			int size = attachmentItems.size();
@@ -447,9 +526,9 @@ public class ViewUnit {
 				}
 				int holders = attachmentHolders.size();
 				if (holders < size) {
-					int postBackgroundColor = getPostBackgroundColor(uiManager, holder.configurationSet);
-					int thumbnailsScale = Preferences.getThumbnailsScale();
-					int textScale = Preferences.getTextScale();
+					int postBackgroundColor = getPostBackgroundColor(uiManager.getContext(), configurationSet);
+					float thumbnailsScale = Preferences.getThumbnailsScale();
+					float textScale = Preferences.getTextScale();
 					for (int i = holders; i < size; i++) {
 						View view = LayoutInflater.from(context).inflate(R.layout.list_item_post_attachment, null);
 						AttachmentHolder attachmentHolder = new AttachmentHolder();
@@ -460,17 +539,18 @@ public class ViewUnit {
 						attachmentHolder.thumbnail.applyRoundedCorners(postBackgroundColor);
 						attachmentHolder.thumbnail.setOnClickListener(attachmentHolder.thumbnailClickListener);
 						attachmentHolder.thumbnail.setOnLongClickListener(attachmentHolder.thumbnailLongClickListener);
-						attachmentHolder.attachmentInfo.getLayoutParams().width = multipleAttachmentInfoWidth;
+						attachmentHolder.attachmentInfo.getLayoutParams().width =
+								holder.dimensions.multipleAttachmentInfoWidth;
 						ViewGroup.LayoutParams thumbnailLayoutParams = attachmentHolder.thumbnail.getLayoutParams();
-						if (thumbnailsScale != 100) {
-							thumbnailLayoutParams.width = thumbnailWidth * thumbnailsScale / 100;
+						if (thumbnailsScale != 1f) {
+							thumbnailLayoutParams.width = (int) (holder.dimensions.thumbnailWidth * thumbnailsScale);
 							thumbnailLayoutParams.height = thumbnailLayoutParams.width;
 						} else {
-							thumbnailLayoutParams.width = thumbnailWidth;
-							thumbnailLayoutParams.height = thumbnailWidth;
+							thumbnailLayoutParams.width = holder.dimensions.thumbnailWidth;
+							thumbnailLayoutParams.height = holder.dimensions.thumbnailWidth;
 						}
-						if (textScale != 100) {
-							ViewUtils.applyScaleSize(attachmentHolder.attachmentInfo);
+						if (textScale != 1f) {
+							ViewUtils.applyScaleSize(textScale, attachmentHolder.attachmentInfo);
 						}
 						attachmentHolders.add(attachmentHolder);
 						holder.attachments.addView(view);
@@ -480,8 +560,8 @@ public class ViewUnit {
 				for (int i = 0; i < size; i++) {
 					AttachmentHolder attachmentHolder = attachmentHolders.get(i);
 					AttachmentItem attachmentItem = attachmentItems.get(i);
-					attachmentItem.configureAndLoad(attachmentHolder.thumbnail, false, false);
-					attachmentHolder.thumbnailClickListener.update(i, false, holder.configurationSet.isDialog
+					attachmentItem.configureAndLoad(attachmentHolder.thumbnail, chan, false, false);
+					attachmentHolder.thumbnailClickListener.update(i, false, configurationSet.isDialog
 							? GalleryOverlay.NavigatePostMode.MANUALLY : GalleryOverlay.NavigatePostMode.ENABLED);
 					attachmentHolder.thumbnailLongClickListener.update(attachmentItem);
 					attachmentHolder.thumbnail.setSfwMode(sfwMode);
@@ -499,13 +579,13 @@ public class ViewUnit {
 				holder.attachmentViewCount = size;
 			} else {
 				AttachmentItem attachmentItem = attachmentItems.get(0);
-				attachmentItem.configureAndLoad(holder.thumbnail, size > 1, false);
-				holder.thumbnailClickListener.update(0, true, holder.configurationSet.isDialog
+				attachmentItem.configureAndLoad(holder.thumbnail, chan, size > 1, false);
+				holder.thumbnailClickListener.update(0, true, configurationSet.isDialog
 						? GalleryOverlay.NavigatePostMode.MANUALLY : GalleryOverlay.NavigatePostMode.ENABLED);
 				holder.thumbnailLongClickListener.update(attachmentItem);
 				holder.thumbnail.setSfwMode(Preferences.isSfwMode());
 				holder.thumbnail.setVisibility(View.VISIBLE);
-				holder.attachmentInfo.setText(postItem.getAttachmentsDescription(context,
+				holder.attachmentInfo.setText(postItem.getAttachmentsDescription(context.getResources(),
 						AttachmentItem.FormatMode.LONG));
 				holder.attachmentInfo.setVisibility(View.VISIBLE);
 				holder.attachments.setVisibility(View.GONE);
@@ -522,11 +602,12 @@ public class ViewUnit {
 	}
 
 	private void handlePostViewIcons(PostViewHolder holder) {
+		PostItem postItem = holder.getPostItem();
+		UiManager.ConfigurationSet configurationSet = holder.getConfigurationSet();
 		Context context = uiManager.getContext();
-		PostItem postItem = holder.postItem;
-		String chanName = postItem.getChanName();
-		List<Pair<Uri, String>> icons = postItem.getIcons();
-		if (icons != null && Preferences.isDisplayIcons()) {
+		Chan chan = Chan.get(configurationSet.chanName);
+		List<Post.Icon> icons = postItem.getIcons();
+		if (!icons.isEmpty() && Preferences.isDisplayIcons()) {
 			if (holder.badgeImages == null) {
 				holder.badgeImages = new ArrayList<>();
 			}
@@ -538,22 +619,24 @@ public class ViewUnit {
 				int anchorIndex = holder.head.indexOfChild(anchorView) + 1;
 				float density = ResourceUtils.obtainDensity(context);
 				int size = (int) (12f * density);
+				float textScale = Preferences.getTextScale();
 				for (int i = 0; i < add; i++) {
 					ImageView imageView = new ImageView(context);
 					holder.head.addView(imageView, anchorIndex + i, new ViewGroup.LayoutParams(size, size));
-					ViewUtils.applyScaleSize(imageView);
+					if (textScale != 1f) {
+						ViewUtils.applyScaleSize(textScale, imageView);
+					}
 					holder.badgeImages.add(imageView);
 				}
 			}
-			ChanLocator locator = ChanLocator.get(chanName);
 			for (int i = 0; i < holder.badgeImages.size(); i++) {
 				ImageView imageView = holder.badgeImages.get(i);
 				if (i < icons.size()) {
 					imageView.setVisibility(View.VISIBLE);
-					Uri uri = icons.get(i).first;
+					Uri uri = icons.get(i).uri;
 					if (uri != null) {
-						uri = uri.isRelative() ? locator.convert(uri) : uri;
-						ImageLoader.getInstance().loadImage(chanName, uri, false, imageView);
+						uri = uri.isRelative() ? chan.locator.convert(uri) : uri;
+						ImageLoader.getInstance().loadImage(chan, uri, false, imageView);
 					} else {
 						ImageLoader.getInstance().cancel(imageView);
 						imageView.setTag(null);
@@ -589,31 +672,6 @@ public class ViewUnit {
 			}
 		}
 		return text;
-	}
-
-	public void notifyUnbindListView(RecyclerView recyclerView) {
-		for (int i = 0; i < recyclerView.getChildCount(); i++) {
-			RecyclerView.ViewHolder holder = recyclerView.getChildViewHolder(recyclerView.getChildAt(i));
-			notifyUnbindView(holder);
-		}
-	}
-
-	public void notifyUnbindView(RecyclerView.ViewHolder holder) {
-		if (holder instanceof PostViewHolder) {
-			((PostViewHolder) holder).notifyUnbind();
-		}
-	}
-
-	public int findImageIndex(ArrayList<GalleryItem> galleryItems, PostItem postItem) {
-		if (galleryItems != null && postItem.hasAttachments()) {
-			String postNumber = postItem.getPostNumber();
-			for (int i = 0; i < galleryItems.size(); i++) {
-				if (postNumber.equals(galleryItems.get(i).postNumber)) {
-					return i;
-				}
-			}
-		}
-		return -1;
 	}
 
 	boolean handlePostForDoubleClick(final View view) {
@@ -658,8 +716,7 @@ public class ViewUnit {
 		@Override
 		public void onClick(View v) {
 			PostViewHolder holder = ListViewUtils.getViewHolder(v, PostViewHolder.class);
-			PostItem postItem = holder.postItem;
-			uiManager.dialog().displayReplies(holder.configurationSet, postItem);
+			uiManager.dialog().displayReplies(holder.getConfigurationSet(), holder.getPostItem());
 		}
 	};
 
@@ -667,10 +724,10 @@ public class ViewUnit {
 		@Override
 		public void onClick(View v) {
 			PostViewHolder holder = ListViewUtils.getViewHolder(v, PostViewHolder.class);
-			PostItem postItem = holder.postItem;
-			String postNumber = postItem.getParentPostNumber() == null ? null : postItem.getPostNumber();
-			uiManager.navigator().navigatePosts(postItem.getChanName(), postItem.getBoardName(),
-					postItem.getThreadNumber(), postNumber, null, 0);
+			PostItem postItem = holder.getPostItem();
+			PostNumber postNumber = postItem.isOriginalPost() ? null : postItem.getPostNumber();
+			uiManager.navigator().navigatePosts(holder.getConfigurationSet().chanName, postItem.getBoardName(),
+					postItem.getThreadNumber(), postNumber, null);
 		}
 	};
 
@@ -731,6 +788,8 @@ public class ViewUnit {
 					if (type != TYPE_NONE) {
 						Context context = uiManager.getContext();
 						PostViewHolder holder = ListViewUtils.getViewHolder(v, PostViewHolder.class);
+						PostItem postItem = holder.getPostItem();
+						UiManager.ConfigurationSet configurationSet = holder.getConfigurationSet();
 						int touchSlop = ViewConfiguration.get(context).getScaledTouchSlop();
 						if (Math.abs(event.getX() - startX) <= touchSlop &&
 								Math.abs(event.getY() - startY) <= touchSlop) {
@@ -738,39 +797,31 @@ public class ViewUnit {
 							String emailToCopy = null;
 							switch (type) {
 								case TYPE_BADGES: {
-									List<Pair<Uri, String>> postIcons = holder.postItem.getIcons();
-									ChanLocator locator = ChanLocator.get(holder.postItem.getChanName());
-									for (Pair<Uri, String> postIcon : postIcons) {
-										Uri uri = postIcon.first;
+									Chan chan = Chan.get(configurationSet.chanName);
+									List<Post.Icon> postIcons = postItem.getIcons();
+									for (Post.Icon postIcon : postIcons) {
+										Uri uri = postIcon.uri;
 										if (uri != null) {
-											uri = uri.isRelative() ? locator.convert(uri) : uri;
+											uri = uri.isRelative() ? chan.locator.convert(uri) : uri;
 										}
-										icons.add(new DialogUnit.IconData(postIcon.second, uri));
+										icons.add(new DialogUnit.IconData(postIcon.title, uri));
 									}
 									break;
 								}
 								case TYPE_STATES: {
-									for (int i = 0; i < holder.states.length; i++) {
-										if (holder.states[i]) {
-											int attr = STATE_ATTRS[i];
-											String title;
-											if (attr == R.attr.iconPostEmail) {
-												title = holder.postItem.getEmail();
-												if (title.startsWith("mailto:")) {
-													title = title.substring(7);
-												}
-												emailToCopy = title;
-											} else {
-												title = context.getString(STATE_TEXTS.get(attr));
-											}
-											icons.add(new DialogUnit.IconData(title, attr));
+									for (int i = 0; i < PostState.POST_ITEM_STATES.size(); i++) {
+										if (holder.stateImages[i].getVisibility() == View.VISIBLE) {
+											PostState postState = PostState.POST_ITEM_STATES.get(i);
+											String title = postState.titleProvider
+													.get(uiManager.getContext(), postItem);
+											icons.add(new DialogUnit.IconData(title, postState.iconAttrResId));
 										}
 									}
 									break;
 								}
 							}
-							uiManager.dialog().showPostDescriptionDialog(icons,
-									holder.postItem.getChanName(), emailToCopy);
+							uiManager.dialog().showPostDescriptionDialog(configurationSet.fragmentManager,
+									icons, configurationSet.chanName, emailToCopy);
 						}
 						return true;
 					}
@@ -781,21 +832,68 @@ public class ViewUnit {
 		}
 	};
 
-	private static final int[] STATE_ATTRS = {R.attr.iconPostUserPost, R.attr.iconPostOriginalPoster,
-			R.attr.iconPostSage, R.attr.iconPostEmail, R.attr.iconPostSticky, R.attr.iconPostClosed,
-			R.attr.iconPostCyclical, R.attr.iconPostWarned, R.attr.iconPostBanned};
+	private enum PostState {
+		USER_POST(R.attr.iconPostUserPost, R.string.my_post,
+				data -> Preferences.isShowMyPosts() && data.configurationSet.postStateProvider
+						.isUserPost(data.postItem.getPostNumber())),
+		ORIGINAL_POSTER(R.attr.iconPostOriginalPoster, R.string.original_poster,
+				data -> data.postItem.isOriginalPoster()),
+		SAGE(R.attr.iconPostSage, R.string.doesnt_bring_up_thread,
+				data -> data.postItem.isSage() || data.bumpLimitReached),
+		EMAIL(R.attr.iconPostEmail,
+				(context, postItem) -> {
+					String email = postItem.getEmail();
+					if (email != null && email.startsWith("mailto:")) {
+						email = email.substring(7);
+					}
+					return email;
+				},
+				data -> !StringUtils.isEmpty(data.postItem.getEmail())),
+		STICKY(R.attr.iconPostSticky, R.string.sticky_thread, data -> data.postItem.isSticky()),
+		CLOSED(R.attr.iconPostClosed, R.string.thread_is_closed, data -> data.postItem.isClosed()),
+		CYCLICAL(R.attr.iconPostCyclical, R.string.cyclical_thread, data -> data.postItem.isCyclical()),
+		WARNED(R.attr.iconPostWarned, R.string.user_is_warned, data -> data.postItem.isPosterWarned()),
+		BANNED(R.attr.iconPostBanned, R.string.user_is_banned, data -> data.postItem.isPosterBanned());
 
-	private static final SparseIntArray STATE_TEXTS = new SparseIntArray();
+		public interface TitleProvider {
+			String get(Context context, PostItem postItem);
+		}
 
-	static {
-		STATE_TEXTS.put(R.attr.iconPostUserPost, R.string.my_post);
-		STATE_TEXTS.put(R.attr.iconPostOriginalPoster, R.string.original_poster);
-		STATE_TEXTS.put(R.attr.iconPostSage, R.string.doesnt_bring_up_thread);
-		STATE_TEXTS.put(R.attr.iconPostSticky, R.string.sticky_thread);
-		STATE_TEXTS.put(R.attr.iconPostClosed, R.string.thread_is_closed);
-		STATE_TEXTS.put(R.attr.iconPostCyclical, R.string.cyclical_thread);
-		STATE_TEXTS.put(R.attr.iconPostWarned, R.string.user_is_warned);
-		STATE_TEXTS.put(R.attr.iconPostBanned, R.string.user_is_banned);
+		public interface Predicate {
+			class Data {
+				public final PostItem postItem;
+				public final UiManager.ConfigurationSet configurationSet;
+				public final boolean bumpLimitReached;
+
+				public Data(PostItem postItem, UiManager.ConfigurationSet configurationSet, boolean bumpLimitReached) {
+					this.postItem = postItem;
+					this.configurationSet = configurationSet;
+					this.bumpLimitReached = bumpLimitReached;
+				}
+			}
+
+			boolean apply(Data data);
+		}
+
+		public static final List<PostState> POST_ITEM_STATES = Arrays
+				.asList(USER_POST, ORIGINAL_POSTER, SAGE, EMAIL, STICKY, CLOSED, CYCLICAL, WARNED, BANNED);
+
+		public static final List<PostState> THREAD_ITEM_STATES = Arrays
+				.asList(SAGE, STICKY, CLOSED, CYCLICAL);
+
+		public final int iconAttrResId;
+		public final TitleProvider titleProvider;
+		public final Predicate predicate;
+
+		PostState(int iconAttrResId, int titleResId, Predicate predicate) {
+			this(iconAttrResId, (c, p) -> c.getString(titleResId), predicate);
+		}
+
+		PostState(int iconAttrResId, TitleProvider titleProvider, Predicate predicate) {
+			this.iconAttrResId = iconAttrResId;
+			this.titleProvider = titleProvider;
+			this.predicate = predicate;
+		}
 	}
 
 	private class AttachmentHolder {
@@ -824,69 +922,159 @@ public class ViewUnit {
 		return cardView;
 	}
 
-	private static class ThreadViewHolder extends RecyclerView.ViewHolder implements UiManager.Holder {
+	private static void fillStateImages(ViewGroup parent, int anchorIndex,
+			ImageView[] images, List<PostState> states, float topDp, float startDp, float endDp) {
+		float density = ResourceUtils.obtainDensity(parent);
+		int size = (int) (12f * density + 0.5f);
+		int top = (int) (topDp * density + 0.5f);
+		int start = (int) (startDp * density + 0.5f);
+		int end = (int) (endDp * density + 0.5f);
+		boolean rtl = ViewCompat.getLayoutDirection(parent) == ViewCompat.LAYOUT_DIRECTION_RTL;
+		int left = rtl ? end : start;
+		int right = rtl ? start : end;
+		int[] attrs = new int[states.size()];
+		for (int i = 0; i < attrs.length; i++) {
+			attrs[i] = states.get(i).iconAttrResId;
+		}
+		TypedArray typedArray = parent.getContext().obtainStyledAttributes(attrs);
+		for (int i = 0; i < images.length; i++) {
+			ImageView imageView = new ImageView(parent.getContext());
+			imageView.setImageDrawable(typedArray.getDrawable(i));
+			parent.addView(imageView, anchorIndex + i, new ViewGroup.LayoutParams(size, size));
+			ViewGroup.LayoutParams layoutParams = imageView.getLayoutParams();
+			if (layoutParams instanceof ViewGroup.MarginLayoutParams) {
+				ViewGroup.MarginLayoutParams marginLayoutParams = (ViewGroup.MarginLayoutParams) layoutParams;
+				marginLayoutParams.topMargin = top;
+				marginLayoutParams.leftMargin = left;
+				marginLayoutParams.rightMargin = right;
+			}
+			images[i] = imageView;
+		}
+		typedArray.recycle();
+		if (C.API_LOLLIPOP && images.length > 0) {
+			ColorStateList tint = ColorStateList.valueOf(ThemeEngine.getTheme(images[0].getContext()).meta);
+			for (ImageView image : images) {
+				image.setImageTintList(tint);
+			}
+		}
+	}
+
+	private static class Lazy<T> {
+		public interface Provider<T> {
+			T createLazy();
+		}
+
+		private T data;
+
+		public T get(Provider<T> provider) {
+			if (data == null) {
+				data = provider.createLazy();
+			}
+			return data;
+		}
+	}
+
+	private static class BasePostViewHolder extends RecyclerView.ViewHolder
+			implements UiManager.Holder, ListViewUtils.ClickCallback<Void, BasePostViewHolder> {
+		private WeakReference<PostItem> postItem;
+		private WeakReference<UiManager.ConfigurationSet> configurationSet;
+
+		public BasePostViewHolder(View itemView) {
+			super(itemView);
+		}
+
+		protected void onConfigure(PostItem postItem, UiManager.ConfigurationSet configurationSet) {}
+
+		public final void configure(PostItem postItem, UiManager.ConfigurationSet configurationSet) {
+			this.postItem = new WeakReference<>(postItem);
+			this.configurationSet = new WeakReference<>(configurationSet);
+			onConfigure(postItem, configurationSet);
+		}
+
+		@Override
+		public final PostItem getPostItem() {
+			return Objects.requireNonNull(postItem.get());
+		}
+
+		@Override
+		public final UiManager.ConfigurationSet getConfigurationSet() {
+			return Objects.requireNonNull(configurationSet.get());
+		}
+
+		@Override
+		public final boolean onItemClick(BasePostViewHolder holder, int position, Void item, boolean longClick) {
+			return getConfigurationSet().clickCallback.onItemClick(holder, position, getPostItem(), longClick);
+		}
+	}
+
+	private static class ThreadViewHolder extends BasePostViewHolder {
+		private final CardView cardView;
 		public final AttachmentView thumbnail;
 		public final TextView subject;
 		public final TextView comment;
-		public final TextView description;
-		public final ImageView stateSage;
-		public final ImageView stateSticky;
-		public final ImageView stateClosed;
+		public final ThreadDescriptionView description;
+		public final ImageView[] stateImages;
 		public final View threadContent;
 		public final View showOriginalPost;
 
-		public final UiManager.ConfigurationSet configurationSet;
 		public final UiManager.ThumbnailClickListener thumbnailClickListener;
 		public final UiManager.ThumbnailLongClickListener thumbnailLongClickListener;
 
-		public PostItem postItem;
+		public ThreadViewHolder(ViewGroup parent, UiManager uiManager, ThreadViewType threadViewType) {
+			super(threadViewType != ThreadViewType.LIST ? createCardLayout(parent)
+					: LayoutInflater.from(parent.getContext()).inflate(R.layout.list_item_thread, parent, false));
 
-		public ThreadViewHolder(ViewGroup parent, UiManager.ConfigurationSet configurationSet,
-				UiManager uiManager, boolean cell) {
-			super(createCardLayout(parent));
-
-			CardView cardView = (CardView) itemView;
-			ViewGroup cardContent = (ViewGroup) cardView.getChildAt(0);
-			LayoutInflater inflater = LayoutInflater.from(itemView.getContext());
-			inflater.inflate(cell ? R.layout.list_item_thread_grid : R.layout.list_item_thread, cardContent);
+			if (threadViewType != ThreadViewType.LIST) {
+				cardView = (CardView) itemView;
+				ViewGroup cardContent = (ViewGroup) cardView.getChildAt(0);
+				LayoutInflater inflater = LayoutInflater.from(itemView.getContext());
+				inflater.inflate(threadViewType == ThreadViewType.CELL ? R.layout.list_item_thread_cell
+						: R.layout.list_item_thread_card, cardContent);
+				ListViewUtils.bind(this, cardContent, true, null, this);
+			} else {
+				cardView = null;
+				ViewUtils.setSelectableItemBackground(itemView);
+				ListViewUtils.bind(this, itemView, true, null, this);
+			}
 
 			thumbnail = itemView.findViewById(R.id.thumbnail);
 			subject = itemView.findViewById(R.id.subject);
 			comment = itemView.findViewById(R.id.comment);
 			description = itemView.findViewById(R.id.thread_description);
-			stateSage = itemView.findViewById(R.id.state_sage);
-			stateSticky = itemView.findViewById(R.id.state_sticky);
-			stateClosed = itemView.findViewById(R.id.state_closed);
 			threadContent = itemView.findViewById(R.id.thread_content);
-			showOriginalPost = itemView.findViewById(R.id.show_original_post);
-			(cell ? description : showOriginalPost).setOnClickListener(uiManager.view()
-					.threadShowOriginalPostClickListener);
+			ViewGroup showOriginalPost = itemView.findViewById(R.id.show_original_post);
+			this.showOriginalPost = showOriginalPost;
+			(threadViewType == ThreadViewType.CELL ? description : showOriginalPost)
+					.setOnClickListener(uiManager.view().threadShowOriginalPostClickListener);
 
-			this.configurationSet = configurationSet;
 			thumbnailClickListener = uiManager.interaction().createThumbnailClickListener();
 			thumbnailLongClickListener = uiManager.interaction().createThumbnailLongClickListener();
 
+			float density = ResourceUtils.obtainDensity(itemView);
+			float textScale = Preferences.getTextScale();
+			int descriptionSpacingDp = 8;
 			thumbnail.setDrawTouching(true);
-			if (cell) {
+			description.setTextColor(ThemeEngine.getTheme(description.getContext()).meta);
+			description.setTextSizeSp(11f * textScale);
+			description.setSpacing((int) (descriptionSpacingDp * density));
+			if (threadViewType == ThreadViewType.CELL) {
 				thumbnail.setFitSquare(true);
-				thumbnail.applyRoundedCorners(cardView.getBackgroundColor());
-				ViewUtils.applyScaleSize(comment, subject, description);
+				ViewUtils.applyScaleSize(textScale, comment, subject);
+				stateImages = null;
+				description.setToEnd(true);
 			} else {
-				if (C.API_LOLLIPOP) {
-					ColorStateList colors = ColorStateList.valueOf(ThemeEngine
-							.getTheme(itemView.getContext()).meta);
-					for (ImageView imageView : Arrays.asList(stateSage, stateSticky, stateClosed)) {
-						imageView.setImageTintList(colors);
-					}
-				}
-				thumbnail.applyRoundedCorners(cardView.getBackgroundColor());
+				stateImages = new ImageView[PostState.THREAD_ITEM_STATES.size()];
+				fillStateImages(showOriginalPost, threadViewType == ThreadViewType.CARD ? 1 : 0,
+						stateImages, PostState.THREAD_ITEM_STATES, 0.5f,
+						threadViewType == ThreadViewType.CARD ? descriptionSpacingDp : 0,
+						threadViewType == ThreadViewType.CARD ? 0 : descriptionSpacingDp);
 				ViewGroup.MarginLayoutParams thumbnailLayoutParams =
 						(ViewGroup.MarginLayoutParams) thumbnail.getLayoutParams();
-				ViewUtils.applyScaleSize(comment, subject, description,
-						stateSage, stateSticky, stateClosed);
-				if (ResourceUtils.isTablet(itemView.getResources().getConfiguration())) {
-					float density = ResourceUtils.obtainDensity(itemView);
-					description.setGravity(Gravity.START);
+				ViewUtils.applyScaleSize(textScale, comment, subject);
+				ViewUtils.applyScaleSize(textScale, stateImages);
+				if (ResourceUtils.isTablet(itemView.getResources().getConfiguration()) &&
+						threadViewType == ThreadViewType.CARD) {
+					description.setToEnd(false);
 					int thumbnailSize = (int) (72f * density);
 					thumbnailLayoutParams.width = thumbnailSize;
 					thumbnailLayoutParams.height = thumbnailSize;
@@ -896,42 +1084,39 @@ public class ViewUnit {
 							description.getPaddingRight(), description.getPaddingBottom());
 					comment.setMaxLines(8);
 				} else {
-					description.setGravity(Gravity.END);
+					description.setToEnd(threadViewType != ThreadViewType.LIST);
 					comment.setMaxLines(6);
 				}
-				int thumbnailsScale = Preferences.getThumbnailsScale();
-				thumbnailLayoutParams.width = thumbnailLayoutParams.width * thumbnailsScale / 100;
-				thumbnailLayoutParams.height = thumbnailLayoutParams.height * thumbnailsScale / 100;
+				float thumbnailsScale = Preferences.getThumbnailsScale();
+				if (thumbnailsScale != 1f) {
+					thumbnailLayoutParams.width = (int) (thumbnailLayoutParams.width * thumbnailsScale);
+					thumbnailLayoutParams.height = (int) (thumbnailLayoutParams.height * thumbnailsScale);
+				}
 			}
 		}
 
 		@Override
-		public PostItem getPostItem() {
-			return postItem;
-		}
-
-		@Override
-		public UiManager.ConfigurationSet getConfigurationSet() {
-			return configurationSet;
-		}
-
-		@Override
-		public GalleryItem.GallerySet getGallerySet() {
-			return postItem.getThreadGallerySet();
+		protected void onConfigure(PostItem postItem, UiManager.ConfigurationSet configurationSet) {
+			int thumbnailBackground = cardView != null ? cardView.getBackgroundColor()
+					: getPostBackgroundColor(itemView.getContext(), configurationSet);
+			thumbnail.applyRoundedCorners(thumbnailBackground);
 		}
 	}
 
 	private static class NewPostAnimation implements Runnable, ValueAnimator.AnimatorUpdateListener {
 		private final PostLinearLayout layout;
-		private final PostItem postItem;
+		private final UiManager.PostStateProvider postStateProvider;
+		private final PostNumber postNumber;
 		private final ColorDrawable drawable;
 
 		private ValueAnimator animator;
 		private boolean applied = false;
 
-		public NewPostAnimation(PostLinearLayout layout, PostItem postItem, int color) {
+		public NewPostAnimation(PostLinearLayout layout, UiManager.PostStateProvider postStateProvider,
+				PostNumber postNumber, int color) {
 			this.layout = layout;
-			this.postItem = postItem;
+			this.postStateProvider = postStateProvider;
+			this.postNumber = postNumber;
 			drawable = new ColorDrawable(color);
 			layout.setSecondaryBackground(drawable);
 			layout.postDelayed(this, 500);
@@ -950,7 +1135,7 @@ public class ViewUnit {
 		public void onAnimationUpdate(ValueAnimator animation) {
 			if (!applied) {
 				applied = true;
-				postItem.setUnread(false);
+				postStateProvider.setRead(postNumber);
 			}
 			drawable.setColor((int) animation.getAnimatedValue());
 		}
@@ -964,9 +1149,22 @@ public class ViewUnit {
 		}
 	}
 
-	private static class PostViewHolder extends RecyclerView.ViewHolder implements UiManager.Holder,
-			CommentTextView.RecyclerKeeper.Holder, PostLinearLayout.OnTemporaryDetachListener,
-			CommentTextView.LimitListener, View.OnClickListener {
+	private static class PostViewHolder extends BasePostViewHolder implements
+			Lazy.Provider<PostViewHolder.Dimensions>, CommentTextView.RecyclerKeeper.Holder,
+			View.OnAttachStateChangeListener, CommentTextView.LimitListener, View.OnClickListener {
+		public static class Dimensions {
+			public final int thumbnailWidth;
+			public final int multipleAttachmentInfoWidth;
+			public final int commentAdditionalHeight;
+
+			public Dimensions(int thumbnailWidth, int multipleAttachmentInfoWidth, int commentAdditionalHeight) {
+				this.thumbnailWidth = thumbnailWidth;
+				this.multipleAttachmentInfoWidth = multipleAttachmentInfoWidth;
+				this.commentAdditionalHeight = commentAdditionalHeight;
+			}
+		}
+
+		public final Dimensions dimensions;
 		public final PostLinearLayout layout;
 		public final LinebreakLayout head;
 		public final TextView number;
@@ -987,45 +1185,29 @@ public class ViewUnit {
 		public ArrayList<AttachmentHolder> attachmentHolders;
 		public int attachmentViewCount = 1;
 		public ArrayList<ImageView> badgeImages;
-		public final ImageView[] stateImages = new ImageView[STATE_ATTRS.length];
-		public final boolean[] states = new boolean[STATE_ATTRS.length];
+		public final ImageView[] stateImages = new ImageView[PostState.POST_ITEM_STATES.size()];
+		public final int highlightBackgroundColor;
 
-		public final UiManager.ConfigurationSet configurationSet;
 		public final UiManager.ThumbnailClickListener thumbnailClickListener;
 		public final UiManager.ThumbnailLongClickListener thumbnailLongClickListener;
 
-		public PostItem postItem;
+		public UiManager.Selection selection;
 		public Animator expandAnimator;
 		public NewPostAnimation newPostAnimation;
 		public long lastCommentClick;
 
-		public PostViewHolder(ViewGroup parent, UiManager.ConfigurationSet configurationSet,
-				UiManager uiManager, int thumbnailWidth) {
+		public PostViewHolder(ViewGroup parent, UiManager uiManager, Lazy<Dimensions> dimensions) {
 			super(LayoutInflater.from(parent.getContext()).inflate(R.layout.list_item_post, parent, false));
 
 			layout = (PostLinearLayout) itemView;
-			layout.setOnTemporaryDetachListener(this);
+			layout.addOnAttachStateChangeListener(this);
 			ViewUtils.setSelectableItemBackground(layout);
 			head = itemView.findViewById(R.id.head);
 			number = itemView.findViewById(R.id.number);
 			name = itemView.findViewById(R.id.name);
 			index = itemView.findViewById(R.id.index);
 			date = itemView.findViewById(R.id.date);
-			int anchorIndex = head.indexOfChild(number) + 1;
-			float density = ResourceUtils.obtainDensity(parent);
-			int size = (int) (12f * density);
-			TypedArray typedArray = parent.getContext().obtainStyledAttributes(STATE_ATTRS);
-			for (int i = 0; i < stateImages.length; i++) {
-				ImageView imageView = new ImageView(parent.getContext());
-				imageView.setImageDrawable(typedArray.getDrawable(i));
-				head.addView(imageView, anchorIndex + i, new ViewGroup.LayoutParams(size, size));
-				stateImages[i] = imageView;
-				if (C.API_LOLLIPOP) {
-					imageView.setImageTintList(ColorStateList.valueOf(ThemeEngine
-							.getTheme(imageView.getContext()).meta));
-				}
-			}
-			typedArray.recycle();
+			fillStateImages(head, head.indexOfChild(number) + 1, stateImages, PostState.POST_ITEM_STATES, 0, 0, 0);
 			attachments = itemView.findViewById(R.id.attachments);
 			thumbnail = itemView.findViewById(R.id.thumbnail);
 			attachmentInfo = itemView.findViewById(R.id.attachment_info);
@@ -1036,42 +1218,113 @@ public class ViewUnit {
 			bottomBarReplies = itemView.findViewById(R.id.bottom_bar_replies);
 			bottomBarExpand = itemView.findViewById(R.id.bottom_bar_expand);
 			bottomBarOpenThread = itemView.findViewById(R.id.bottom_bar_open_thread);
+			highlightBackgroundColor = ThemeEngine.getColorScheme(itemView.getContext()).highlightBackgroundColor;
 
-			this.configurationSet = configurationSet;
 			thumbnailClickListener = uiManager.interaction().createThumbnailClickListener();
 			thumbnailLongClickListener = uiManager.interaction().createThumbnailLongClickListener();
+			ListViewUtils.bind(this, itemView, true, null, this);
 
 			head.setOnTouchListener(uiManager.view().headContentTouchListener);
 			comment.setLimitListener(this);
-			comment.setCommentListener(uiManager.view().commentListener);
+			comment.setSpanStateListener(uiManager.view().spanStateListener);
+			comment.setPrepareToCopyListener(uiManager.view().prepareToCopyListener);
+			comment.setExtraButtons(uiManager.view().extraButtons);
 			thumbnail.setOnClickListener(thumbnailClickListener);
 			thumbnail.setOnLongClickListener(thumbnailLongClickListener);
 			bottomBarReplies.setOnClickListener(uiManager.view().repliesBlockClickListener);
 			bottomBarExpand.setOnClickListener(this);
 			bottomBarOpenThread.setOnClickListener(uiManager.view().threadLinkBlockClickListener);
 
-			index.setTypeface(GraphicsUtils.TYPEFACE_MEDIUM);
-			int textScale = Preferences.getTextScale();
-			if (textScale != 100) {
-				ViewUtils.applyScaleSize(number, name, index, date, comment, attachmentInfo,
+			index.setTypeface(ResourceUtils.TYPEFACE_MEDIUM);
+			if (C.API_LOLLIPOP) {
+				bottomBarReplies.setTypeface(ResourceUtils.TYPEFACE_MEDIUM);
+				bottomBarExpand.setTypeface(ResourceUtils.TYPEFACE_MEDIUM);
+				bottomBarOpenThread.setTypeface(ResourceUtils.TYPEFACE_MEDIUM);
+			}
+			float textScale = Preferences.getTextScale();
+			if (textScale != 1f) {
+				ViewUtils.applyScaleSize(textScale, number, name, index, date, comment, attachmentInfo,
 						bottomBarReplies, bottomBarExpand, bottomBarOpenThread);
-				ViewUtils.applyScaleSize(stateImages);
-				head.setHorizontalSpacing(head.getHorizontalSpacing() * textScale / 100);
+				ViewUtils.applyScaleSize(textScale, stateImages);
+				head.setHorizontalSpacing((int) (head.getHorizontalSpacing() * textScale));
 			}
 
+			this.dimensions = dimensions.get(this);
 			thumbnail.setDrawTouching(true);
-			thumbnail.applyRoundedCorners(getPostBackgroundColor(uiManager, configurationSet));
 			ViewGroup.LayoutParams thumbnailLayoutParams = thumbnail.getLayoutParams();
-			int thumbnailsScale = Preferences.getThumbnailsScale();
-			if (thumbnailsScale != 100) {
-				thumbnailLayoutParams.width = thumbnailWidth * thumbnailsScale / 100;
+			float thumbnailsScale = Preferences.getThumbnailsScale();
+			if (thumbnailsScale != 1f) {
+				thumbnailLayoutParams.width = (int) (this.dimensions.thumbnailWidth * thumbnailsScale);
 				thumbnailLayoutParams.height = thumbnailLayoutParams.width;
 			} else {
-				thumbnailLayoutParams.width = thumbnailWidth;
+				thumbnailLayoutParams.width = this.dimensions.thumbnailWidth;
 			}
 		}
 
-		public void notifyUnbind() {
+		@Override
+		public Dimensions createLazy() {
+			float density = ResourceUtils.obtainDensity(itemView);
+			Configuration configuration = itemView.getResources().getConfiguration();
+			int widthMeasureSpec = View.MeasureSpec.makeMeasureSpec
+					((int) (320 * density + 0.5f), View.MeasureSpec.AT_MOST);
+			int heightMeasureSpec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED);
+			itemView.measure(widthMeasureSpec, heightMeasureSpec);
+			int commentAdditionalHeight = bottomBar.getMeasuredHeight();
+			int thumbnailWidth = head.getMeasuredHeight();
+			// Approximately equals to thumbnail width + right padding
+			int additionalAttachmentInfoWidthDp = 64;
+			int minAttachmentInfoWidthDp = additionalAttachmentInfoWidthDp + 68;
+			int maxAttachmentInfoWidthDp = additionalAttachmentInfoWidthDp + 84;
+			int attachmentInfoWidthDp = configuration.smallestScreenWidthDp * minAttachmentInfoWidthDp / 320;
+			attachmentInfoWidthDp = Math.max(Math.min(attachmentInfoWidthDp, maxAttachmentInfoWidthDp),
+					minAttachmentInfoWidthDp);
+			attachmentInfoWidthDp -= additionalAttachmentInfoWidthDp;
+			int multipleAttachmentInfoWidth = (int) (attachmentInfoWidthDp * density + 0.5f);
+			return new Dimensions(thumbnailWidth, multipleAttachmentInfoWidth, commentAdditionalHeight);
+		}
+
+		public void installBackground() {
+			if (ViewCompat.isAttachedToWindow(itemView)) {
+				installBackgroundUnchecked();
+			}
+		}
+
+		private void installBackgroundUnchecked() {
+			if (newPostAnimation != null) {
+				newPostAnimation.cancel();
+				newPostAnimation = null;
+			}
+			PostItem postItem = getPostItem();
+			UiManager.ConfigurationSet configurationSet = getConfigurationSet();
+			if (selection == UiManager.Selection.DISABLED &&
+					!configurationSet.postStateProvider.isRead(postItem.getPostNumber())) {
+				switch (Preferences.getHighlightUnreadMode()) {
+					case AUTOMATICALLY: {
+						newPostAnimation = new NewPostAnimation(layout,
+								configurationSet.postStateProvider, postItem.getPostNumber(),
+								highlightBackgroundColor);
+						break;
+					}
+					case MANUALLY: {
+						layout.setSecondaryBackgroundColor(highlightBackgroundColor);
+						break;
+					}
+					case NEVER: {
+						layout.setSecondaryBackground(null);
+						break;
+					}
+					default: {
+						throw new IllegalStateException();
+					}
+				}
+			} else if (selection == UiManager.Selection.SELECTED) {
+				layout.setSecondaryBackgroundColor(highlightBackgroundColor);
+			} else {
+				layout.setSecondaryBackground(null);
+			}
+		}
+
+		public void resetAnimations() {
 			if (expandAnimator != null) {
 				expandAnimator.cancel();
 				expandAnimator = null;
@@ -1099,6 +1352,16 @@ public class ViewUnit {
 		}
 
 		@Override
+		public void onViewAttachedToWindow(View v) {
+			installBackgroundUnchecked();
+		}
+
+		@Override
+		public void onViewDetachedFromWindow(View v) {
+			resetAnimations();
+		}
+
+		@Override
 		public void onApplyLimit(boolean limited) {
 			if (limited != (bottomBarExpand.getVisibility() == View.VISIBLE)) {
 				bottomBarExpand.setVisibility(limited ? View.VISIBLE : View.GONE);
@@ -1108,8 +1371,11 @@ public class ViewUnit {
 
 		@Override
 		public void onClick(View v) {
-			if (v == bottomBarExpand && postItem != null && !postItem.isExpanded()) {
-				postItem.setExpanded(true);
+			PostItem postItem = getPostItem();
+			PostNumber postNumber = postItem.getPostNumber();
+			UiManager.ConfigurationSet configurationSet = getConfigurationSet();
+			if (v == bottomBarExpand && !configurationSet.postStateProvider.isExpanded(postNumber)) {
+				configurationSet.postStateProvider.setExpanded(postNumber);
 				comment.setLinesLimit(0, 0);
 				bottomBarExpand.setVisibility(View.GONE);
 				int bottomBarHeight = bottomBar.getHeight();
@@ -1143,25 +1409,8 @@ public class ViewUnit {
 		}
 
 		@Override
-		public void onTemporaryDetach(PostLinearLayout view, boolean start) {
-			if (start) {
-				notifyUnbind();
-			}
-		}
-
-		@Override
-		public PostItem getPostItem() {
-			return postItem;
-		}
-
-		@Override
-		public UiManager.ConfigurationSet getConfigurationSet() {
-			return configurationSet;
-		}
-
-		@Override
-		public GalleryItem.GallerySet getGallerySet() {
-			return configurationSet.gallerySet;
+		protected void onConfigure(PostItem postItem, UiManager.ConfigurationSet configurationSet) {
+			thumbnail.applyRoundedCorners(getPostBackgroundColor(itemView.getContext(), configurationSet));
 		}
 
 		@Override
@@ -1170,17 +1419,13 @@ public class ViewUnit {
 		}
 	}
 
-	private static class HiddenViewHolder extends RecyclerView.ViewHolder implements UiManager.Holder {
+	private static class HiddenViewHolder extends BasePostViewHolder {
 		public final TextView index;
 		public final TextView number;
 		public final TextView comment;
 
-		public final UiManager.ConfigurationSet configurationSet;
-
-		public PostItem postItem;
-
-		private static View createBaseView(ViewGroup parent, boolean thread) {
-			if (thread) {
+		private static View createBaseView(ViewGroup parent, boolean card) {
+			if (card) {
 				CardView cardView = createCardLayout(parent);
 				ViewGroup cardContent = (ViewGroup) cardView.getChildAt(0);
 				LayoutInflater.from(cardView.getContext()).inflate(R.layout.list_item_hidden, cardContent);
@@ -1190,38 +1435,30 @@ public class ViewUnit {
 			}
 		}
 
-		public HiddenViewHolder(ViewGroup parent, UiManager.ConfigurationSet configurationSet, boolean thread) {
-			super(createBaseView(parent, thread));
+		public HiddenViewHolder(ViewGroup parent, boolean card, boolean thread) {
+			super(createBaseView(parent, card));
 
 			index = itemView.findViewById(R.id.index);
 			number = itemView.findViewById(R.id.number);
 			comment = itemView.findViewById(R.id.comment);
 			itemView.findViewById(R.id.head).setAlpha(ALPHA_HIDDEN_POST);
-			ViewUtils.applyScaleSize(index, number, comment);
-			ViewUtils.applyScaleMarginLR(index, number, comment);
+
+			float textScale = Preferences.getTextScale();
+			ViewUtils.applyScaleSize(textScale, index, number, comment);
+			ViewUtils.applyScaleMarginLR(textScale, index, number, comment);
+			index.setTypeface(ResourceUtils.TYPEFACE_MEDIUM);
 			if (thread) {
 				index.setVisibility(View.GONE);
 				number.setVisibility(View.GONE);
+			}
+			if (card) {
+				CardView cardView = (CardView) itemView;
+				ViewGroup cardContent = (ViewGroup) cardView.getChildAt(0);
+				ListViewUtils.bind(this, cardContent, true, null, this);
 			} else {
 				ViewUtils.setSelectableItemBackground(itemView);
+				ListViewUtils.bind(this, itemView, true, null, this);
 			}
-
-			this.configurationSet = configurationSet;
-		}
-
-		@Override
-		public PostItem getPostItem() {
-			return postItem;
-		}
-
-		@Override
-		public UiManager.ConfigurationSet getConfigurationSet() {
-			return configurationSet;
-		}
-
-		@Override
-		public GalleryItem.GallerySet getGallerySet() {
-			throw new UnsupportedOperationException();
 		}
 	}
 }

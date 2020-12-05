@@ -4,25 +4,33 @@ import android.app.AlertDialog;
 import android.net.Uri;
 import android.view.Menu;
 import android.view.MenuItem;
+import androidx.fragment.app.FragmentManager;
 import androidx.recyclerview.widget.LinearLayoutManager;
+import chan.content.Chan;
 import chan.util.StringUtils;
 import com.mishiranu.dashchan.C;
 import com.mishiranu.dashchan.R;
 import com.mishiranu.dashchan.content.Preferences;
+import com.mishiranu.dashchan.content.async.GetHistoryTask;
+import com.mishiranu.dashchan.content.database.CommonDatabase;
+import com.mishiranu.dashchan.content.database.HistoryDatabase;
 import com.mishiranu.dashchan.content.storage.FavoritesStorage;
-import com.mishiranu.dashchan.content.storage.HistoryDatabase;
-import com.mishiranu.dashchan.ui.navigator.Page;
+import com.mishiranu.dashchan.ui.DialogMenu;
+import com.mishiranu.dashchan.ui.InstanceDialog;
 import com.mishiranu.dashchan.ui.navigator.adapter.HistoryAdapter;
-import com.mishiranu.dashchan.util.DialogMenu;
+import com.mishiranu.dashchan.util.ConcurrentUtils;
 import com.mishiranu.dashchan.util.ResourceUtils;
 import com.mishiranu.dashchan.util.ViewUtils;
 import com.mishiranu.dashchan.widget.DividerItemDecoration;
-import com.mishiranu.dashchan.widget.PullableRecyclerView;
-import com.mishiranu.dashchan.widget.PullableWrapper;
+import com.mishiranu.dashchan.widget.HeaderItemDecoration;
+import com.mishiranu.dashchan.widget.PaddedRecyclerView;
 
-public class HistoryPage extends ListPage implements HistoryAdapter.Callback {
+public class HistoryPage extends ListPage implements HistoryAdapter.Callback, GetHistoryTask.Callback {
 	private String chanName;
-	private boolean mergeChans;
+	private String searchQuery;
+
+	private GetHistoryTask task;
+	private boolean firstLoad = true;
 
 	private HistoryAdapter getAdapter() {
 		return (HistoryAdapter) getRecyclerView().getAdapter();
@@ -30,47 +38,32 @@ public class HistoryPage extends ListPage implements HistoryAdapter.Callback {
 
 	@Override
 	protected void onCreate() {
-		PullableRecyclerView recyclerView = getRecyclerView();
+		PaddedRecyclerView recyclerView = getRecyclerView();
 		recyclerView.setLayoutManager(new LinearLayoutManager(recyclerView.getContext()));
 		if (!C.API_LOLLIPOP) {
 			float density = ResourceUtils.obtainDensity(recyclerView);
 			ViewUtils.setNewPadding(recyclerView, (int) (16f * density), null, (int) (16f * density), null);
 		}
-		HistoryAdapter adapter = new HistoryAdapter(this);
+		chanName = Preferences.isMergeChans() ? null : getPage().chanName;
+		searchQuery = getInitSearch().currentQuery;
+		CommonDatabase.getInstance().getHistory().registerObserver(updateHistoryRunnable);
+		HistoryAdapter adapter = new HistoryAdapter(getContext(), this, chanName);
 		recyclerView.setAdapter(adapter);
 		recyclerView.addItemDecoration(new DividerItemDecoration(recyclerView.getContext(),
 				adapter::configureDivider));
-		recyclerView.getWrapper().setPullSides(PullableWrapper.Side.NONE);
-		adapter.applyFilter(getInitSearch().currentQuery);
-		if (updateConfiguration(true)) {
-			restoreListPosition();
-		}
+		recyclerView.addItemDecoration(new HeaderItemDecoration(adapter::getItemHeader));
+		recyclerView.setItemAnimator(null);
+		switchProgress();
+		updateHistory();
 	}
 
 	@Override
-	protected void onResume() {
-		updateConfiguration(false);
-	}
-
-	private boolean updateConfiguration(boolean create) {
-		Page page = getPage();
-		HistoryAdapter adapter = getAdapter();
-		String chanName = page.chanName;
-		boolean mergeChans = Preferences.isMergeChans();
-		boolean update = !mergeChans && !chanName.equals(this.chanName) || mergeChans != this.mergeChans;
-		if (create || update) {
-			adapter.updateConfiguration(getContext(), mergeChans ? null : chanName);
-		}
-		if (update) {
-			this.chanName = chanName;
-			this.mergeChans = mergeChans;
-		}
-		if (adapter.isRealEmpty()) {
-			switchView(ViewType.ERROR, R.string.history_is_empty);
-			return false;
-		} else {
-			switchView(ViewType.LIST, null);
-			return true;
+	protected void onDestroy() {
+		CommonDatabase.getInstance().getHistory().unregisterObserver(updateHistoryRunnable);
+		getAdapter().setCursor(null);
+		if (task != null) {
+			task.cancel();
+			task = null;
 		}
 	}
 
@@ -81,18 +74,22 @@ public class HistoryPage extends ListPage implements HistoryAdapter.Callback {
 
 	@Override
 	public void onItemClick(HistoryDatabase.HistoryItem historyItem) {
-		if (historyItem != null) {
-			getUiManager().navigator().navigatePosts(historyItem.chanName, historyItem.boardName,
-					historyItem.threadNumber, null, null, 0);
-		}
+		getUiManager().navigator().navigatePosts(historyItem.chanName, historyItem.boardName,
+				historyItem.threadNumber, null, null);
 	}
 
 	@Override
 	public boolean onItemLongClick(HistoryDatabase.HistoryItem historyItem) {
-		if (historyItem != null) {
-			DialogMenu dialogMenu = new DialogMenu(getContext());
+		showItemPopupMenu(getFragmentManager(), historyItem);
+		return true;
+	}
+
+	private void showItemPopupMenu(FragmentManager fragmentManager, HistoryDatabase.HistoryItem historyItem) {
+		new InstanceDialog(fragmentManager, null, provider -> {
+			DialogMenu dialogMenu = new DialogMenu(provider.getContext());
 			dialogMenu.add(R.string.copy_link, () -> {
-				Uri uri = getChanLocator().safe(true).createThreadUri(historyItem.boardName, historyItem.threadNumber);
+				Uri uri = Chan.get(historyItem.chanName).locator.safe(true)
+						.createThreadUri(historyItem.boardName, historyItem.threadNumber);
 				if (uri != null) {
 					StringUtils.copyToClipboard(getContext(), uri.toString());
 				}
@@ -100,19 +97,12 @@ public class HistoryPage extends ListPage implements HistoryAdapter.Callback {
 			if (!FavoritesStorage.getInstance().hasFavorite(historyItem.chanName,
 					historyItem.boardName, historyItem.threadNumber)) {
 				dialogMenu.add(R.string.add_to_favorites, () -> FavoritesStorage.getInstance()
-						.add(historyItem.chanName, historyItem.boardName, historyItem.threadNumber,
-								historyItem.title, 0));
+						.add(historyItem.chanName, historyItem.boardName, historyItem.threadNumber, historyItem.title));
 			}
-			dialogMenu.add(R.string.remove_from_history, () -> {
-				if (HistoryDatabase.getInstance().remove(historyItem.chanName, historyItem.boardName,
-						historyItem.threadNumber)) {
-					getAdapter().remove(historyItem);
-				}
-			});
-			dialogMenu.show(getUiManager().getConfigurationLock());
-			return true;
-		}
-		return false;
+			dialogMenu.add(R.string.remove_from_history, () -> CommonDatabase.getInstance().getHistory()
+					.remove(historyItem.chanName, historyItem.boardName, historyItem.threadNumber));
+			return dialogMenu.create();
+		});
 	}
 
 	@Override
@@ -127,23 +117,52 @@ public class HistoryPage extends ListPage implements HistoryAdapter.Callback {
 	public boolean onOptionsItemSelected(MenuItem item) {
 		switch (item.getItemId()) {
 			case R.id.menu_clear: {
-				AlertDialog dialog = new AlertDialog.Builder(getContext())
-						.setMessage(R.string.clear_history__sentence)
-						.setNegativeButton(android.R.string.cancel, null)
-						.setPositiveButton(android.R.string.ok, (d, which1) -> {
-							HistoryDatabase.getInstance().clearAllHistory(mergeChans ? null : chanName);
-							getAdapter().clear();
-							switchView(ViewType.ERROR, R.string.history_is_empty);
-						}).show();
-				getUiManager().getConfigurationLock().lockConfiguration(dialog);
+				showClearHistoryDialog(getFragmentManager(), chanName);
 				return true;
 			}
 		}
 		return false;
 	}
 
+	private static void showClearHistoryDialog(FragmentManager fragmentManager, String chanName) {
+		new InstanceDialog(fragmentManager, null, provider -> new AlertDialog
+				.Builder(provider.getContext())
+				.setMessage(R.string.clear_history__sentence)
+				.setNegativeButton(android.R.string.cancel, null)
+				.setPositiveButton(android.R.string.ok, (d, w) -> CommonDatabase
+						.getInstance().getHistory().clearHistory(chanName))
+				.create());
+	}
+
 	@Override
 	public void onSearchQueryChange(String query) {
-		getAdapter().applyFilter(query);
+		searchQuery = query;
+		updateHistory();
+	}
+
+	private final Runnable updateHistoryRunnable = this::updateHistory;
+
+	private void updateHistory() {
+		if (task != null) {
+			task.cancel();
+		}
+		task = new GetHistoryTask(this, chanName, searchQuery);
+		task.execute(ConcurrentUtils.PARALLEL_EXECUTOR);
+	}
+
+	@Override
+	public void onGetHistoryResult(HistoryDatabase.HistoryCursor cursor) {
+		task = null;
+		boolean firstLoad = this.firstLoad;
+		this.firstLoad = false;
+		getAdapter().setCursor(cursor);
+		if (cursor.hasItems) {
+			switchList();
+			if (firstLoad) {
+				restoreListPosition();
+			}
+		} else {
+			switchError(R.string.history_is_empty);
+		}
 	}
 }

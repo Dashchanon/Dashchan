@@ -1,7 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
 
+	<attr name="isOverlay" format="boolean" />
 	<attr name="isPopup" format="boolean" />
+	<attr name="overlayTheme" format="reference" />
 
 	<attr name="colorWindowBackground" format="color|reference" />
 	<attr name="colorBlockBackground" format="color|reference" />
@@ -39,6 +41,7 @@
 	<attr name="iconActionSearch" format="reference" />
 	<attr name="iconActionSelect" format="reference" />
 	<attr name="iconActionSelectAll" format="reference" />
+	<attr name="iconActionSync" format="reference" />
 	<attr name="iconActionVolumeOff" format="reference" />
 
 	<attr name="iconButtonCancel" format="reference" />

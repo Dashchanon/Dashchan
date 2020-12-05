@@ -1,54 +1,58 @@
 package com.mishiranu.dashchan.ui.navigator;
 
-import android.animation.Animator;
-import android.animation.AnimatorInflater;
-import android.app.ActionBar;
+import android.content.Context;
 import android.os.Bundle;
 import android.os.Parcelable;
 import android.util.Pair;
 import android.view.ActionMode;
-import android.view.ContextThemeWrapper;
+import android.view.Gravity;
 import android.view.LayoutInflater;
 import android.view.Menu;
 import android.view.MenuInflater;
 import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.TextView;
+import android.widget.FrameLayout;
+import android.widget.ProgressBar;
 import androidx.annotation.NonNull;
-import androidx.fragment.app.Fragment;
 import com.mishiranu.dashchan.C;
 import com.mishiranu.dashchan.R;
 import com.mishiranu.dashchan.content.Preferences;
-import com.mishiranu.dashchan.ui.ActivityHandler;
+import com.mishiranu.dashchan.content.model.ErrorItem;
+import com.mishiranu.dashchan.content.model.PostNumber;
+import com.mishiranu.dashchan.ui.ContentFragment;
 import com.mishiranu.dashchan.ui.FragmentHandler;
 import com.mishiranu.dashchan.ui.navigator.manager.UiManager;
 import com.mishiranu.dashchan.ui.navigator.page.ListPage;
 import com.mishiranu.dashchan.widget.CustomSearchView;
+import com.mishiranu.dashchan.widget.ExpandedLayout;
 import com.mishiranu.dashchan.widget.ListPosition;
 import com.mishiranu.dashchan.widget.MenuExpandListener;
-import com.mishiranu.dashchan.widget.PullableRecyclerView;
+import com.mishiranu.dashchan.widget.PaddedRecyclerView;
+import com.mishiranu.dashchan.widget.ThemeEngine;
+import com.mishiranu.dashchan.widget.ViewFactory;
+import java.util.Collection;
 import java.util.UUID;
 
-public final class PageFragment extends Fragment implements ActivityHandler, ListPage.Callback {
+public final class PageFragment extends ContentFragment implements FragmentHandler.Callback, ListPage.Callback {
 	private static final String EXTRA_PAGE = "page";
 	private static final String EXTRA_RETAIN_ID = "retainId";
 
 	private static final String EXTRA_LIST_POSITION = "listPosition";
 	private static final String EXTRA_PARCELABLE_EXTRA = "parcelableExtra";
+	private static final String EXTRA_INIT_ERROR_ITEM = "initErrorItem";
 	private static final String EXTRA_SEARCH_CURRENT_QUERY = "searchCurrentQuery";
 	private static final String EXTRA_SEARCH_SUBMIT_QUERY = "searchSubmitQuery";
 	private static final String EXTRA_SEARCH_FOCUSED = "searchFocused";
 
 	public interface Callback {
 		UiManager getUiManager();
-		Object getRetainExtra(String retainId);
-		void storeRetainExtra(String retainId, Object extra);
-		ActionBar getActionBar();
-		void setPageTitle(String title);
+		ListPage.Retainable getRetainableExtra(String retainId);
+		void storeRetainableExtra(String retainId, ListPage.Retainable extra);
+		void setPageTitle(String title, String subtitle);
 		void invalidateHomeUpState();
-		void setActionBarLocked(String locker, boolean locked);
-		void handleRedirect(Page page, String chanName, String boardName, String threadNumber, String postNumber);
+		void handleRedirect(String chanName, String boardName, String threadNumber, PostNumber postNumber);
+		void closeCurrentPage();
 	}
 
 	public PageFragment() {}
@@ -74,9 +78,8 @@ public final class PageFragment extends Fragment implements ActivityHandler, Lis
 
 	private ListPage listPage;
 	private View progressView;
-	private View errorView;
-	private TextView errorText;
-	private PullableRecyclerView recyclerView;
+	private ViewFactory.ErrorHolder errorHolder;
+	private PaddedRecyclerView recyclerView;
 	private CustomSearchView searchView;
 
 	private String actionBarLockerPull;
@@ -84,6 +87,7 @@ public final class PageFragment extends Fragment implements ActivityHandler, Lis
 
 	private ListPosition listPosition;
 	private Parcelable parcelableExtra;
+	private ErrorItem initErrorItem;
 	private String searchCurrentQuery;
 	private String searchSubmitQuery;
 	private boolean searchFocused;
@@ -91,6 +95,7 @@ public final class PageFragment extends Fragment implements ActivityHandler, Lis
 	private ListPage.InitRequest initRequest;
 	private boolean resetScroll = false;
 
+	private boolean allowShowScale;
 	private Runnable doOnResume;
 	private Menu currentMenu;
 	private boolean fillMenuOnResume;
@@ -105,6 +110,8 @@ public final class PageFragment extends Fragment implements ActivityHandler, Lis
 				? savedInstanceState.getParcelable(EXTRA_LIST_POSITION) : null;
 		parcelableExtra = savedInstanceState != null ? savedInstanceState
 				.getParcelable(EXTRA_PARCELABLE_EXTRA) : null;
+		initErrorItem = savedInstanceState != null ? savedInstanceState
+				.getParcelable(EXTRA_INIT_ERROR_ITEM) : null;
 		searchCurrentQuery = savedInstanceState != null ? savedInstanceState
 				.getString(EXTRA_SEARCH_CURRENT_QUERY) : null;
 		searchSubmitQuery = savedInstanceState != null ? savedInstanceState
@@ -115,42 +122,57 @@ public final class PageFragment extends Fragment implements ActivityHandler, Lis
 
 	@Override
 	public View onCreateView(@NonNull LayoutInflater inflater, ViewGroup container, Bundle savedInstanceState) {
-		return inflater.inflate(R.layout.activity_common, container, false);
-	}
-
-	@Override
-	public void onViewCreated(@NonNull View view, Bundle savedInstanceState) {
-		super.onViewCreated(view, savedInstanceState);
-
 		actionBarLockerPull = "pull-" + UUID.randomUUID();
 		actionBarLockerSearch = "search-" + UUID.randomUUID();
 
-		listPage = getPage().content.newPage();
-		progressView = view.findViewById(R.id.progress);
-		errorView = view.findViewById(R.id.error);
-		errorText = view.findViewById(R.id.error_text);
-		recyclerView = view.findViewById(android.R.id.list);
-		recyclerView.setSaveEnabled(false);
+		ExpandedLayout layout = new ExpandedLayout(container.getContext(), false);
+		recyclerView = new PaddedRecyclerView(layout.getContext());
+		layout.addView(recyclerView, ExpandedLayout.LayoutParams.MATCH_PARENT,
+				ExpandedLayout.LayoutParams.MATCH_PARENT);
+		layout.setRecyclerView(recyclerView);
+		if (!C.API_MARSHMALLOW) {
+			@SuppressWarnings("deprecation")
+			Runnable setAnimationCacheEnabled = () -> recyclerView.setAnimationCacheEnabled(false);
+			setAnimationCacheEnabled.run();
+		}
+		recyclerView.setMotionEventSplittingEnabled(false);
+		recyclerView.setClipToPadding(false);
+		recyclerView.setVerticalScrollBarEnabled(true);
 		recyclerView.setFastScrollerEnabled(Preferences.isActiveScrollbar());
-		recyclerView.getWrapper().setOnPullListener(listPage);
-		recyclerView.getWrapper().setPullStateListener((wrapper, busy) -> getCallback()
+		FrameLayout progress = new FrameLayout(layout.getContext());
+		layout.addView(progress, ExpandedLayout.LayoutParams.MATCH_PARENT, ExpandedLayout.LayoutParams.MATCH_PARENT);
+		progress.setVisibility(View.GONE);
+		progressView = progress;
+		ProgressBar progressBar = new ProgressBar(progress.getContext());
+		progress.addView(progressBar, FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT);
+		((FrameLayout.LayoutParams) progressBar.getLayoutParams()).gravity = Gravity.CENTER;
+		ThemeEngine.applyStyle(progressBar);
+		errorHolder = ViewFactory.createErrorLayout(layout);
+		errorHolder.layout.setVisibility(View.GONE);
+		layout.addView(errorHolder.layout);
+
+		allowShowScale = true;
+		listPage = getPage().content.newPage();
+		recyclerView.getPullable().setOnPullListener(listPage);
+		recyclerView.getPullable().setPullStateListener((wrapper, busy) -> ((FragmentHandler) requireActivity())
 				.setActionBarLocked(actionBarLockerPull, busy));
+		return layout;
 	}
 
 	@Override
 	public void onDestroyView() {
 		super.onDestroyView();
 
-		getCallback().setActionBarLocked(actionBarLockerPull, false);
-		getCallback().setActionBarLocked(actionBarLockerSearch, false);
+		FragmentHandler fragmentHandler = (FragmentHandler) requireActivity();
+		fragmentHandler.setActionBarLocked(actionBarLockerPull, false);
+		fragmentHandler.setActionBarLocked(actionBarLockerSearch, false);
 
-		listPage.cleanup();
-		getCallback().getUiManager().view().notifyUnbindListView(recyclerView);
-
-		listPage = null;
+		if (listPage != null) {
+			listPage.destroy();
+			listPage = null;
+		}
 		progressView = null;
-		errorView = null;
-		errorText = null;
+		errorHolder = null;
 		recyclerView = null;
 		searchView = null;
 	}
@@ -160,12 +182,16 @@ public final class PageFragment extends Fragment implements ActivityHandler, Lis
 		super.onActivityCreated(savedInstanceState);
 
 		setHasOptionsMenu(true);
-		ListPage.IconProvider iconProvider = ((FragmentHandler) requireActivity())::getActionBarIcon;
-		listPage.init(this, getPage(), recyclerView,
-				listPosition, getCallback().getUiManager(), iconProvider,
-				getCallback().getRetainExtra(getRetainId()), parcelableExtra, initRequest,
+		ErrorItem initErrorItem = this.initErrorItem;
+		this.initErrorItem = null;
+		ListPage.InitRequest initRequest = this.initRequest;
+		this.initRequest = null;
+		if (initRequest == null && initErrorItem != null) {
+			initRequest = new ListPage.InitRequest(initErrorItem);
+		}
+		listPage.init(getPage(), this, this, recyclerView, listPosition, getCallback().getUiManager(),
+				getCallback().getRetainableExtra(getRetainId()), parcelableExtra, initRequest,
 				new ListPage.InitSearch(searchCurrentQuery, searchSubmitQuery));
-		initRequest = null;
 		notifyTitleChanged();
 	}
 
@@ -191,7 +217,10 @@ public final class PageFragment extends Fragment implements ActivityHandler, Lis
 	@Override
 	public void onPause() {
 		super.onPause();
-		listPage.pause();
+
+		if (listPage != null) {
+			listPage.pause();
+		}
 	}
 
 	public void setSaveToStack(boolean saveToStack) {
@@ -204,8 +233,8 @@ public final class PageFragment extends Fragment implements ActivityHandler, Lis
 
 		if (listPage != null) {
 			listPosition = listPage.getListPosition();
-			Pair<Object, Parcelable> extraPair = listPage.getExtraToStore(saveToStack);
-			getCallback().storeRetainExtra(getRetainId(), extraPair.first);
+			Pair<ListPage.Retainable, Parcelable> extraPair = listPage.getExtraToStore(saveToStack);
+			getCallback().storeRetainableExtra(getRetainId(), extraPair.first);
 			parcelableExtra = extraPair.second;
 			CustomSearchView searchView = getSearchView(false);
 			if (searchView != null) {
@@ -214,9 +243,12 @@ public final class PageFragment extends Fragment implements ActivityHandler, Lis
 		}
 		outState.putParcelable(EXTRA_LIST_POSITION, listPosition);
 		outState.putParcelable(EXTRA_PARCELABLE_EXTRA, parcelableExtra);
+		if (!saveToStack && initErrorItem != null) {
+			outState.putParcelable(EXTRA_INIT_ERROR_ITEM, initErrorItem);
+		}
 		outState.putString(EXTRA_SEARCH_CURRENT_QUERY, searchCurrentQuery);
 		outState.putString(EXTRA_SEARCH_SUBMIT_QUERY, searchSubmitQuery);
-		outState.putBoolean(EXTRA_SEARCH_FOCUSED, searchFocused);
+		outState.putBoolean(EXTRA_SEARCH_FOCUSED, searchFocused && !saveToStack);
 	}
 
 	@Override
@@ -229,34 +261,37 @@ public final class PageFragment extends Fragment implements ActivityHandler, Lis
 			}
 		}
 		currentMenu = null;
+		if (listPage != null) {
+			listPage.destroy();
+			listPage = null;
+		}
+	}
+
+	@Override
+	public void onChansChanged(Collection<String> changed, Collection<String> removed) {
+		Page page = getPage();
+		if (changed.contains(page.chanName)) {
+			updateOptionsMenu();
+		}
 	}
 
 	private CustomSearchView getSearchView(boolean required) {
 		if (searchView == null && required) {
-			searchView = new CustomSearchView(C.API_LOLLIPOP ? new ContextThemeWrapper(requireContext(),
-					R.style.Theme_Special_White) : getCallback().getActionBar().getThemedContext());
+			searchView = getViewHolder().obtainSearchView();
 			searchView.setOnSubmitListener(query -> {
-				switch (listPage.onSearchSubmit(query)) {
-					case COLLAPSE: {
-						searchSubmitQuery = null;
-						setSearchMode(false);
-						return true;
-					}
-					case ACCEPT: {
-						searchSubmitQuery = query;
-						return true;
-					}
-					case DISCARD: {
-						searchSubmitQuery = null;
-						return false;
-					}
-					default: {
-						throw new IllegalStateException();
-					}
+				if (listPage.onSearchSubmit(query)) {
+					searchSubmitQuery = null;
+					setSearchMode(false);
+					return true;
+				} else {
+					searchSubmitQuery = query;
+					return false;
 				}
 			});
 			searchView.setOnChangeListener(query -> {
-				listPage.onSearchQueryChange(query);
+				if (listPage != null) {
+					listPage.onSearchQueryChange(query);
+				}
 				if (searchCurrentQuery != null) {
 					searchCurrentQuery = query;
 				}
@@ -277,7 +312,7 @@ public final class PageFragment extends Fragment implements ActivityHandler, Lis
 				listPage.onSearchCancel();
 			}
 			updateOptionsMenu();
-			getCallback().setActionBarLocked(actionBarLockerSearch, search);
+			((FragmentHandler) requireActivity()).setActionBarLocked(actionBarLockerSearch, search);
 			getCallback().invalidateHomeUpState();
 			if (toggle) {
 				if (search) {
@@ -315,7 +350,7 @@ public final class PageFragment extends Fragment implements ActivityHandler, Lis
 		return listPage.onDrawerNumberEntered(number);
 	}
 
-	public void updatePageConfiguration(String postNumber) {
+	public void updatePageConfiguration(PostNumber postNumber) {
 		if (listPage != null) {
 			listPage.updatePageConfiguration(postNumber);
 		} else {
@@ -329,7 +364,7 @@ public final class PageFragment extends Fragment implements ActivityHandler, Lis
 		listPage.handleNewPostDataListNow();
 	}
 
-	public void scrollToPost(String postNumber) {
+	public void scrollToPost(PostNumber postNumber) {
 		listPage.handleScrollToPost(postNumber);
 	}
 
@@ -409,7 +444,9 @@ public final class PageFragment extends Fragment implements ActivityHandler, Lis
 
 	@Override
 	public void notifyTitleChanged() {
-		getCallback().setPageTitle(listPage.obtainTitle());
+		Pair<String, String> titleSubtitle = listPage.obtainTitleSubtitle();
+		getCallback().setPageTitle(titleSubtitle != null ? titleSubtitle.first : null,
+				titleSubtitle != null ? titleSubtitle.second : null);
 	}
 
 	@Override
@@ -425,33 +462,71 @@ public final class PageFragment extends Fragment implements ActivityHandler, Lis
 	}
 
 	@Override
+	public void clearSearchFocus() {
+		CustomSearchView searchView = getSearchView(false);
+		if (searchView != null) {
+			searchView.clearFocus();
+		}
+	}
+
+	@Override
+	public Context getToolbarContext() {
+		return ((FragmentHandler) requireActivity()).getToolbarContext();
+	}
+
+	@Override
 	public ActionMode startActionMode(ActionMode.Callback callback) {
 		return requireActivity().startActionMode(callback);
 	}
 
 	@Override
-	public void switchView(ListPage.ViewType viewType, String message) {
-		progressView.setVisibility(viewType == ListPage.ViewType.PROGRESS ? View.VISIBLE : View.GONE);
-		errorView.setVisibility(viewType == ListPage.ViewType.ERROR ? View.VISIBLE : View.GONE);
-		if (viewType == ListPage.ViewType.ERROR) {
-			errorText.setText(message != null ? message : getString(R.string.unknown_error));
+	public void switchList() {
+		initErrorItem = null;
+		progressView.setVisibility(View.GONE);
+		errorHolder.layout.setVisibility(View.GONE);
+	}
+
+	@Override
+	public void switchProgress() {
+		initErrorItem = null;
+		progressView.setVisibility(View.VISIBLE);
+		errorHolder.layout.setVisibility(View.GONE);
+	}
+
+	@Override
+	public void switchError(ErrorItem errorItem) {
+		if (errorItem == null) {
+			errorItem = new ErrorItem(ErrorItem.Type.UNKNOWN);
 		}
+		initErrorItem = errorItem;
+		progressView.setVisibility(View.GONE);
+		errorHolder.layout.setVisibility(View.VISIBLE);
+		errorHolder.text.setText(errorItem.toString());
 	}
 
 	@Override
 	public void showScaleAnimation() {
-		Animator animator = AnimatorInflater.loadAnimator(requireContext(), R.animator.fragment_in);
-		animator.setTarget(recyclerView);
-		animator.start();
+		if (allowShowScale) {
+			allowShowScale = false;
+			createAnimator(recyclerView, true).start();
+		}
 	}
 
 	@Override
-	public void handleRedirect(String chanName, String boardName, String threadNumber, String postNumber) {
-		if (isResumed()) {
-			getCallback().handleRedirect(getPage(), chanName, boardName, threadNumber, postNumber);
-		} else {
-			// Fragment transactions allowed in resumed state only
+	public void handleRedirect(String chanName, String boardName, String threadNumber, PostNumber postNumber) {
+		if (isStateSaved()) {
 			doOnResume = () -> handleRedirect(chanName, boardName, threadNumber, postNumber);
+		} else {
+			getCallback().handleRedirect(chanName, boardName, threadNumber, postNumber);
+		}
+	}
+
+	@Override
+	public void closePage() {
+		if (isStateSaved()) {
+			doOnResume = () -> getCallback().closeCurrentPage();
+		} else {
+			getCallback().closeCurrentPage();
 		}
 	}
 }

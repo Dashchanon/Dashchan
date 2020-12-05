@@ -6,6 +6,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
+import android.util.Pair;
 import android.view.Menu;
 import android.view.MenuInflater;
 import android.view.MenuItem;
@@ -15,8 +16,9 @@ import android.webkit.MimeTypeMap;
 import android.widget.TextView;
 import androidx.annotation.NonNull;
 import androidx.fragment.app.DialogFragment;
+import androidx.lifecycle.ViewModelProvider;
 import androidx.recyclerview.widget.RecyclerView;
-import chan.content.ChanLocator;
+import chan.content.Chan;
 import chan.http.HttpException;
 import chan.http.HttpHolder;
 import chan.http.HttpRequest;
@@ -26,20 +28,21 @@ import com.mishiranu.dashchan.BuildConfig;
 import com.mishiranu.dashchan.C;
 import com.mishiranu.dashchan.R;
 import com.mishiranu.dashchan.content.Preferences;
-import com.mishiranu.dashchan.content.async.AsyncManager;
+import com.mishiranu.dashchan.content.async.HttpHolderTask;
 import com.mishiranu.dashchan.content.async.ReadUpdateTask;
+import com.mishiranu.dashchan.content.async.TaskViewModel;
 import com.mishiranu.dashchan.content.model.ErrorItem;
 import com.mishiranu.dashchan.content.model.FileHolder;
 import com.mishiranu.dashchan.content.service.DownloadService;
-import com.mishiranu.dashchan.ui.ActivityHandler;
+import com.mishiranu.dashchan.ui.DialogMenu;
 import com.mishiranu.dashchan.ui.FragmentHandler;
 import com.mishiranu.dashchan.ui.preference.core.Preference;
-import com.mishiranu.dashchan.util.DialogMenu;
+import com.mishiranu.dashchan.util.ConcurrentUtils;
 import com.mishiranu.dashchan.util.IOUtils;
 import com.mishiranu.dashchan.util.ListViewUtils;
 import com.mishiranu.dashchan.util.Log;
-import com.mishiranu.dashchan.util.ToastUtils;
 import com.mishiranu.dashchan.util.ViewUtils;
+import com.mishiranu.dashchan.widget.ClickableToast;
 import com.mishiranu.dashchan.widget.DividerItemDecoration;
 import com.mishiranu.dashchan.widget.SimpleViewHolder;
 import com.mishiranu.dashchan.widget.ThemeEngine;
@@ -50,17 +53,15 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.List;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
-public class ThemesFragment extends BaseListFragment implements ActivityHandler, AsyncManager.Callback {
+public class ThemesFragment extends BaseListFragment {
 	private static final String EXTRA_AVAILABLE_THEMES = "availableThemes";
-	private static final String TASK_READ_THEMES = "readThemes";
 
-	private List<JSONObject> availableJsonThemes = Collections.emptyList();
+	private List<JSONObject> availableJsonThemes;
 
 	@Override
 	public void onActivityCreated(Bundle savedInstanceState) {
@@ -84,12 +85,12 @@ public class ThemesFragment extends BaseListFragment implements ActivityHandler,
 			}
 			return true;
 		}));
+		updateThemes();
 
+		ThemesViewModel viewModel = new ViewModelProvider(this).get(ThemesViewModel.class);
 		ArrayList<String> availableThemes = savedInstanceState != null
 				? savedInstanceState.getStringArrayList(EXTRA_AVAILABLE_THEMES) : null;
-		if (availableThemes == null) {
-			AsyncManager.get(this).startTask(TASK_READ_THEMES, this, null, false);
-		} else {
+		if (availableThemes != null) {
 			availableJsonThemes = new ArrayList<>();
 			for (String string : availableThemes) {
 				try {
@@ -98,13 +99,23 @@ public class ThemesFragment extends BaseListFragment implements ActivityHandler,
 					throw new RuntimeException(e);
 				}
 			}
+			updateThemes();
+		} else {
+			if (!viewModel.hasTaskOrValue()) {
+				ReadThemesTask task = new ReadThemesTask(viewModel);
+				task.execute(ConcurrentUtils.PARALLEL_EXECUTOR);
+				viewModel.attach(task);
+			}
+			viewModel.observe(getViewLifecycleOwner(), result -> {
+				if (result.second != null) {
+					availableJsonThemes = result.second;
+					updateThemes();
+				} else {
+					availableJsonThemes = Collections.emptyList();
+					ClickableToast.show(result.first);
+				}
+			});
 		}
-		updateThemes();
-	}
-
-	@Override
-	public void onTerminate() {
-		AsyncManager.get(this).cancelTask(TASK_READ_THEMES, this);
 	}
 
 	@Override
@@ -176,7 +187,7 @@ public class ThemesFragment extends BaseListFragment implements ActivityHandler,
 							if (theme != null) {
 								installTheme(theme, false);
 							} else {
-								ToastUtils.show(requireContext(), R.string.invalid_data_format);
+								ClickableToast.show(R.string.invalid_data_format);
 							}
 						}
 					}
@@ -228,7 +239,7 @@ public class ThemesFragment extends BaseListFragment implements ActivityHandler,
 			if (ThemeEngine.addTheme(theme)) {
 				updateThemes();
 			} else {
-				ToastUtils.show(requireContext(), R.string.no_access);
+				ClickableToast.show(R.string.no_access);
 				return;
 			}
 		}
@@ -245,30 +256,6 @@ public class ThemesFragment extends BaseListFragment implements ActivityHandler,
 				requireActivity().recreate();
 			}
 		}
-	}
-
-	@Override
-	public AsyncManager.Holder onCreateAndExecuteTask(String name, HashMap<String, Object> extra) {
-		ReadThemesTask task = new ReadThemesTask();
-		task.executeOnExecutor(ReadThemesTask.THREAD_POOL_EXECUTOR);
-		return task.getHolder();
-	}
-
-	@Override
-	public void onFinishTaskExecution(String name, AsyncManager.Holder holder) {
-		List<JSONObject> themes = holder.nextArgument();
-		ErrorItem errorItem = holder.nextArgument();
-		if (errorItem != null) {
-			ToastUtils.show(requireContext(), errorItem);
-		} else {
-			availableJsonThemes = themes != null ? themes : Collections.emptyList();
-			updateThemes();
-		}
-	}
-
-	@Override
-	public void onRequestTaskCancel(String name, Object task) {
-		((ReadThemesTask) task).cancel();
 	}
 
 	private static class ListItem {
@@ -413,59 +400,49 @@ public class ThemesFragment extends BaseListFragment implements ActivityHandler,
 		}
 	}
 
-	private static class ReadThemesTask extends AsyncManager.SimpleTask<Void, Void, Boolean> {
-		private final HttpHolder holder = new HttpHolder();
+	public static class ThemesViewModel extends TaskViewModel<ReadThemesTask, Pair<ErrorItem, List<JSONObject>>> {}
 
-		private ArrayList<JSONObject> themes;
-		private ErrorItem errorItem;
+	private static class ReadThemesTask extends HttpHolderTask<Void, Pair<ErrorItem, List<JSONObject>>> {
+		private final ThemesViewModel viewModel;
+
+		public ReadThemesTask(ThemesViewModel viewModel) {
+			super(Chan.getFallback());
+			this.viewModel = viewModel;
+		}
 
 		@Override
-		protected Boolean doInBackground(Void... params) {
-			ArrayList<JSONObject> themes = new ArrayList<>();
+		protected Pair<ErrorItem, List<JSONObject>> run(HttpHolder holder) {
 			try {
-				Uri uri = ChanLocator.getDefault().setScheme(Uri.parse(BuildConfig.URI_THEMES));
+				Uri uri = Chan.getFallback().locator.setSchemeIfEmpty(Uri.parse(BuildConfig.URI_THEMES), null);
 				int redirects = 0;
 				while (redirects++ < 5) {
-					JSONObject jsonObject = new HttpRequest(uri, holder).read().getJsonObject();
+					JSONObject jsonObject = new JSONObject(new HttpRequest(uri, holder).perform().readString());
 					if (jsonObject == null) {
-						errorItem = new ErrorItem(ErrorItem.Type.INVALID_RESPONSE);
-						return false;
+						return new Pair<>(new ErrorItem(ErrorItem.Type.INVALID_RESPONSE), null);
 					}
 					String redirect = CommonUtils.optJsonString(jsonObject, "redirect");
 					if (redirect != null) {
-						uri = ReadUpdateTask.normalizeUri(Uri.parse(redirect), uri);
+						uri = ReadUpdateTask.normalizeRelativeUri(uri, redirect);
 						continue;
 					}
 					JSONArray jsonArray = jsonObject.getJSONArray("themes");
+					ArrayList<JSONObject> themes = new ArrayList<>();
 					for (int i = 0; i < jsonArray.length(); i++) {
 						themes.add(jsonArray.getJSONObject(i));
 					}
-					this.themes = themes;
-					return true;
+					return new Pair<>(null, themes);
 				}
-				errorItem = new ErrorItem(ErrorItem.Type.EMPTY_RESPONSE);
-				return false;
+				return new Pair<>(new ErrorItem(ErrorItem.Type.EMPTY_RESPONSE), null);
 			} catch (HttpException e) {
-				errorItem = e.getErrorItemAndHandle();
-				holder.disconnect();
-				return false;
+				return new Pair<>(e.getErrorItemAndHandle(), null);
 			} catch (JSONException e) {
-				errorItem = new ErrorItem(ErrorItem.Type.INVALID_RESPONSE);
-				return false;
-			} finally {
-				holder.cleanup();
+				return new Pair<>(new ErrorItem(ErrorItem.Type.INVALID_RESPONSE), null);
 			}
 		}
 
 		@Override
-		protected void onStoreResult(AsyncManager.Holder holder, Boolean result) {
-			holder.storeResult(themes, errorItem);
-		}
-
-		@Override
-		public void cancel() {
-			cancel(true);
-			holder.cleanup();
+		protected void onComplete(Pair<ErrorItem, List<JSONObject>> result) {
+			viewModel.handleResult(result);
 		}
 	}
 }

@@ -3,13 +3,13 @@ package com.mishiranu.dashchan.ui.preference;
 import android.app.AlertDialog;
 import android.content.Context;
 import android.content.DialogInterface;
-import android.net.Uri;
 import android.os.Bundle;
 import android.text.SpannableString;
 import android.text.SpannableStringBuilder;
 import android.text.style.AbsoluteSizeSpan;
 import android.text.style.ForegroundColorSpan;
 import android.view.Gravity;
+import android.view.LayoutInflater;
 import android.view.Menu;
 import android.view.MenuInflater;
 import android.view.MenuItem;
@@ -20,46 +20,49 @@ import android.widget.ProgressBar;
 import android.widget.TextView;
 import androidx.annotation.NonNull;
 import androidx.fragment.app.DialogFragment;
+import androidx.fragment.app.FragmentManager;
+import androidx.lifecycle.ViewModelProvider;
 import androidx.recyclerview.widget.RecyclerView;
-import chan.content.ChanConfiguration;
+import chan.content.Chan;
 import chan.content.ChanManager;
+import chan.util.CommonUtils;
 import chan.util.StringUtils;
 import com.mishiranu.dashchan.C;
 import com.mishiranu.dashchan.R;
 import com.mishiranu.dashchan.content.Preferences;
 import com.mishiranu.dashchan.content.UpdaterActivity;
-import com.mishiranu.dashchan.content.async.AsyncManager;
 import com.mishiranu.dashchan.content.async.ReadUpdateTask;
+import com.mishiranu.dashchan.content.async.TaskViewModel;
 import com.mishiranu.dashchan.content.model.ErrorItem;
-import com.mishiranu.dashchan.ui.ActivityHandler;
 import com.mishiranu.dashchan.ui.FragmentHandler;
+import com.mishiranu.dashchan.ui.InstanceDialog;
 import com.mishiranu.dashchan.ui.preference.core.CheckPreference;
 import com.mishiranu.dashchan.util.AndroidUtils;
+import com.mishiranu.dashchan.util.ConcurrentUtils;
 import com.mishiranu.dashchan.util.ListViewUtils;
 import com.mishiranu.dashchan.util.ResourceUtils;
-import com.mishiranu.dashchan.util.ToastUtils;
 import com.mishiranu.dashchan.util.ViewUtils;
+import com.mishiranu.dashchan.widget.ClickableToast;
 import com.mishiranu.dashchan.widget.DividerItemDecoration;
+import com.mishiranu.dashchan.widget.ExpandedLayout;
 import com.mishiranu.dashchan.widget.SimpleViewHolder;
 import com.mishiranu.dashchan.widget.ThemeEngine;
 import com.mishiranu.dashchan.widget.ViewFactory;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 
-public class UpdateFragment extends BaseListFragment implements ActivityHandler, AsyncManager.Callback {
+public class UpdateFragment extends BaseListFragment {
 	private static final String VERSION_TITLE_RELEASE = "Release";
 
 	private static final String EXTRA_UPDATE_DATA_MAP = "updateDataMap";
-	private static final String EXTRA_UPDATE_DOWNLOAD_ERROR = "updateDownloadError";
+	private static final String EXTRA_UPDATE_ERROR_ITEM = "updateErrorItem";
 	private static final String EXTRA_TARGET_PREFIX = "target_";
 
-	private static final String TASK_READ_UPDATES = "readUpdates";
-
 	private ReadUpdateTask.UpdateDataMap updateDataMap;
-	private ErrorItem updateDownloadError;
+	private ErrorItem updateErrorItem;
 
 	private View progressView;
 
@@ -73,10 +76,10 @@ public class UpdateFragment extends BaseListFragment implements ActivityHandler,
 		public int targetIndex;
 		public String warning;
 
-		public static ListItem create(String extensionName, boolean enabled, boolean installed) {
-			String title = ChanConfiguration.get(extensionName).getTitle();
+		public static ListItem create(String extensionName, String extensionTitle, boolean enabled, boolean installed) {
+			String title = Chan.get(extensionName).configuration.getTitle();
 			if (title == null) {
-				title = extensionName;
+				title = extensionTitle;
 			}
 			return new ListItem(extensionName, title, enabled, installed);
 		}
@@ -96,16 +99,16 @@ public class UpdateFragment extends BaseListFragment implements ActivityHandler,
 			return !isHeader() && (installed && targetIndex > 0 || !installed && targetIndex >= 0);
 		}
 
-		public void setTarget(Context context, List<ReadUpdateTask.UpdateItem> updateItems, int targetIndex) {
+		public void setTarget(Context context, ReadUpdateTask.ApplicationItem applicationItem, int targetIndex) {
 			this.targetIndex = targetIndex;
 			if (installed && targetIndex > 0 || !installed && targetIndex >= 0) {
-				ReadUpdateTask.UpdateItem updateItem = updateItems.get(targetIndex);
-				String target = updateItem.title;
+				ReadUpdateTask.PackageItem packageItem = applicationItem.packageItems.get(targetIndex);
+				String target = packageItem.title;
 				if (context != null) {
-					target = context.getString(R.string.__enumeration_format, target, updateItem.name);
-					if (updateItem.length > 0) {
+					target = context.getString(R.string.__enumeration_format, target, packageItem.versionName);
+					if (packageItem.length > 0) {
 						target = context.getString(R.string.__enumeration_format, target,
-								StringUtils.formatFileSize(updateItem.length, false));
+								StringUtils.formatFileSize(packageItem.length, false));
 					}
 				}
 				this.target = target;
@@ -145,16 +148,17 @@ public class UpdateFragment extends BaseListFragment implements ActivityHandler,
 	}
 
 	@Override
-	public void onViewCreated(@NonNull View view, Bundle savedInstanceState) {
-		super.onViewCreated(view, savedInstanceState);
-
-		FrameLayout content = getContentView();
-		ProgressBar progressBar = new ProgressBar(content.getContext());
-		ThemeEngine.applyStyle(progressBar);
-		content.addView(progressBar, FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT);
+	public View onCreateView(@NonNull LayoutInflater inflater, ViewGroup container, Bundle savedInstanceState) {
+		ExpandedLayout layout = (ExpandedLayout) super.onCreateView(inflater, container, savedInstanceState);
+		FrameLayout progress = new FrameLayout(layout.getContext());
+		layout.addView(progress, ExpandedLayout.LayoutParams.MATCH_PARENT, ExpandedLayout.LayoutParams.MATCH_PARENT);
+		progress.setVisibility(View.GONE);
+		progressView = progress;
+		ProgressBar progressBar = new ProgressBar(progress.getContext());
+		progress.addView(progressBar, FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT);
 		((FrameLayout.LayoutParams) progressBar.getLayoutParams()).gravity = Gravity.CENTER;
-		progressBar.setVisibility(View.GONE);
-		progressView = progressBar;
+		ThemeEngine.applyStyle(progressBar);
+		return layout;
 	}
 
 	@Override
@@ -173,13 +177,31 @@ public class UpdateFragment extends BaseListFragment implements ActivityHandler,
 		} else {
 			updateDataMap = savedInstanceState != null
 					? savedInstanceState.getParcelable(EXTRA_UPDATE_DATA_MAP) : null;
-			updateDownloadError = savedInstanceState != null
-					? savedInstanceState.getParcelable(EXTRA_UPDATE_DOWNLOAD_ERROR) : null;
-			if (updateDownloadError != null) {
-				setErrorText(updateDownloadError.toString());
+			updateErrorItem = savedInstanceState != null
+					? savedInstanceState.getParcelable(EXTRA_UPDATE_ERROR_ITEM) : null;
+			if (updateErrorItem != null) {
+				setErrorText(updateErrorItem.toString());
 			} else if (updateDataMap == null) {
-				AsyncManager.get(this).startTask(TASK_READ_UPDATES, this, null, false);
 				progressView.setVisibility(View.VISIBLE);
+				UpdateViewModel viewModel = new ViewModelProvider(this).get(UpdateViewModel.class);
+				if (!viewModel.hasTaskOrValue()) {
+					ReadUpdateTask task = new ReadUpdateTask(requireContext(), viewModel.callback);
+					task.execute(ConcurrentUtils.PARALLEL_EXECUTOR);
+					viewModel.attach(task);
+				}
+				viewModel.observe(getViewLifecycleOwner(), (updateDataMap, errorItem) -> {
+					progressView.setVisibility(View.GONE);
+					if (updateDataMap != null) {
+						this.updateDataMap = updateDataMap;
+						Adapter adapter = (Adapter) getRecyclerView().getAdapter();
+						adapter.listItems = buildData(requireContext(), updateDataMap, null);
+						adapter.notifyDataSetChanged();
+						updateTitle();
+					} else {
+						updateErrorItem = errorItem;
+						setErrorText(errorItem.toString());
+					}
+				});
 			}
 		}
 		Adapter adapter = new Adapter(getRecyclerView().getContext(), this::onItemClick);
@@ -188,11 +210,6 @@ public class UpdateFragment extends BaseListFragment implements ActivityHandler,
 			adapter.listItems = buildData(requireContext(), updateDataMap, savedInstanceState);
 		}
 		updateTitle();
-	}
-
-	@Override
-	public void onTerminate() {
-		AsyncManager.get(this).cancelTask(TASK_READ_UPDATES, this);
 	}
 
 	@Override
@@ -208,7 +225,7 @@ public class UpdateFragment extends BaseListFragment implements ActivityHandler,
 		}
 		if (!isUpdateDataProvided()) {
 			outState.putParcelable(EXTRA_UPDATE_DATA_MAP, updateDataMap);
-			outState.putParcelable(EXTRA_UPDATE_DOWNLOAD_ERROR, updateDownloadError);
+			outState.putParcelable(EXTRA_UPDATE_ERROR_ITEM, updateErrorItem);
 		}
 	}
 
@@ -218,34 +235,36 @@ public class UpdateFragment extends BaseListFragment implements ActivityHandler,
 		return ((Adapter) getRecyclerView().getAdapter()).configureDivider(configuration, position);
 	}
 
-	private static boolean checkVersionValid(ReadUpdateTask.UpdateItem updateItem, int minVersion, int maxVersion) {
-		return updateItem.ignoreVersion || updateItem.version >= minVersion && updateItem.version <= maxVersion;
+	private static boolean checkVersionValid(ReadUpdateTask.ApplicationItem applicationItem,
+			ReadUpdateTask.PackageItem packageItem, int minApiVersion, int maxApiVersion) {
+		return applicationItem.type != ReadUpdateTask.ApplicationItem.Type.CHAN ||
+				packageItem.apiVersion >= minApiVersion && packageItem.apiVersion <= maxApiVersion;
 	}
 
-	private static boolean compareForUpdates(ReadUpdateTask.UpdateItem installedUpdateItem,
-			ReadUpdateTask.UpdateItem newUpdateItem) {
-		return newUpdateItem.code > installedUpdateItem.code ||
-				!StringUtils.equals(newUpdateItem.name, installedUpdateItem.name);
+	private static boolean compareForUpdates(ReadUpdateTask.PackageItem installed, ReadUpdateTask.PackageItem update) {
+		return update.versionCode > installed.versionCode ||
+				!CommonUtils.equals(installed.versionName, update.versionName);
 	}
 
-	private static ListItem handleAddListItem(Context context, List<ReadUpdateTask.UpdateItem> updateItems,
-			String extensionName, Bundle savedInstanceState, int minVersion, int maxVersion,
+	private static ListItem handleAddListItem(Context context, ReadUpdateTask.ApplicationItem applicationItem,
+			Bundle savedInstanceState, int minApiVersion, int maxApiVersion,
 			boolean installed, String warningUnsupported) {
-		ListItem listItem = ListItem.create(extensionName, updateItems.size() >= (installed ? 2 : 1), installed);
+		ListItem listItem = ListItem.create(applicationItem.name, applicationItem.title,
+				applicationItem.packageItems.size() >= (installed ? 2 : 1), installed);
 		int targetIndex = savedInstanceState != null ? savedInstanceState
-				.getInt(EXTRA_TARGET_PREFIX + extensionName, -1) : -1;
+				.getInt(EXTRA_TARGET_PREFIX + applicationItem.name, -1) : -1;
 		if (targetIndex < 0) {
 			if (installed) {
-				ReadUpdateTask.UpdateItem installedExtensionData = updateItems.get(0);
-				if (checkVersionValid(installedExtensionData, minVersion, maxVersion)) {
+				ReadUpdateTask.PackageItem installedExtensionData = applicationItem.packageItems.get(0);
+				if (checkVersionValid(applicationItem, installedExtensionData, minApiVersion, maxApiVersion)) {
 					targetIndex = 0;
 				}
-				for (int i = 1; i < updateItems.size(); i++) {
-					ReadUpdateTask.UpdateItem newUpdateItem = updateItems.get(i);
-					if (checkVersionValid(newUpdateItem, minVersion, maxVersion)) {
+				for (int i = 1; i < applicationItem.packageItems.size(); i++) {
+					ReadUpdateTask.PackageItem updatePackageItem = applicationItem.packageItems.get(i);
+					if (checkVersionValid(applicationItem, updatePackageItem, minApiVersion, maxApiVersion)) {
 						// targetIndex < 0 - means installed version is not supported
-						if (targetIndex < 0 || VERSION_TITLE_RELEASE.equals(newUpdateItem.title)
-								&& compareForUpdates(installedExtensionData, newUpdateItem)) {
+						if (targetIndex < 0 || VERSION_TITLE_RELEASE.equals(updatePackageItem.title)
+								&& compareForUpdates(installedExtensionData, updatePackageItem)) {
 							targetIndex = i;
 							break;
 						}
@@ -258,12 +277,36 @@ public class UpdateFragment extends BaseListFragment implements ActivityHandler,
 			}
 		} else {
 			// Restore state
-			if (!checkVersionValid(updateItems.get(targetIndex), minVersion, maxVersion)) {
+			ReadUpdateTask.PackageItem packageItem = applicationItem.packageItems.get(targetIndex);
+			if (!checkVersionValid(applicationItem, packageItem, minApiVersion, maxApiVersion)) {
 				listItem.warning = warningUnsupported;
 			}
 		}
-		listItem.setTarget(context, updateItems, targetIndex);
+		listItem.setTarget(context, applicationItem, targetIndex);
 		return listItem;
+	}
+
+	@SuppressWarnings("ComparatorCombinators")
+	private static final Comparator<ReadUpdateTask.ApplicationItem> UPDATE_DATA_COMPARATOR = (lhs, rhs) -> {
+		int result = lhs.type.compareTo(rhs.type);
+		if (result != 0) {
+			return result;
+		}
+		result = lhs.title.compareTo(rhs.title);
+		if (result != 0) {
+			return result;
+		}
+		return lhs.name.compareTo(rhs.name);
+	};
+
+	private static ArrayList<ReadUpdateTask.ApplicationItem> collectSorted
+			(ReadUpdateTask.UpdateDataMap updateDataMap, boolean installed) {
+		ArrayList<ReadUpdateTask.ApplicationItem> applicationItems = new ArrayList<>();
+		for (String extensionName : updateDataMap.extensionNames(installed)) {
+			applicationItems.add(updateDataMap.get(extensionName, installed));
+		}
+		Collections.sort(applicationItems, UPDATE_DATA_COMPARATOR);
+		return applicationItems;
 	}
 
 	private static List<ListItem> buildData(Context context,
@@ -271,81 +314,75 @@ public class UpdateFragment extends BaseListFragment implements ActivityHandler,
 		ArrayList<ListItem> listItems = new ArrayList<>();
 		String warningUnsupported = context != null ? context.getString(R.string.unsupported_version) : null;
 		HashSet<String> handledExtensionNames = new HashSet<>();
-		int minVersion;
-		int maxVersion;
+		int minApiVersion;
+		int maxApiVersion;
 		{
-			List<ReadUpdateTask.UpdateItem> updateItems = updateDataMap.get(ChanManager.EXTENSION_NAME_CLIENT, true);
+			ReadUpdateTask.ApplicationItem applicationItem = updateDataMap.get(ChanManager.EXTENSION_NAME_CLIENT, true);
 			ListItem listItem = new ListItem(ChanManager.EXTENSION_NAME_CLIENT,
 					context != null ? AndroidUtils.getApplicationLabel(context) : null,
-					updateItems.size() >= 2, true);
+					applicationItem.packageItems.size() >= 2, true);
 			int targetIndex = savedInstanceState != null ? savedInstanceState.getInt(EXTRA_TARGET_PREFIX
 					+ listItem.extensionName, -1) : -1;
 			if (targetIndex < 0) {
 				targetIndex = 0;
-				for (int i = 1; i < updateItems.size(); i++) {
-					ReadUpdateTask.UpdateItem newUpdateItem = updateItems.get(i);
-					if (VERSION_TITLE_RELEASE.equals(newUpdateItem.title) &&
-							compareForUpdates(updateItems.get(0), newUpdateItem)) {
+				for (int i = 1; i < applicationItem.packageItems.size(); i++) {
+					ReadUpdateTask.PackageItem updatePackageItem = applicationItem.packageItems.get(i);
+					if (VERSION_TITLE_RELEASE.equals(updatePackageItem.title) &&
+							compareForUpdates(applicationItem.packageItems.get(0), updatePackageItem)) {
 						targetIndex = 1;
 						break;
 					}
 				}
 			}
-			listItem.setTarget(context, updateItems, targetIndex);
-			ReadUpdateTask.UpdateItem currentAppUpdateItem = updateItems.get(targetIndex);
-			minVersion = currentAppUpdateItem.minVersion;
-			maxVersion = currentAppUpdateItem.version;
+			listItem.setTarget(context, applicationItem, targetIndex);
+			ReadUpdateTask.PackageItem currentApplicationPackageItem = applicationItem.packageItems.get(targetIndex);
+			minApiVersion = currentApplicationPackageItem.minApiVersion;
+			maxApiVersion = currentApplicationPackageItem.maxApiVersion;
 			listItems.add(listItem);
 		}
 		handledExtensionNames.add(ChanManager.EXTENSION_NAME_CLIENT);
 		ChanManager manager = ChanManager.getInstance();
-		for (String chanName : manager.getAvailableChanNames()) {
-			List<ReadUpdateTask.UpdateItem> updateItems = updateDataMap.get(chanName, true);
-			if (updateItems != null) {
-				ListItem listItem = handleAddListItem(context, updateItems, chanName,
-						savedInstanceState, minVersion, maxVersion, true, warningUnsupported);
-				listItems.add(listItem);
-				handledExtensionNames.add(chanName);
-			}
-		}
 		for (ChanManager.ExtensionItem extensionItem : manager.getExtensionItems()) {
 			if (extensionItem.type == ChanManager.ExtensionItem.Type.LIBRARY) {
-				List<ReadUpdateTask.UpdateItem> updateItems = updateDataMap.get(extensionItem.extensionName, true);
-				if (updateItems != null) {
-					ListItem listItem = handleAddListItem(context, updateItems, extensionItem.extensionName,
-							savedInstanceState, minVersion, maxVersion, true, warningUnsupported);
+				ReadUpdateTask.ApplicationItem applicationItem = updateDataMap.get(extensionItem.name, true);
+				if (applicationItem != null) {
+					ListItem listItem = handleAddListItem(context, applicationItem,
+							savedInstanceState, minApiVersion, maxApiVersion, true, warningUnsupported);
 					listItems.add(listItem);
-					handledExtensionNames.add(extensionItem.extensionName);
+					handledExtensionNames.add(extensionItem.name);
 				}
 			}
 		}
-		List<String> updateExtensionNames = new ArrayList<>(updateDataMap.extensionNames(true));
-		Collections.sort(updateExtensionNames);
-		for (String extensionName : updateExtensionNames) {
-			if (!handledExtensionNames.contains(extensionName)) {
-				List<ReadUpdateTask.UpdateItem> updateItems = updateDataMap.get(extensionName, true);
-				ListItem listItem = handleAddListItem(context, updateItems, extensionName, savedInstanceState,
-						minVersion, maxVersion, true, warningUnsupported);
+		for (Chan chan : manager.getAvailableChans()) {
+			ReadUpdateTask.ApplicationItem applicationItem = updateDataMap.get(chan.name, true);
+			if (applicationItem != null) {
+				ListItem listItem = handleAddListItem(context, applicationItem,
+						savedInstanceState, minApiVersion, maxApiVersion, true, warningUnsupported);
 				listItems.add(listItem);
-				handledExtensionNames.add(extensionName);
+				handledExtensionNames.add(chan.name);
 			}
 		}
-		List<String> installExtensionNames = new ArrayList<>(updateDataMap.extensionNames(false));
-		Collections.sort(installExtensionNames);
-		boolean headerAdded = false;
-		for (String extensionName : installExtensionNames) {
-			if (!handledExtensionNames.contains(extensionName)) {
-				if (!headerAdded) {
+		for (ReadUpdateTask.ApplicationItem applicationItem : collectSorted(updateDataMap, true)) {
+			if (!handledExtensionNames.contains(applicationItem.name)) {
+				ListItem listItem = handleAddListItem(context, applicationItem, savedInstanceState,
+						minApiVersion, maxApiVersion, true, warningUnsupported);
+				listItems.add(listItem);
+				handledExtensionNames.add(applicationItem.name);
+			}
+		}
+		boolean availableHeaderAdded = false;
+		for (ReadUpdateTask.ApplicationItem applicationItem : collectSorted(updateDataMap, false)) {
+			if (!handledExtensionNames.contains(applicationItem.name)) {
+				if (!availableHeaderAdded) {
 					if (context != null) {
 						listItems.add(new ListItem("", context.getString(R.string.available__plural), false, false));
 					}
-					headerAdded = true;
+					availableHeaderAdded = true;
 				}
-				List<ReadUpdateTask.UpdateItem> updateItems = updateDataMap.get(extensionName, false);
-				ListItem listItem = handleAddListItem(context, updateItems, extensionName, savedInstanceState,
-						minVersion, maxVersion, false, warningUnsupported);
+				ListItem listItem = handleAddListItem(context, applicationItem, savedInstanceState,
+						minApiVersion, maxApiVersion, false, warningUnsupported);
 				listItems.add(listItem);
-				handledExtensionNames.add(extensionName);
+				handledExtensionNames.add(applicationItem.name);
 			}
 		}
 		return listItems;
@@ -355,21 +392,22 @@ public class UpdateFragment extends BaseListFragment implements ActivityHandler,
 		ArrayList<String> targets = new ArrayList<>();
 		ArrayList<String> repositories = new ArrayList<>();
 		int targetIndex;
-		List<ReadUpdateTask.UpdateItem> updateItems = updateDataMap.get(listItem.extensionName, listItem.installed);
+		ReadUpdateTask.ApplicationItem applicationItem = updateDataMap.get(listItem.extensionName, listItem.installed);
 		if (listItem.installed) {
 			targets.add(getString(R.string.keep_current_version));
 			repositories.add(null);
-			for (ReadUpdateTask.UpdateItem updateItem : updateItems.subList(1, updateItems.size())) {
-				targets.add(updateItem.title);
-				repositories.add(updateItem.repository);
+			for (ReadUpdateTask.PackageItem packageItem : applicationItem.packageItems
+					.subList(1, applicationItem.packageItems.size())) {
+				targets.add(packageItem.title);
+				repositories.add(packageItem.repository);
 			}
 			targetIndex = listItem.targetIndex;
 		} else {
 			targets.add(getString(R.string.dont_install));
 			repositories.add(null);
-			for (ReadUpdateTask.UpdateItem updateItem : updateItems) {
-				targets.add(updateItem.title);
-				repositories.add(updateItem.repository);
+			for (ReadUpdateTask.PackageItem packageItem : applicationItem.packageItems) {
+				targets.add(packageItem.title);
+				repositories.add(packageItem.repository);
 			}
 			targetIndex = listItem.targetIndex + 1;
 		}
@@ -395,7 +433,7 @@ public class UpdateFragment extends BaseListFragment implements ActivityHandler,
 			for (ListItem listItem : adapter.listItems) {
 				if (listItem.willBeInstalled()) {
 					length += updateDataMap.get(listItem.extensionName, listItem.installed)
-							.get(listItem.targetIndex).length;
+							.packageItems.get(listItem.targetIndex).length;
 				}
 			}
 		}
@@ -417,20 +455,21 @@ public class UpdateFragment extends BaseListFragment implements ActivityHandler,
 					Adapter adapter = (Adapter) getRecyclerView().getAdapter();
 					for (ListItem listItem : adapter.listItems) {
 						if (listItem.willBeInstalled()) {
-							ReadUpdateTask.UpdateItem updateItem = updateDataMap
-									.get(listItem.extensionName, listItem.installed).get(listItem.targetIndex);
-							if (updateItem.source != null) {
+							ReadUpdateTask.PackageItem packageItem = updateDataMap
+									.get(listItem.extensionName, listItem.installed)
+									.packageItems.get(listItem.targetIndex);
+							if (packageItem.source != null) {
 								requests.add(new UpdaterActivity.Request(listItem.extensionName,
-										updateItem.name, Uri.parse(updateItem.source)));
+										packageItem.versionName, packageItem.source, packageItem.sha256sum));
 							}
 						}
 					}
 				}
 				if (!requests.isEmpty()) {
-					MessageDialog.create(this, getString(R.string.update_reminder__sentence), true);
+					displayUpdateReminderDialog(getChildFragmentManager());
 					UpdaterActivity.startUpdater(requests);
 				} else {
-					ToastUtils.show(requireContext(), R.string.no_available_updates);
+					ClickableToast.show(R.string.no_available_updates);
 				}
 				return true;
 			}
@@ -442,13 +481,24 @@ public class UpdateFragment extends BaseListFragment implements ActivityHandler,
 		return false;
 	}
 
+	private static void displayUpdateReminderDialog(FragmentManager fragmentManager) {
+		new InstanceDialog(fragmentManager, null, provider -> new AlertDialog
+				.Builder(provider.getContext())
+				.setMessage(R.string.update_reminder__sentence)
+				.setPositiveButton(android.R.string.ok, (d, w) -> ((FragmentHandler) provider
+						.getActivity()).removeFragment())
+				.setOnCancelListener(d -> ((FragmentHandler) provider.getActivity()).removeFragment())
+				.create());
+	}
+
 	private static void handleListItemValidity(ReadUpdateTask.UpdateDataMap updateDataMap,
-			ListItem listItem, int minVersion, int maxVersion, String warningUnsupported) {
+			ListItem listItem, int minApiVersion, int maxApiVersion, String warningUnsupported) {
 		boolean valid = true;
 		if (listItem.targetIndex >= 0) {
-			ReadUpdateTask.UpdateItem updateItem = updateDataMap
-					.get(listItem.extensionName, listItem.installed).get(listItem.targetIndex);
-			valid = checkVersionValid(updateItem, minVersion, maxVersion);
+			ReadUpdateTask.ApplicationItem applicationItem = updateDataMap
+					.get(listItem.extensionName, listItem.installed);
+			ReadUpdateTask.PackageItem packageItem = applicationItem.packageItems.get(listItem.targetIndex);
+			valid = checkVersionValid(applicationItem, packageItem, minApiVersion, maxApiVersion);
 		}
 		listItem.warning = valid ? null : warningUnsupported;
 	}
@@ -460,19 +510,19 @@ public class UpdateFragment extends BaseListFragment implements ActivityHandler,
 		if (!ChanManager.EXTENSION_NAME_CLIENT.equals(applicationListItem.extensionName)) {
 			throw new IllegalStateException();
 		}
-		ReadUpdateTask.UpdateItem applicationUpdateItem = updateDataMap
-				.get(ChanManager.EXTENSION_NAME_CLIENT, true).get(applicationListItem.targetIndex);
-		int minVersion = applicationUpdateItem.minVersion;
-		int maxVersion = applicationUpdateItem.version;
+		ReadUpdateTask.PackageItem applicationPackageItem = updateDataMap
+				.get(ChanManager.EXTENSION_NAME_CLIENT, true).packageItems.get(applicationListItem.targetIndex);
+		int minApiVersion = applicationPackageItem.minApiVersion;
+		int maxApiVersion = applicationPackageItem.maxApiVersion;
 		if (ChanManager.EXTENSION_NAME_CLIENT.equals(listItem.extensionName)) {
 			for (ListItem invalidateListItem : adapter.listItems) {
 				if (!invalidateListItem.isHeader()) {
 					handleListItemValidity(updateDataMap, invalidateListItem,
-							minVersion, maxVersion, warningUnsupported);
+							minApiVersion, maxApiVersion, warningUnsupported);
 				}
 			}
 		} else {
-			handleListItemValidity(updateDataMap, listItem, minVersion, maxVersion, warningUnsupported);
+			handleListItemValidity(updateDataMap, listItem, minApiVersion, maxApiVersion, warningUnsupported);
 		}
 	}
 
@@ -481,12 +531,12 @@ public class UpdateFragment extends BaseListFragment implements ActivityHandler,
 		for (int i = 0; i < adapter.listItems.size(); i++) {
 			ListItem listItem = adapter.listItems.get(i);
 			if (extensionName.equals(listItem.extensionName)) {
-				List<ReadUpdateTask.UpdateItem> updateItems = updateDataMap.get(extensionName, listItem.installed);
+				ReadUpdateTask.ApplicationItem applicationItem = updateDataMap.get(extensionName, listItem.installed);
 				if (!listItem.installed) {
 					targetIndex--;
 				}
 				if (listItem.targetIndex != targetIndex) {
-					listItem.setTarget(requireContext(), updateItems, targetIndex);
+					listItem.setTarget(requireContext(), applicationItem, targetIndex);
 					onTargetChanged(requireContext(), adapter, updateDataMap, listItem);
 					adapter.notifyDataSetChanged();
 					requireActivity().invalidateOptionsMenu();
@@ -497,45 +547,7 @@ public class UpdateFragment extends BaseListFragment implements ActivityHandler,
 		}
 	}
 
-	private static class ReadUpdateHolder extends AsyncManager.Holder implements ReadUpdateTask.Callback {
-		@Override
-		public void onReadUpdateComplete(ReadUpdateTask.UpdateDataMap updateDataMap, ErrorItem errorItem) {
-			storeResult(updateDataMap, errorItem);
-		}
-	}
-
-	@Override
-	public AsyncManager.Holder onCreateAndExecuteTask(String name, HashMap<String, Object> extra) {
-		ReadUpdateHolder holder = new ReadUpdateHolder();
-		ReadUpdateTask task = new ReadUpdateTask(requireContext(), holder);
-		task.executeOnExecutor(ReadUpdateTask.THREAD_POOL_EXECUTOR);
-		return holder.attach(task);
-	}
-
-	@Override
-	public void onFinishTaskExecution(String name, AsyncManager.Holder holder) {
-		ReadUpdateTask.UpdateDataMap updateDataMap = holder.nextArgument();
-		ErrorItem errorItem = holder.nextArgument();
-		progressView.setVisibility(View.GONE);
-		if (updateDataMap != null) {
-			this.updateDataMap = updateDataMap;
-			Adapter adapter = (Adapter) getRecyclerView().getAdapter();
-			adapter.listItems = buildData(requireContext(), updateDataMap, null);
-			adapter.notifyDataSetChanged();
-			updateTitle();
-		} else {
-			if (errorItem == null) {
-				errorItem = new ErrorItem(ErrorItem.Type.UNKNOWN);
-			}
-			updateDownloadError = errorItem;
-			setErrorText(errorItem.toString());
-		}
-	}
-
-	@Override
-	public void onRequestTaskCancel(String name, Object task) {
-		((ReadUpdateTask) task).cancel();
-	}
+	public static class UpdateViewModel extends TaskViewModel.Proxy<ReadUpdateTask, ReadUpdateTask.Callback> {}
 
 	private static class Adapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
 		private enum ViewType {ITEM, HEADER}
@@ -658,8 +670,7 @@ public class UpdateFragment extends BaseListFragment implements ActivityHandler,
 			List<String> repositories = requireArguments().getStringArrayList(EXTRA_REPOSITORIES);
 			CharSequence[] titles = new CharSequence[targets.size()];
 			FrameLayout referenceParent = new FrameLayout(requireContext());
-			TextView referenceSubtitle = ((ViewFactory.TwoLinesViewHolder)
-					ViewFactory.makeTwoLinesListItem(referenceParent).getTag()).text2;
+			TextView referenceSubtitle = ViewFactory.makeTwoLinesListItem(referenceParent, 0).text2;
 			for (int i = 0; i < titles.length; i++) {
 				String target = targets.get(i);
 				String repository = repositories.get(i);

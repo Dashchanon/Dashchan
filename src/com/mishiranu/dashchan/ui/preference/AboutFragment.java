@@ -1,47 +1,28 @@
 package com.mishiranu.dashchan.ui.preference;
 
 import android.app.AlertDialog;
-import android.content.Context;
 import android.content.DialogInterface;
 import android.content.SharedPreferences;
-import android.content.res.Configuration;
-import android.net.Uri;
 import android.os.Bundle;
+import android.text.format.DateFormat;
 import android.view.View;
 import androidx.annotation.NonNull;
 import androidx.fragment.app.DialogFragment;
-import chan.content.ChanLocator;
-import chan.http.HttpException;
-import chan.http.HttpHolder;
-import chan.http.HttpRequest;
-import chan.text.GroupParser;
-import chan.text.ParseException;
 import chan.util.CommonUtils;
 import chan.util.DataFile;
-import chan.util.StringUtils;
 import com.mishiranu.dashchan.BuildConfig;
 import com.mishiranu.dashchan.C;
 import com.mishiranu.dashchan.R;
 import com.mishiranu.dashchan.content.BackupManager;
-import com.mishiranu.dashchan.content.LocaleManager;
 import com.mishiranu.dashchan.content.Preferences;
-import com.mishiranu.dashchan.content.async.AsyncManager;
-import com.mishiranu.dashchan.content.model.ErrorItem;
 import com.mishiranu.dashchan.content.service.DownloadService;
-import com.mishiranu.dashchan.ui.ActivityHandler;
 import com.mishiranu.dashchan.ui.FragmentHandler;
 import com.mishiranu.dashchan.ui.preference.core.PreferenceFragment;
-import com.mishiranu.dashchan.util.Log;
-import com.mishiranu.dashchan.util.ToastUtils;
-import com.mishiranu.dashchan.widget.ProgressDialog;
+import com.mishiranu.dashchan.widget.ClickableToast;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
-import java.util.Locale;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
-public class AboutFragment extends PreferenceFragment implements ActivityHandler {
+public class AboutFragment extends PreferenceFragment implements FragmentHandler.Callback {
 	private static final String EXTRA_IN_STORAGE_REQUEST = "inStorageRequest";
 
 	private boolean inStorageRequest = false;
@@ -68,15 +49,18 @@ public class AboutFragment extends PreferenceFragment implements ActivityHandler
 				.setOnClickListener(p -> new BackupDialog()
 						.show(getChildFragmentManager(), BackupDialog.class.getName()));
 		addButton(R.string.changelog, 0)
-				.setOnClickListener(p -> new ReadDialog(ReadDialog.Type.CHANGELOG)
-						.show(getChildFragmentManager(), ReadDialog.class.getName()));
+				.setOnClickListener(p -> ((FragmentHandler) requireActivity())
+						.pushFragment(new TextFragment(TextFragment.Type.CHANGELOG)));
 		addButton(R.string.check_for_updates, 0)
 				.setOnClickListener(p -> ((FragmentHandler) requireActivity())
 						.pushFragment(new UpdateFragment()));
 		addButton(R.string.foss_licenses, R.string.foss_licenses__summary)
 				.setOnClickListener(p -> ((FragmentHandler) requireActivity())
-						.pushFragment(new TextFragment(TextFragment.Type.LICENSES, null)));
-		addButton(getString(R.string.build_version), BuildConfig.VERSION_NAME);
+						.pushFragment(new TextFragment(TextFragment.Type.LICENSES)));
+		String versionDate = TextFragment.formatChangelogDate
+				(DateFormat.getDateFormat(requireContext()), BuildConfig.VERSION_DATE);
+		addButton(getString(R.string.build_version), BuildConfig.VERSION_NAME +
+				(versionDate != null ? " " + versionDate : ""));
 	}
 
 	@Override
@@ -109,9 +93,10 @@ public class AboutFragment extends PreferenceFragment implements ActivityHandler
 		} else {
 			LinkedHashMap<DataFile, String> filesMap = BackupManager.getAvailableBackups(requireContext());
 			if (filesMap != null && filesMap.size() > 0) {
-				new RestoreFragment(filesMap).show(getChildFragmentManager(), RestoreFragment.class.getName());
+				RestoreDialog dialog = new RestoreDialog(filesMap);
+				dialog.show(getChildFragmentManager(), RestoreDialog.class.getName());
 			} else {
-				ToastUtils.show(requireContext(), R.string.backups_not_found);
+				ClickableToast.show(R.string.backups_not_found);
 			}
 		}
 	}
@@ -140,13 +125,13 @@ public class AboutFragment extends PreferenceFragment implements ActivityHandler
 		}
 	}
 
-	public static class RestoreFragment extends DialogFragment implements DialogInterface.OnClickListener {
+	public static class RestoreDialog extends DialogFragment implements DialogInterface.OnClickListener {
 		private static final String EXTRA_FILES = "files";
 		private static final String EXTRA_NAMES = "names";
 
-		public RestoreFragment() {}
+		public RestoreDialog() {}
 
-		public RestoreFragment(LinkedHashMap<DataFile, String> filesMap) {
+		public RestoreDialog(LinkedHashMap<DataFile, String> filesMap) {
 			Bundle args = new Bundle();
 			ArrayList<String> files = new ArrayList<>(filesMap.size());
 			ArrayList<String> names = new ArrayList<>(filesMap.size());
@@ -177,205 +162,6 @@ public class AboutFragment extends PreferenceFragment implements ActivityHandler
 			String path = requireArguments().getStringArrayList(EXTRA_FILES).get(index);
 			DataFile file = DataFile.obtain(requireContext(), DataFile.Target.DOWNLOADS, path);
 			BackupManager.loadBackup(requireContext(), file);
-		}
-	}
-
-	public static class ReadDialog extends DialogFragment implements AsyncManager.Callback {
-		private static final String EXTRA_TYPE = "type";
-
-		private enum Type {CHANGELOG}
-
-		private static final String TASK_READ_CHANGELOG = "read_changelog";
-
-		public ReadDialog() {}
-
-		public ReadDialog(Type type) {
-			Bundle args = new Bundle();
-			args.putString(EXTRA_TYPE, type.name());
-			setArguments(args);
-		}
-
-		@NonNull
-		@Override
-		public ProgressDialog onCreateDialog(Bundle savedInstanceState) {
-			ProgressDialog dialog = new ProgressDialog(requireContext(), null);
-			dialog.setMessage(getString(R.string.loading__ellipsis));
-			return dialog;
-		}
-
-		@Override
-		public void onActivityCreated(Bundle savedInstanceState) {
-			super.onActivityCreated(savedInstanceState);
-			switch (Type.valueOf(requireArguments().getString(EXTRA_TYPE))) {
-				case CHANGELOG: {
-					AsyncManager.get(this).startTask(TASK_READ_CHANGELOG, this, null, false);
-					break;
-				}
-			}
-		}
-
-		@Override
-		public void onCancel(@NonNull DialogInterface dialog) {
-			super.onCancel(dialog);
-			switch (Type.valueOf(requireArguments().getString(EXTRA_TYPE))) {
-				case CHANGELOG: {
-					AsyncManager.get(this).cancelTask(TASK_READ_CHANGELOG, this);
-					break;
-				}
-			}
-		}
-
-		@Override
-		public AsyncManager.Holder onCreateAndExecuteTask(String name, HashMap<String, Object> extra) {
-			switch (name) {
-				case TASK_READ_CHANGELOG: {
-					ReadChangelogTask task = new ReadChangelogTask(requireContext());
-					task.executeOnExecutor(ReadChangelogTask.THREAD_POOL_EXECUTOR);
-					return task.getHolder();
-				}
-			}
-			return null;
-		}
-
-		@Override
-		public void onFinishTaskExecution(String name, AsyncManager.Holder holder) {
-			dismissAllowingStateLoss();
-			switch (name) {
-				case TASK_READ_CHANGELOG: {
-					String content = holder.nextArgument();
-					ErrorItem errorItem = holder.nextArgument();
-					if (errorItem == null) {
-						((FragmentHandler) requireActivity())
-								.pushFragment(new TextFragment(TextFragment.Type.CHANGELOG, content));
-					} else {
-						ToastUtils.show(requireContext(), errorItem);
-					}
-					break;
-				}
-			}
-		}
-
-		@Override
-		public void onRequestTaskCancel(String name, Object task) {
-			switch (name) {
-				case TASK_READ_CHANGELOG: {
-					((ReadChangelogTask) task).cancel();
-					break;
-				}
-			}
-		}
-	}
-
-	private static class ReadChangelogTask extends AsyncManager.SimpleTask<Void, Void, Boolean> {
-		private static final Pattern PATTERN_TITLE = Pattern.compile("<h1.*?>Changelog (.*)</h1>");
-
-		private final HttpHolder holder = new HttpHolder();
-
-		private final Configuration configuration;
-
-		private String result;
-		private ErrorItem errorItem;
-
-		public ReadChangelogTask(Context context) {
-			configuration = context.getResources().getConfiguration();
-		}
-
-		private String downloadChangelog(String suffix) throws HttpException {
-			Uri uri = ChanLocator.getDefault().buildPathWithHost("github.com",
-					"Mishiranu", "Dashchan", "wiki", "Changelog-" + suffix);
-			try {
-				String response = new HttpRequest(uri, holder).setSuccessOnly(false).read().getString();
-				Matcher matcher = PATTERN_TITLE.matcher(StringUtils.emptyIfNull(response));
-				if (matcher.find()) {
-					String titleSuffix = matcher.group(1);
-					if (titleSuffix.replace(' ', '-').toLowerCase(Locale.US).equals(suffix.toLowerCase(Locale.US))) {
-						return response;
-					}
-				}
-				return null;
-			} finally {
-				holder.cleanup();
-			}
-		}
-
-		@Override
-		public Boolean doInBackground(Void... params) {
-			try {
-				String result = null;
-				for (Locale locale : LocaleManager.getInstance().getLocales(configuration)) {
-					String language = locale.getLanguage();
-					String country = locale.getCountry();
-					if (!StringUtils.isEmpty(country)) {
-						result = downloadChangelog(language.toUpperCase(Locale.US) +
-								"-" + country.toUpperCase(Locale.US));
-						if (result != null) {
-							break;
-						}
-					}
-					result = downloadChangelog(language.toUpperCase(Locale.US));
-					if (result != null) {
-						break;
-					}
-				}
-				if (result != null) {
-					result = ChangelogGroupCallback.parse(result);
-				}
-				if (result == null) {
-					errorItem = new ErrorItem(ErrorItem.Type.UNKNOWN);
-					return false;
-				} else {
-					this.result = result;
-					return true;
-				}
-			} catch (HttpException e) {
-				errorItem = e.getErrorItemAndHandle();
-				holder.disconnect();
-				return false;
-			} finally {
-				holder.cleanup();
-			}
-		}
-
-		@Override
-		protected void onStoreResult(AsyncManager.Holder holder, Boolean result) {
-			holder.storeResult(this.result, errorItem);
-		}
-
-		@Override
-		public void cancel() {
-			cancel(true);
-			holder.interrupt();
-		}
-	}
-
-	private static class ChangelogGroupCallback implements GroupParser.Callback {
-		private String result;
-
-		public static String parse(String source) {
-			ChangelogGroupCallback callback = new ChangelogGroupCallback();
-			try {
-				GroupParser.parse(source, callback);
-			} catch (ParseException e) {
-				Log.persistent().stack(e);
-			}
-			return callback.result;
-		}
-
-		@Override
-		public boolean onStartElement(GroupParser parser, String tagName, String attrs) {
-			return "div".equals(tagName) && "markdown-body".equals(parser.getAttr(attrs, "class"));
-		}
-
-		@Override
-		public void onEndElement(GroupParser parser, String tagName) {}
-
-		@Override
-		public void onText(GroupParser parser, String source, int start, int end) {}
-
-		@Override
-		public void onGroupComplete(GroupParser parser, String text) throws ParseException {
-			result = text;
-			throw new ParseException();
 		}
 	}
 }

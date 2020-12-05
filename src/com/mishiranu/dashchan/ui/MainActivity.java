@@ -12,12 +12,12 @@ import android.content.ServiceConnection;
 import android.content.SharedPreferences;
 import android.content.res.Configuration;
 import android.graphics.drawable.ColorDrawable;
-import android.graphics.drawable.Drawable;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.IBinder;
 import android.os.Parcel;
 import android.os.SystemClock;
+import android.provider.DocumentsContract;
 import android.util.Pair;
 import android.view.ActionMode;
 import android.view.ContextThemeWrapper;
@@ -33,26 +33,30 @@ import android.widget.Toolbar;
 import androidx.annotation.NonNull;
 import androidx.core.app.NotificationCompat;
 import androidx.core.view.GravityCompat;
-import androidx.drawerlayout.widget.DrawerLayout;
-import androidx.fragment.app.Fragment;
 import androidx.fragment.app.FragmentManager;
+import androidx.fragment.app.FragmentTransaction;
+import androidx.lifecycle.Lifecycle;
+import androidx.lifecycle.ViewModel;
+import androidx.lifecycle.ViewModelProvider;
+import chan.content.Chan;
 import chan.content.ChanConfiguration;
 import chan.content.ChanLocator;
 import chan.content.ChanManager;
-import chan.util.StringUtils;
+import chan.util.CommonUtils;
 import com.mishiranu.dashchan.C;
 import com.mishiranu.dashchan.R;
 import com.mishiranu.dashchan.content.CacheManager;
 import com.mishiranu.dashchan.content.LocaleManager;
 import com.mishiranu.dashchan.content.Preferences;
 import com.mishiranu.dashchan.content.async.ReadUpdateTask;
-import com.mishiranu.dashchan.content.model.ErrorItem;
+import com.mishiranu.dashchan.content.async.TaskViewModel;
+import com.mishiranu.dashchan.content.database.ChanDatabase;
 import com.mishiranu.dashchan.content.model.GalleryItem;
+import com.mishiranu.dashchan.content.model.PostNumber;
 import com.mishiranu.dashchan.content.service.AudioPlayerService;
 import com.mishiranu.dashchan.content.service.DownloadService;
 import com.mishiranu.dashchan.content.service.PostingService;
 import com.mishiranu.dashchan.content.service.WatcherService;
-import com.mishiranu.dashchan.content.storage.DraftsStorage;
 import com.mishiranu.dashchan.content.storage.FavoritesStorage;
 import com.mishiranu.dashchan.ui.gallery.GalleryOverlay;
 import com.mishiranu.dashchan.ui.navigator.Page;
@@ -68,15 +72,15 @@ import com.mishiranu.dashchan.ui.preference.ThemesFragment;
 import com.mishiranu.dashchan.ui.preference.UpdateFragment;
 import com.mishiranu.dashchan.util.AndroidUtils;
 import com.mishiranu.dashchan.util.ConcatIterable;
-import com.mishiranu.dashchan.util.ConfigurationLock;
+import com.mishiranu.dashchan.util.ConcurrentUtils;
 import com.mishiranu.dashchan.util.DrawerToggle;
 import com.mishiranu.dashchan.util.FlagUtils;
 import com.mishiranu.dashchan.util.IOUtils;
 import com.mishiranu.dashchan.util.NavigationUtils;
 import com.mishiranu.dashchan.util.ResourceUtils;
-import com.mishiranu.dashchan.util.ToastUtils;
 import com.mishiranu.dashchan.util.ViewUtils;
 import com.mishiranu.dashchan.widget.ClickableToast;
+import com.mishiranu.dashchan.widget.CustomDrawerLayout;
 import com.mishiranu.dashchan.widget.ExpandedScreen;
 import com.mishiranu.dashchan.widget.ThemeEngine;
 import com.mishiranu.dashchan.widget.ViewFactory;
@@ -86,6 +90,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -93,11 +98,12 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.List;
 import java.util.UUID;
 
-public class MainActivity extends StateActivity implements DrawerForm.Callback,
-		FavoritesStorage.Observer, WatcherService.Client.Callback, UiManager.LocalNavigator,
-		FragmentHandler, PageFragment.Callback, ReadUpdateTask.Callback {
+public class MainActivity extends StateActivity implements DrawerForm.Callback, ThemeDialog.Callback,
+		FavoritesStorage.Observer, WatcherService.Client.Callback,
+		UiManager.Callback, UiManager.LocalNavigator, FragmentHandler, PageFragment.Callback {
 	private static final String EXTRA_FRAGMENTS = "fragments";
 	private static final String EXTRA_STACK_PAGE_ITEMS = "stackPageItems";
 	private static final String EXTRA_PRESERVED_PAGE_ITEMS = "preservedPageItems";
@@ -117,15 +123,16 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 	private PageItem currentPageItem;
 
 	private UiManager uiManager;
-	private RetainFragment retainFragment;
-	private ConfigurationLock configurationLock;
-	private final WatcherService.Client watcherServiceClient = new WatcherService.Client(this);
+	private InstanceViewModel instanceViewModel;
+	private WatcherService.Client watcherServiceClient;
+	private final ExtensionsTrustLoop.State extensionsTrustLoopState = new ExtensionsTrustLoop.State();
 	private DownloadDialog downloadDialog;
 
 	private DrawerForm drawerForm;
 	private FrameLayout drawerParent;
-	private DrawerLayout drawerLayout;
+	private CustomDrawerLayout drawerLayout;
 	private DrawerToggle drawerToggle;
+	private final HashSet<String> navigationAreaLockers = new HashSet<>();
 
 	private ExpandedScreen expandedScreen;
 	private ViewFactory.ToolbarHolder toolbarHolder;
@@ -135,14 +142,12 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 	private ViewGroup drawerWide;
 	private boolean wideMode;
 
-	private ReadUpdateTask readUpdateTask;
 	private Intent navigateIntentOnResume;
 	private StorageRequestState storageRequestState;
 
 	private static final String LOCKER_DRAWER = "drawer";
 	private static final String LOCKER_NON_PAGE = "nonPage";
-
-	private final ClickableToast.Holder clickableToastHolder = new ClickableToast.Holder(this);
+	private static final String LOCKER_ACTION_MODE = "actionMode";
 
 	@Override
 	protected void attachBaseContext(Context newBase) {
@@ -160,15 +165,18 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 		ThemeEngine.applyTheme(this);
 		ExpandedScreen.Init expandedScreenInit = expandedScreenPreThemeInit.initAfterTheme();
 		super.onCreate(savedInstanceState);
-		getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+		// ExpandedScreen should handle this for R+
+		getWindow().setSoftInputMode(C.API_R ? WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
+				: ViewUtils.SOFT_INPUT_ADJUST_RESIZE_COMPAT);
 		float density = ResourceUtils.obtainDensity(this);
 		setContentView(R.layout.activity_main);
-		ClickableToast.register(clickableToastHolder);
+		ClickableToast.register(this);
+		ForegroundManager.getInstance().register(this);
 		FavoritesStorage.getInstance().getObservable().register(this);
 		Preferences.PREFERENCES.registerOnSharedPreferenceChangeListener(preferencesListener);
 		ChanManager.getInstance().observable.register(chanManagerCallback);
-		watcherServiceClient.bind(this);
-		configurationLock = new ConfigurationLock(this);
+		watcherServiceClient = WatcherService.getClient(this);
+		watcherServiceClient.setCallback(this);
 		drawerCommon = findViewById(R.id.drawer_common);
 		drawerWide = findViewById(R.id.drawer_wide);
 		ThemeEngine.Theme theme = ThemeEngine.getTheme(this);
@@ -188,7 +196,7 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 		}
 		drawerCommon.setBackgroundColor(drawerBackground);
 		drawerWide.setBackgroundColor(drawerBackground);
-		drawerForm = new DrawerForm(drawerContext, this, configurationLock, watcherServiceClient);
+		drawerForm = new DrawerForm(drawerContext, this, getSupportFragmentManager(), watcherServiceClient);
 		drawerParent = new FrameLayout(this);
 		drawerParent.addView(drawerForm.getContentView());
 		drawerCommon.addView(drawerParent);
@@ -229,7 +237,7 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 			drawerLayout.addDrawerListener(new ExpandedScreenDrawerLocker());
 		}
 
-		downloadDialog = new DownloadDialog(this, configurationLock, new DownloadDialog.Callback() {
+		downloadDialog = new DownloadDialog(this, new DownloadDialog.Callback() {
 			@Override
 			public void resolve(DownloadService.ChoiceRequest choiceRequest,
 					DownloadService.DirectRequest directRequest) {
@@ -258,7 +266,9 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 		expandedScreen = new ExpandedScreen(expandedScreenInit, drawerLayout, toolbarLayout, drawerInterlayer,
 				drawerParent, drawerForm.getContentView(), drawerForm.getHeaderView());
 		expandedScreen.setDrawerOverToolbarEnabled(!wideMode);
-		uiManager = new UiManager(this, this, () -> downloadBinder, configurationLock);
+		uiManager = new UiManager(this, this, this);
+		uiManager.attach(this);
+		ContentFragment.prepare(this);
 		ViewGroup contentFragment = findViewById(R.id.content_fragment);
 		contentFragment.setOnHierarchyChangeListener(new ViewGroup.OnHierarchyChangeListener() {
 			@Override
@@ -275,12 +285,12 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 		bindService(new Intent(this, DownloadService.class), downloadConnection, BIND_AUTO_CREATE);
 		boolean allowSelectChan = ChanManager.getInstance().hasMultipleAvailableChans();
 		if (savedInstanceState == null) {
-			int drawerInitialPosition = Preferences.getDrawerInitialPosition();
-			if (drawerInitialPosition != Preferences.DRAWER_INITIAL_POSITION_CLOSED) {
+			Preferences.DrawerInitialPosition drawerInitialPosition = Preferences.getDrawerInitialPosition();
+			if (drawerInitialPosition != Preferences.DrawerInitialPosition.CLOSED) {
 				if (!wideMode) {
 					drawerLayout.post(() -> drawerLayout.openDrawer(GravityCompat.START));
 				}
-				if (drawerInitialPosition == Preferences.DRAWER_INITIAL_POSITION_FORUMS) {
+				if (drawerInitialPosition == Preferences.DrawerInitialPosition.FORUMS) {
 					drawerForm.setChanSelectMode(allowSelectChan);
 				}
 			}
@@ -292,18 +302,11 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 					savedInstanceState.getBoolean(EXTRA_DRAWER_CHAN_SELECT_MODE));
 		}
 
-		FragmentManager fragmentManager = getSupportFragmentManager();
-		retainFragment = (RetainFragment) fragmentManager.findFragmentByTag(RetainFragment.class.getName());
-		if (retainFragment == null) {
-			retainFragment = new RetainFragment();
-			fragmentManager.beginTransaction()
-					.add(retainFragment, RetainFragment.class.getName())
-					.commit();
-		}
+		instanceViewModel = new ViewModelProvider(this).get(InstanceViewModel.class);
 		storageRequestState = savedInstanceState != null ? StorageRequestState
 				.valueOf(savedInstanceState.getString(EXTRA_STORAGE_REQUEST_STATE)) : StorageRequestState.NONE;
 
-		Fragment currentFragmentFromSaved = null;
+		ContentFragment currentFragmentFromSaved = null;
 		if (savedInstanceState == null) {
 			File file = getSavedPagesFile();
 			if (file != null && file.exists()) {
@@ -329,7 +332,7 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 				}
 			}
 			if (savedInstanceState != null) {
-				currentFragmentFromSaved = savedInstanceState
+				currentFragmentFromSaved = (ContentFragment) savedInstanceState
 						.<StackItem>getParcelable(EXTRA_CURRENT_FRAGMENT).create(null);
 				if (currentFragmentFromSaved == null) {
 					savedInstanceState = null;
@@ -345,13 +348,13 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 		}
 		Iterator<SavedPageItem> iterator = new ConcatIterable<>(preservedPageItems, stackPageItems).iterator();
 		while (iterator.hasNext()) {
-			if (!ChanManager.getInstance().isAvailableChanName(getSavedPage(iterator.next()).chanName)) {
+			if (Chan.get(getSavedPage(iterator.next()).chanName).name == null) {
 				iterator.remove();
 			}
 		}
 		if (currentFragmentFromSaved != null) {
-			if (currentFragmentFromSaved instanceof PageFragment && !ChanManager.getInstance()
-					.isAvailableChanName(((PageFragment) currentFragmentFromSaved).getPage().chanName)) {
+			if (currentFragmentFromSaved instanceof PageFragment &&
+					Chan.get(((PageFragment) currentFragmentFromSaved).getPage().chanName).name == null) {
 				currentFragmentFromSaved = null;
 				currentPageItem = null;
 			}
@@ -361,21 +364,19 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 				currentPageItem = pair.second;
 			}
 			if (currentFragmentFromSaved != null) {
-				fragmentManager.beginTransaction()
+				getSupportFragmentManager().beginTransaction()
 						.replace(R.id.content_fragment, currentFragmentFromSaved)
 						.commit();
 				updatePostFragmentConfiguration();
 			}
 		} else {
-			Fragment currentFragment = getCurrentFragment();
-			if (currentFragment instanceof PageFragment && !ChanManager.getInstance()
-					.isAvailableChanName(((PageFragment) currentFragment).getPage().chanName)) {
+			ContentFragment currentFragment = getCurrentFragment();
+			if (currentFragment instanceof PageFragment &&
+					Chan.get(((PageFragment) currentFragment).getPage().chanName).name == null) {
 				currentFragment = null;
 				currentPageItem = null;
 			}
-			if (currentFragment == null) {
-				startUpdateTask();
-			} else {
+			if (currentFragment != null) {
 				updatePostFragmentConfiguration();
 			}
 		}
@@ -385,23 +386,20 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 			navigateIntent(getIntent(), false);
 		}
 		if (getCurrentFragment() == null) {
-			String chanName = ChanManager.getInstance().getDefaultChanName();
-			if (chanName != null) {
-				navigateIntentData(chanName, Preferences.getDefaultBoardName(chanName), null, null, null, null, 0);
-			} else {
-				navigateFragment(new CategoriesFragment(), null);
-				ClickableToast.show(this, getString(R.string.no_extensions_installed),
-						getString(R.string.install), false, () -> {
-					if (getCurrentFragment() instanceof UpdateFragment) {
-						navigateFragment(new UpdateFragment(), null);
-					} else {
-						pushFragment(new UpdateFragment());
-					}
-				});
+			if (!navigateInitial(false)) {
+				ClickableToast.show(getString(R.string.no_extensions_installed), null,
+						new ClickableToast.Button(R.string.install, false, () -> {
+							if (getCurrentFragment() instanceof UpdateFragment) {
+								navigateFragment(new UpdateFragment(), null, true);
+							} else {
+								pushFragment(new UpdateFragment());
+							}
+						}));
 			}
 		}
 
-		ExtensionsTrustLoop.handleUntrustedExtensions(this, configurationLock);
+		startUpdateTask(savedInstanceState == null);
+		ExtensionsTrustLoop.handleUntrustedExtensions(this, extensionsTrustLoopState);
 		if (storageRequestState == StorageRequestState.INSTRUCTIONS) {
 			showStorageInstructionsDialog();
 		}
@@ -447,14 +445,14 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 		}
 	}
 
-	private Fragment getCurrentFragment() {
+	private ContentFragment getCurrentFragment() {
 		FragmentManager fragmentManager = getSupportFragmentManager();
 		try {
 			fragmentManager.executePendingTransactions();
 		} catch (IllegalStateException e) {
 			// Ignore exception
 		}
-		return fragmentManager.findFragmentById(R.id.content_fragment);
+		return (ContentFragment) fragmentManager.findFragmentById(R.id.content_fragment);
 	}
 
 	@Override
@@ -484,52 +482,64 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 	}
 
 	@Override
-	public Drawable getActionBarIcon(int attr) {
-		return ResourceUtils.getActionBarIcon(toolbarHolder != null ? toolbarHolder.toolbar.getContext() : this, attr);
+	public Context getToolbarContext() {
+		return toolbarHolder != null ? toolbarHolder.toolbar.getContext() : this;
 	}
 
 	@Override
-	public void navigateBoardsOrThreads(String chanName, String boardName, int flags) {
-		flags = flags & (NavigationUtils.FLAG_FROM_CACHE | NavigationUtils.FLAG_RETURNABLE);
-		navigateIntentData(chanName, boardName, null, null, null, null, flags);
+	public void navigateBoardsOrThreads(String chanName, String boardName) {
+		navigateBoardsOrThreads(chanName, boardName, false, false);
+	}
+
+	private void navigateBoardsOrThreads(String chanName, String boardName, boolean fromCache, boolean allowReturn) {
+		navigateData(chanName, boardName, null, null, null, null, FLAG_DATA_CLOSE_OVERLAYS |
+				(fromCache ? FLAG_DATA_FROM_CACHE : 0) | (allowReturn ? FLAG_DATA_ALLOW_RETURN : 0));
 	}
 
 	@Override
-	public void navigatePosts(String chanName, String boardName, String threadNumber, String postNumber,
-			String threadTitle, int flags) {
-		flags = flags & (NavigationUtils.FLAG_FROM_CACHE | NavigationUtils.FLAG_RETURNABLE);
-		navigateIntentData(chanName, boardName, threadNumber, postNumber, threadTitle, null, flags);
+	public void navigatePosts(String chanName, String boardName, String threadNumber,
+			PostNumber postNumber, String threadTitle) {
+		navigatePosts(chanName, boardName, threadNumber, postNumber, threadTitle, false, false);
+	}
+
+	private void navigatePosts(String chanName, String boardName, String threadNumber,
+			PostNumber postNumber, String threadTitle, boolean fromCache, boolean allowReturn) {
+		navigateData(chanName, boardName, threadNumber, postNumber, threadTitle, null, FLAG_DATA_CLOSE_OVERLAYS |
+				(fromCache ? FLAG_DATA_FROM_CACHE : 0) | (allowReturn ? FLAG_DATA_ALLOW_RETURN : 0));
 	}
 
 	@Override
-	public void navigateSearch(String chanName, String boardName, String searchQuery, int flags) {
-		flags = flags & NavigationUtils.FLAG_RETURNABLE;
-		navigateIntentData(chanName, boardName, null, null, null, searchQuery, flags);
+	public void navigateSearch(String chanName, String boardName, String searchQuery) {
+		navigateSearch(chanName, boardName, searchQuery, false);
+	}
+
+	private void navigateSearch(String chanName, String boardName, String searchQuery, boolean allowReturn) {
+		navigateData(chanName, boardName, null, null, null, searchQuery, FLAG_DATA_CLOSE_OVERLAYS |
+				(allowReturn ? FLAG_DATA_ALLOW_RETURN : 0));
 	}
 
 	@Override
-	public void navigateArchive(String chanName, String boardName, int flags) {
-		boolean returnable = FlagUtils.get(flags, NavigationUtils.FLAG_RETURNABLE);
-		navigatePage(Page.Content.ARCHIVE, chanName, boardName, null, null, null, null, false, returnable, false);
+	public void navigateArchive(String chanName, String boardName) {
+		navigatePage(Page.Content.ARCHIVE, chanName, boardName, null, null, null, null, FLAG_PAGE_CLOSE_OVERLAYS);
 	}
 
 	@Override
-	public void navigateTarget(String chanName, ChanLocator.NavigationData data, int flags) {
+	public void navigateTargetAllowReturn(String chanName, ChanLocator.NavigationData data) {
 		switch (data.target) {
-			case ChanLocator.NavigationData.TARGET_THREADS: {
-				navigateBoardsOrThreads(chanName, data.boardName, flags);
+			case THREADS: {
+				navigateBoardsOrThreads(chanName, data.boardName, false, true);
 				break;
 			}
-			case ChanLocator.NavigationData.TARGET_POSTS: {
-				navigatePosts(chanName, data.boardName, data.threadNumber, data.postNumber, null, flags);
+			case POSTS: {
+				navigatePosts(chanName, data.boardName, data.threadNumber, data.postNumber, null, false, true);
 				break;
 			}
-			case ChanLocator.NavigationData.TARGET_SEARCH: {
-				navigateSearch(chanName, data.boardName, data.searchQuery, flags);
+			case SEARCH: {
+				navigateSearch(chanName, data.boardName, data.searchQuery, true);
 				break;
 			}
 			default: {
-				throw new UnsupportedOperationException();
+				throw new IllegalArgumentException();
 			}
 		}
 	}
@@ -537,40 +547,52 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 	@Override
 	public void navigatePosting(String chanName, String boardName, String threadNumber, Replyable.ReplyData... data) {
 		fragments.clear();
-		navigateFragment(new PostingFragment(chanName, boardName, threadNumber, Arrays.asList(data)), null);
+		navigateFragment(new PostingFragment(chanName, boardName, threadNumber, Arrays.asList(data)), null, true);
 	}
 
 	@Override
-	public void navigateGallery(String chanName, GalleryItem.GallerySet gallerySet, int imageIndex,
+	public void navigateGallery(String chanName, GalleryItem.Set gallerySet, int imageIndex,
 			View view, GalleryOverlay.NavigatePostMode navigatePostMode, boolean galleryMode) {
-		ArrayList<GalleryItem> galleryItems = gallerySet.getItems();
+		List<GalleryItem> galleryItems = gallerySet.createList();
 		navigatePostMode = gallerySet.isNavigatePostSupported() ? navigatePostMode
 				: GalleryOverlay.NavigatePostMode.DISABLED;
-		navigateGallery(new GalleryOverlay(chanName, galleryItems, imageIndex, gallerySet.getThreadTitle(),
+		navigateOrCloseGallery(new GalleryOverlay(chanName, galleryItems, imageIndex, gallerySet.getThreadTitle(),
 				view, navigatePostMode, galleryMode));
 	}
 
 	private void navigateGalleryUri(Uri uri) {
-		navigateGallery(new GalleryOverlay(uri));
+		navigateOrCloseGallery(new GalleryOverlay(uri));
 	}
 
-	private void navigateGallery(GalleryOverlay galleryOverlay) {
+	private void navigateOrCloseGallery(GalleryOverlay galleryOverlay) {
 		FragmentManager fragmentManager = getSupportFragmentManager();
 		String tag = GalleryOverlay.class.getName();
 		GalleryOverlay currentGalleryOverlay = (GalleryOverlay) fragmentManager.findFragmentByTag(tag);
 		if (currentGalleryOverlay != null) {
 			currentGalleryOverlay.dismiss();
 		}
-		galleryOverlay.show(fragmentManager, tag);
+		if (galleryOverlay != null) {
+			galleryOverlay.show(fragmentManager, tag);
+		}
 	}
 
 	@Override
-	public void scrollToPost(String chanName, String boardName, String threadNumber, String postNumber) {
-		Fragment fragment = getCurrentFragment();
+	public void navigateSetTheme(ThemeEngine.Theme theme) {
+		ConcurrentUtils.HANDLER.post(() -> {
+			if (ThemeEngine.addTheme(theme)) {
+				Preferences.setTheme(theme.name);
+				recreate();
+			}
+		});
+	}
+
+	@Override
+	public void scrollToPost(String chanName, String boardName, String threadNumber, PostNumber postNumber) {
+		ContentFragment fragment = getCurrentFragment();
 		if (fragment instanceof PageFragment) {
 			Page page = ((PageFragment) fragment).getPage();
 			if (page.content == Page.Content.POSTS && page.chanName.equals(chanName) &&
-					StringUtils.equals(page.boardName, boardName) && page.threadNumber.equals(threadNumber)) {
+					CommonUtils.equals(page.boardName, boardName) && page.threadNumber.equals(threadNumber)) {
 				((PageFragment) fragment).scrollToPost(postNumber);
 			}
 		}
@@ -588,13 +610,13 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 		ReadUpdateTask.UpdateDataMap updateDataMap = intent.getParcelableExtra(C.EXTRA_UPDATE_DATA_MAP);
 		if (updateDataMap != null) {
 			fragments.clear();
-			navigateFragment(new UpdateFragment(updateDataMap), null);
+			navigateFragment(new UpdateFragment(updateDataMap), null, true);
 		} else if (C.ACTION_POSTING.equals(intent.getAction())) {
 			String chanName = intent.getStringExtra(C.EXTRA_CHAN_NAME);
 			String boardName = intent.getStringExtra(C.EXTRA_BOARD_NAME);
 			String threadNumber = intent.getStringExtra(C.EXTRA_THREAD_NUMBER);
 			PostingService.FailResult failResult = intent.getParcelableExtra(C.EXTRA_FAIL_RESULT);
-			Fragment currentFragment = getCurrentFragment();
+			ContentFragment currentFragment = getCurrentFragment();
 			boolean replace = true;
 			if (currentFragment instanceof PostingFragment &&
 					((PostingFragment) currentFragment).check(chanName, boardName, threadNumber)) {
@@ -603,7 +625,7 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 			if (replace) {
 				fragments.clear();
 				navigateFragment(new PostingFragment(chanName, boardName, threadNumber,
-						Collections.emptyList()), null);
+						Collections.emptyList()), null, true);
 				currentFragment = getCurrentFragment();
 			}
 			if (failResult != null) {
@@ -620,62 +642,59 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 		} else if (C.ACTION_BROWSER.equals(intent.getAction())) {
 			BrowserFragment browserFragment = new BrowserFragment(intent.getData());
 			if (getCurrentFragment() instanceof BrowserFragment) {
-				navigateFragment(browserFragment, null);
+				navigateFragment(browserFragment, null, true);
 			} else {
 				pushFragment(browserFragment);
 			}
 		} else {
 			Uri uri = intent.getData();
 			if (uri != null) {
-				if (intent.getBooleanExtra(C.EXTRA_FROM_CLIENT, false) || !navigateIntentUri(uri)) {
-					ToastUtils.show(this, R.string.unknown_address);
+				if (intent.getBooleanExtra(C.EXTRA_FROM_CLIENT, false) || !navigateUri(uri)) {
+					ClickableToast.show(R.string.unknown_address);
 				}
 			} else {
 				String chanName = intent.getStringExtra(C.EXTRA_CHAN_NAME);
 				String boardName = intent.getStringExtra(C.EXTRA_BOARD_NAME);
 				String threadNumber = intent.getStringExtra(C.EXTRA_THREAD_NUMBER);
-				String postNumber = intent.getStringExtra(C.EXTRA_POST_NUMBER);
-				String searchQuery = intent.getStringExtra(C.EXTRA_SEARCH_QUERY);
-				int flags = intent.getIntExtra(C.EXTRA_NAVIGATION_FLAGS, 0);
-				navigateIntentData(chanName, boardName, threadNumber, postNumber, null, searchQuery, flags);
+				PostNumber postNumber = PostNumber.parseNullable(intent.getStringExtra(C.EXTRA_POST_NUMBER));
+				navigateData(chanName, boardName, threadNumber, postNumber, null, null, FLAG_DATA_CLOSE_OVERLAYS);
 			}
 		}
 	}
 
-	private boolean navigateIntentUri(Uri uri) {
-		String chanName = ChanManager.getInstance().getChanNameByHost(uri.getAuthority());
-		if (chanName != null) {
-			ChanLocator locator = ChanLocator.get(chanName);
-			boolean boardUri = locator.safe(false).isBoardUri(uri);
-			boolean threadUri = locator.safe(false).isThreadUri(uri);
-			String boardName = boardUri || threadUri ? locator.safe(false).getBoardName(uri) : null;
-			String threadNumber = threadUri ? locator.safe(false).getThreadNumber(uri) : null;
-			String postNumber = threadUri ? locator.safe(false).getPostNumber(uri) : null;
+	private boolean navigateUri(Uri uri) {
+		Chan chan = Chan.getPreferred(null, uri);
+		if (chan.name != null) {
+			boolean boardUri = chan.locator.safe(false).isBoardUri(uri);
+			boolean threadUri = chan.locator.safe(false).isThreadUri(uri);
+			String boardName = boardUri || threadUri ? chan.locator.safe(false).getBoardName(uri) : null;
+			String threadNumber = threadUri ? chan.locator.safe(false).getThreadNumber(uri) : null;
+			PostNumber postNumber = threadUri ? chan.locator.safe(false).getPostNumber(uri) : null;
 			if (boardUri) {
-				navigateIntentData(chanName, boardName, null, null, null, null,
-						NavigationUtils.FLAG_RETURNABLE);
+				navigateData(chan.name, boardName, null, null, null, null,
+						FLAG_DATA_CLOSE_OVERLAYS | FLAG_DATA_ALLOW_RETURN);
 				return true;
 			} else if (threadUri) {
-				navigateIntentData(chanName, boardName, threadNumber, postNumber, null, null,
-						NavigationUtils.FLAG_RETURNABLE);
+				navigateData(chan.name, boardName, threadNumber, postNumber, null, null,
+						FLAG_DATA_CLOSE_OVERLAYS | FLAG_DATA_ALLOW_RETURN);
 				return true;
-			} else if (locator.isImageUri(uri)) {
+			} else if (chan.locator.isImageUri(uri)) {
 				navigateGalleryUri(uri);
 				return true;
-			} else if (locator.isAudioUri(uri)) {
-				AudioPlayerService.start(this, chanName, uri, locator.createAttachmentFileName(uri));
+			} else if (chan.locator.isAudioUri(uri)) {
+				AudioPlayerService.start(this, chan.name, uri, chan.locator.createAttachmentFileName(uri));
 				return true;
-			} else if (locator.isVideoUri(uri)) {
-				String fileName = locator.createAttachmentFileName(uri);
+			} else if (chan.locator.isVideoUri(uri)) {
+				String fileName = chan.locator.createAttachmentFileName(uri);
 				if (NavigationUtils.isOpenableVideoPath(fileName)) {
-					navigateGalleryUri(locator.convert(uri));
+					navigateGalleryUri(chan.locator.convert(uri));
 				} else {
-					NavigationUtils.handleUri(this, chanName, locator.convert(uri),
+					NavigationUtils.handleUri(this, chan.name, chan.locator.convert(uri),
 							NavigationUtils.BrowserType.EXTERNAL);
 				}
 				return true;
 			} else if (Preferences.isUseInternalBrowser()) {
-				NavigationUtils.handleUri(this, chanName, locator.convert(uri),
+				NavigationUtils.handleUri(this, chan.name, chan.locator.convert(uri),
 						NavigationUtils.BrowserType.INTERNAL);
 				return true;
 			}
@@ -683,12 +702,12 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 		return false;
 	}
 
-	private static boolean isSingleBoardMode(String chanName) {
-		return ChanConfiguration.get(chanName).getOption(ChanConfiguration.OPTION_SINGLE_BOARD_MODE);
+	private static boolean isSingleBoardMode(Chan chan) {
+		return chan.configuration.getOption(ChanConfiguration.OPTION_SINGLE_BOARD_MODE);
 	}
 
-	private static String getSingleBoardName(String chanName) {
-		return ChanConfiguration.get(chanName).getSingleBoardName();
+	private static String getSingleBoardName(Chan chan) {
+		return chan.configuration.getSingleBoardName();
 	}
 
 	private Page getSavedPage(SavedPageItem savedPageItem) {
@@ -699,7 +718,7 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 	private int getPagesStackSize(String chanName) {
 		boolean mergeChans = Preferences.isMergeChans();
 		int size = 0;
-		Fragment currentFragment = getCurrentFragment();
+		ContentFragment currentFragment = getCurrentFragment();
 		if (currentFragment instanceof PageFragment && currentPageItem != null &&
 				(mergeChans || (((PageFragment) currentFragment).getPage().chanName.equals(chanName)))) {
 			size++;
@@ -713,7 +732,10 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 	}
 
 	private SavedPageItem prepareTargetPreviousPage(boolean allowForeignChan) {
-		Fragment currentFragment = getCurrentFragment();
+		if (allowForeignChan && currentPageItem.allowReturn && !stackPageItems.isEmpty()) {
+			return stackPageItems.remove(stackPageItems.size() - 1);
+		}
+		ContentFragment currentFragment = getCurrentFragment();
 		String chanName = ((PageFragment) currentFragment).getPage().chanName;
 		boolean mergeChans = Preferences.isMergeChans();
 		for (int i = stackPageItems.size() - 1; i >= 0; i--) {
@@ -723,14 +745,11 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 				return savedPageItem;
 			}
 		}
-		if (allowForeignChan && currentPageItem.returnable && !stackPageItems.isEmpty()) {
-			return stackPageItems.remove(stackPageItems.size() - 1);
-		}
 		return null;
 	}
 
 	private void clearStackAndCurrent() {
-		Fragment currentFragment = getCurrentFragment();
+		ContentFragment currentFragment = getCurrentFragment();
 		boolean mergeChans = Preferences.isMergeChans();
 		boolean closeOnBack = Preferences.isCloseOnBack();
 		String chanName = ((PageFragment) currentFragment).getPage().chanName;
@@ -755,31 +774,53 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 		}
 	}
 
-	private void navigateIntentData(String chanName, String boardName, String threadNumber, String postNumber,
-			String threadTitle, String searchQuery, int flags) {
-		if (chanName == null) {
+	private boolean navigateInitial(boolean closeOverlays) {
+		currentPageItem = null;
+		Chan chan = ChanManager.getInstance().getDefaultChan();
+		if (chan != null) {
+			navigateData(chan.name, Preferences.getDefaultBoardName(chan),
+					null, null, null, null, closeOverlays ? FLAG_DATA_CLOSE_OVERLAYS : 0);
+			return true;
+		} else {
+			navigateFragment(new CategoriesFragment(), null, closeOverlays);
+			return false;
+		}
+	}
+
+	private static final int FLAG_DATA_CLOSE_OVERLAYS = 0x00000001;
+	private static final int FLAG_DATA_FROM_CACHE = 0x00000002;
+	private static final int FLAG_DATA_ALLOW_RETURN = 0x00000004;
+
+	private void navigateData(String chanName, String boardName, String threadNumber, PostNumber postNumber,
+			String threadTitle, String searchQuery, int dataFlags) {
+		Chan chan = Chan.get(chanName);
+		if (chan.name == null) {
 			return;
 		}
-		boolean fromCache = FlagUtils.get(flags, NavigationUtils.FLAG_FROM_CACHE);
-		boolean returnable = FlagUtils.get(flags, NavigationUtils.FLAG_RETURNABLE);
 		boolean forceBoardPage = false;
-		if (isSingleBoardMode(chanName)) {
-			boardName = getSingleBoardName(chanName);
+		if (isSingleBoardMode(chan)) {
+			boardName = getSingleBoardName(chan);
 			forceBoardPage = true;
 		}
+		int pageFlags = 0;
+		pageFlags = FlagUtils.set(pageFlags, FLAG_PAGE_CLOSE_OVERLAYS,
+				FlagUtils.get(dataFlags, FLAG_DATA_CLOSE_OVERLAYS));
+		pageFlags = FlagUtils.set(pageFlags, FLAG_PAGE_ALLOW_RETURN,
+				FlagUtils.get(dataFlags, FLAG_DATA_ALLOW_RETURN));
 		if (boardName != null || threadNumber != null || forceBoardPage) {
+			pageFlags = FlagUtils.set(pageFlags, FLAG_PAGE_FROM_CACHE,
+					FlagUtils.get(dataFlags, FLAG_DATA_FROM_CACHE));
 			Page.Content content = searchQuery != null ? Page.Content.SEARCH
 					: threadNumber == null ? Page.Content.THREADS : Page.Content.POSTS;
-			navigatePage(content, chanName, boardName, threadNumber, postNumber, threadTitle,
-					searchQuery, fromCache, returnable, false);
+			navigatePage(content, chan.name, boardName, threadNumber, postNumber, threadTitle, searchQuery, pageFlags);
 		} else {
 			String currentChanName = null;
-			Fragment currentFragment = getCurrentFragment();
+			ContentFragment currentFragment = getCurrentFragment();
 			if (currentFragment instanceof PageFragment) {
 				currentChanName = ((PageFragment) currentFragment).getPage().chanName;
 			}
-			if (getPagesStackSize(chanName) == 0 || !chanName.equals(currentChanName)) {
-				navigatePage(Page.Content.BOARDS, chanName, null, null, null, null, null, false, returnable, false);
+			if (getPagesStackSize(chan.name) == 0 || !chan.name.equals(currentChanName)) {
+				navigatePage(Page.Content.BOARDS, chan.name, null, null, null, null, null, pageFlags);
 			}
 		}
 	}
@@ -834,10 +875,14 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 		return pair;
 	}
 
+	private static final int FLAG_PAGE_CLOSE_OVERLAYS = 0x00000001;
+	private static final int FLAG_PAGE_FROM_CACHE = 0x00000002;
+	private static final int FLAG_PAGE_ALLOW_RETURN = 0x00000004;
+	private static final int FLAG_PAGE_RESET_SCROLL = 0x00000008;
+
 	private void navigatePage(Page.Content content, String chanName, String boardName,
-			String threadNumber, String postNumber, String threadTitle, String searchQuery,
-			boolean fromCache, boolean returnable, boolean resetScroll) {
-		Fragment currentFragment = getCurrentFragment();
+			String threadNumber, PostNumber postNumber, String threadTitle, String searchQuery, int pageFlags) {
+		ContentFragment currentFragment = getCurrentFragment();
 		Page currentPage = currentFragment instanceof PageFragment
 				? ((PageFragment) currentFragment).getPage() : null;
 		if (currentPage != null && currentPage.is(content, chanName, boardName, threadNumber) && searchQuery == null) {
@@ -854,13 +899,17 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 				currentPageItem.createdRealtime = SystemClock.elapsedRealtime();
 			}
 			if (currentPageItem != null) {
-				currentPageItem.returnable &= returnable;
+				if (FlagUtils.get(pageFlags, FLAG_PAGE_CLOSE_OVERLAYS)) {
+					closeOverlaysForNavigation();
+				}
+				currentPageItem.allowReturn &= FlagUtils.get(pageFlags, FLAG_PAGE_ALLOW_RETURN);
 				((PageFragment) currentFragment).updatePageConfiguration(postNumber);
 				invalidateHomeUpState();
 				return;
 			}
 		}
 		Pair<PageFragment, PageItem> pair;
+		boolean fromCache = FlagUtils.get(pageFlags, FLAG_PAGE_FROM_CACHE);
 		switch (content) {
 			case THREADS: {
 				pair = prepareAddPage(content, chanName, boardName, null, null,
@@ -888,31 +937,34 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 				throw new RuntimeException();
 			}
 		}
-		pair.second.returnable = returnable;
-		if (resetScroll) {
+		pair.second.allowReturn = FlagUtils.get(pageFlags, FLAG_PAGE_ALLOW_RETURN);
+		if (FlagUtils.get(pageFlags, FLAG_PAGE_RESET_SCROLL)) {
 			pair.first.requestResetScroll();
 		}
-		navigateFragment(pair.first, pair.second);
+		navigateFragment(pair.first, pair.second, FlagUtils.get(pageFlags, FLAG_PAGE_CLOSE_OVERLAYS));
 	}
 
-	private void navigateSavedPage(SavedPageItem savedPageItem) {
+	private void navigateSavedPage(SavedPageItem savedPageItem, boolean closeOverlays) {
 		Pair<PageFragment, PageItem> pair = savedPageItem.create();
-		navigateFragment(pair.first, pair.second);
+		navigateFragment(pair.first, pair.second, closeOverlays);
 	}
 
 	@Override
-	public void pushFragment(Fragment fragment) {
-		Fragment currentFragment = getCurrentFragment();
+	public void pushFragment(ContentFragment fragment) {
+		ContentFragment currentFragment = getCurrentFragment();
 		if (!(currentFragment instanceof PageFragment)) {
 			StackItem stackItem = new StackItem(getSupportFragmentManager(), currentFragment, null);
 			fragments.add(stackItem);
 		}
-		navigateFragment(fragment, null);
+		navigateFragment(fragment, null, true);
 	}
 
-	private void navigateFragment(Fragment fragment, PageItem pageItem) {
+	private void navigateFragment(ContentFragment fragment, PageItem pageItem, boolean closeOverlays) {
+		if (closeOverlays) {
+			closeOverlaysForNavigation();
+		}
 		FragmentManager fragmentManager = getSupportFragmentManager();
-		Fragment currentFragment = getCurrentFragment();
+		ContentFragment currentFragment = getCurrentFragment();
 		if (currentFragment instanceof PageFragment) {
 			// currentPageItem == null means page was deleted
 			if (currentPageItem != null) {
@@ -926,10 +978,10 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 			fragments.clear();
 		}
 
-		if (currentFragment instanceof ActivityHandler) {
-			((ActivityHandler) currentFragment).onTerminate();
+		if (currentFragment != null) {
+			currentFragment.onTerminate();
 		}
-		ClickableToast.cancel(this);
+		ClickableToast.cancel();
 		InputMethodManager inputMethodManager = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
 		if (inputMethodManager != null) {
 			View view = getCurrentFocus();
@@ -941,7 +993,7 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 		}
 		currentPageItem = pageItem;
 		fragmentManager.beginTransaction()
-				.setCustomAnimations(R.animator.fragment_in, R.animator.fragment_out)
+				.setTransition(FragmentTransaction.TRANSIT_FRAGMENT_OPEN)
 				.replace(R.id.content_fragment, fragment)
 				.commit();
 		updatePostFragmentConfiguration();
@@ -956,19 +1008,35 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 				String retainId = REFERENCE_FRAGMENT.getRetainId();
 				retainIds.add(retainId);
 			}
-			retainFragment.extras.keySet().retainAll(retainIds);
+			Iterator<HashMap.Entry<String, ListPage.Retainable>> iterator =
+					instanceViewModel.extras.entrySet().iterator();
+			while (iterator.hasNext()) {
+				HashMap.Entry<String, ListPage.Retainable> entry = iterator.next();
+				if (!retainIds.contains(entry.getKey())) {
+					entry.getValue().clear();
+					iterator.remove();
+				}
+			}
+		}
+	}
+
+	private void closeOverlaysForNavigation() {
+		navigateOrCloseGallery(null);
+		if (!wideMode) {
+			drawerLayout.closeDrawers();
 		}
 	}
 
 	private void updatePostFragmentConfiguration() {
-		Fragment currentFragment = getCurrentFragment();
+		ContentFragment currentFragment = getCurrentFragment();
 		String chanName;
 		if (currentFragment instanceof PageFragment) {
 			chanName = ((PageFragment) currentFragment).getPage().chanName;
 		} else if (!stackPageItems.isEmpty()) {
 			chanName = getSavedPage(stackPageItems.get(stackPageItems.size() - 1)).chanName;
 		} else {
-			chanName = ChanManager.getInstance().getDefaultChanName();
+			Chan chan = ChanManager.getInstance().getDefaultChan();
+			chanName = chan != null ? chan.name : null;
 		}
 		if (currentFragment instanceof PageFragment) {
 			expandedScreen.removeLocker(LOCKER_NON_PAGE);
@@ -981,13 +1049,20 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 	}
 
 	@Override
+	public void onDialogStackOpen() {
+		if (!wideMode) {
+			drawerLayout.closeDrawers();
+		}
+	}
+
+	@Override
 	public DownloadService.Binder getDownloadBinder() {
 		return downloadBinder;
 	}
 
 	@Override
-	public ConfigurationLock getConfigurationLock() {
-		return configurationLock;
+	public WatcherService.Client getWatcherClient() {
+		return watcherServiceClient;
 	}
 
 	@Override
@@ -996,23 +1071,23 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 	}
 
 	@Override
-	public Object getRetainExtra(String retainId) {
-		return retainFragment.extras.get(retainId);
+	public ListPage.Retainable getRetainableExtra(String retainId) {
+		return instanceViewModel.extras.get(retainId);
 	}
 
 	@Override
-	public void storeRetainExtra(String retainId, Object extra) {
+	public void storeRetainableExtra(String retainId, ListPage.Retainable extra) {
 		if (extra != null) {
-			retainFragment.extras.put(retainId, extra);
+			instanceViewModel.extras.put(retainId, extra);
 		} else {
-			retainFragment.extras.remove(retainId);
+			instanceViewModel.extras.remove(retainId);
 		}
 	}
 
 	@Override
 	public void invalidateHomeUpState() {
-		Fragment currentFragment = getCurrentFragment();
-		if (currentFragment instanceof ActivityHandler && ((ActivityHandler) currentFragment).isSearchMode()) {
+		ContentFragment currentFragment = getCurrentFragment();
+		if (currentFragment != null && currentFragment.isSearchMode()) {
 			drawerToggle.setDrawerIndicatorMode(DrawerToggle.Mode.UP);
 		} else {
 			boolean displayUp;
@@ -1056,8 +1131,8 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 			if (!forced) {
 				expandedScreen.setDrawerOverToolbarEnabled(!wideMode);
 			}
-			drawerLayout.setDrawerLockMode(wideMode ? DrawerLayout.LOCK_MODE_LOCKED_CLOSED
-					: DrawerLayout.LOCK_MODE_UNLOCKED);
+			drawerLayout.setDrawerLockMode(wideMode ? CustomDrawerLayout.LOCK_MODE_LOCKED_CLOSED
+					: CustomDrawerLayout.LOCK_MODE_UNLOCKED);
 			drawerWide.setVisibility(wideMode ? View.VISIBLE : View.GONE);
 			ViewUtils.removeFromParent(drawerParent);
 			(wideMode ? drawerWide : drawerCommon).addView(drawerParent);
@@ -1082,15 +1157,23 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 	}
 
 	@Override
+	protected void onStart() {
+		super.onStart();
+
+		handleChansChangedDelayed();
+		watcherServiceClient.notifyForeground();
+	}
+
+	@Override
 	protected void onResume() {
 		super.onResume();
 
-		watcherServiceClient.start();
-		clickableToastHolder.onResume();
 		drawerForm.updateRestartViewVisibility();
-		drawerForm.invalidateItems(true, true);
+		drawerForm.updateItems(true, true);
 		updateWideConfiguration(false);
-		ForegroundManager.register(this);
+		handleChansChangedDelayed();
+		ClickableToast.register(this);
+		ForegroundManager.getInstance().register(this);
 
 		Intent navigateIntentOnResume = this.navigateIntentOnResume;
 		this.navigateIntentOnResume = null;
@@ -1101,15 +1184,6 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 		if (downloadBinder != null) {
 			downloadBinder.notifyReadyToHandleRequests();
 		}
-	}
-
-	@Override
-	protected void onPause() {
-		super.onPause();
-
-		watcherServiceClient.stop();
-		clickableToastHolder.onPause();
-		ForegroundManager.unregister(this);
 	}
 
 	@Override
@@ -1124,10 +1198,6 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 	protected void onFinish() {
 		super.onFinish();
 
-		if (readUpdateTask != null) {
-			readUpdateTask.cancel();
-			readUpdateTask = null;
-		}
 		if (postingBinder != null) {
 			postingBinder.unregister(postingGlobalCallback);
 			postingBinder = null;
@@ -1138,14 +1208,12 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 		}
 		unbindService(postingConnection);
 		unbindService(downloadConnection);
-		uiManager.onFinish();
-		watcherServiceClient.unbind(this);
-		ClickableToast.unregister(clickableToastHolder);
+		watcherServiceClient.setCallback(null);
 		FavoritesStorage.getInstance().getObservable().unregister(this);
 		Preferences.PREFERENCES.unregisterOnSharedPreferenceChangeListener(preferencesListener);
 		ChanManager.getInstance().observable.unregister(chanManagerCallback);
-		for (String chanName : ChanManager.getInstance().getAvailableChanNames()) {
-			ChanConfiguration.get(chanName).commit();
+		for (Chan chan : ChanManager.getInstance().getAvailableChans()) {
+			chan.configuration.commit();
 		}
 		NotificationManager notificationManager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
 		notificationManager.cancel(C.NOTIFICATION_ID_UPDATES);
@@ -1160,30 +1228,28 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 
 	@Override
 	public boolean onSearchRequested() {
-		Fragment currentFragment = getCurrentFragment();
-		return currentFragment instanceof ActivityHandler &&
-				((ActivityHandler) currentFragment).onSearchRequested();
+		ContentFragment currentFragment = getCurrentFragment();
+		return currentFragment.onSearchRequested();
 	}
 
 	@Override
 	public void removeFragment() {
-		onBackPressed(true, false);
+		onBackPressed(true, false, () -> navigateInitial(true));
 	}
 
 	private long backPressed = 0;
 
 	@Override
 	public void onBackPressed() {
-		onBackPressed(false, true);
+		onBackPressed(false, true, super::onBackPressed);
 	}
 
-	private void onBackPressed(boolean homeHandled, boolean allowTimeout) {
+	private void onBackPressed(boolean homeHandled, boolean allowTimeout, Runnable close) {
 		if (!wideMode && drawerLayout.isDrawerOpen(GravityCompat.START)) {
 			drawerLayout.closeDrawers();
 		} else {
-			Fragment currentFragment = getCurrentFragment();
-			if (!homeHandled && currentFragment instanceof ActivityHandler &&
-					((ActivityHandler) currentFragment).onBackPressed()) {
+			ContentFragment currentFragment = getCurrentFragment();
+			if (!homeHandled && currentFragment.onBackPressed()) {
 				return;
 			}
 			boolean handled = false;
@@ -1198,44 +1264,50 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 						}
 						currentPageItem = null;
 					}
-					navigateSavedPage(savedPageItem);
+					navigateSavedPage(savedPageItem, true);
 					handled = true;
 				}
 			} else if (!fragments.isEmpty()) {
-				Fragment fragment = fragments.remove(fragments.size() - 1).create(null);
-				navigateFragment(fragment, null);
+				ContentFragment fragment = (ContentFragment) fragments.remove(fragments.size() - 1).create(null);
+				navigateFragment(fragment, null, true);
 				handled = true;
 			} else if (!stackPageItems.isEmpty()) {
-				navigateSavedPage(stackPageItems.remove(stackPageItems.size() - 1));
+				navigateSavedPage(stackPageItems.remove(stackPageItems.size() - 1), true);
 				handled = true;
 			}
 			if (!handled) {
 				if (allowTimeout && SystemClock.elapsedRealtime() - backPressed > 2000) {
-					ClickableToast.show(this, R.string.press_again_to_exit);
+					ClickableToast.show(R.string.press_again_to_exit);
 					backPressed = SystemClock.elapsedRealtime();
 				} else {
-					super.onBackPressed();
+					close.run();
 				}
 			}
 		}
 	}
 
+	private WeakReference<ActionMode> currentActionMode;
+
 	@Override
 	public void onActionModeStarted(ActionMode mode) {
 		super.onActionModeStarted(mode);
 		expandedScreen.setActionModeState(true);
+		if (currentActionMode == null) {
+			setNavigationAreaLocked(LOCKER_ACTION_MODE, true);
+		}
+		currentActionMode = new WeakReference<>(mode);
 	}
 
 	@Override
 	public void onActionModeFinished(ActionMode mode) {
+		if (currentActionMode != null) {
+			if (currentActionMode.get() == mode) {
+				currentActionMode = null;
+				setNavigationAreaLocked(LOCKER_ACTION_MODE, false);
+			}
+		}
 		super.onActionModeFinished(mode);
 		expandedScreen.setActionModeState(false);
-	}
-
-	@Override
-	public void onWindowFocusChanged(boolean hasFocus) {
-		super.onWindowFocusChanged(hasFocus);
-		clickableToastHolder.onWindowFocusChanged(hasFocus);
 	}
 
 	@Override
@@ -1255,8 +1327,6 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 						R.string.my_posts).setCheckable(true);
 				appearanceOptionsMenu.add(0, R.id.menu_drawer, 0,
 						R.string.lock_navigation).setCheckable(true);
-				appearanceOptionsMenu.add(0, R.id.menu_threads_grid, 0,
-						R.string.threads_grid).setCheckable(true);
 				appearanceOptionsMenu.add(0, R.id.menu_sfw_mode, 0,
 						R.string.sfw_mode).setCheckable(true);
 			}
@@ -1269,8 +1339,6 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 			appearanceOptionsMenu.findItem(R.id.menu_drawer)
 					.setVisible(ViewUtils.isDrawerLockable(getResources().getConfiguration()))
 					.setChecked(Preferences.isDrawerLocked());
-			appearanceOptionsMenu.findItem(R.id.menu_threads_grid)
-					.setChecked(Preferences.isThreadsGridMode());
 			appearanceOptionsMenu.findItem(R.id.menu_sfw_mode)
 					.setChecked(Preferences.isSfwMode());
 		}
@@ -1282,11 +1350,10 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 		if (drawerToggle.onOptionsItemSelected(item)) {
 			return true;
 		}
-		Fragment currentFragment = getCurrentFragment();
+		ContentFragment currentFragment = getCurrentFragment();
 		switch (item.getItemId()) {
 			case android.R.id.home: {
-				if (currentFragment instanceof ActivityHandler &&
-						((ActivityHandler) currentFragment).onHomePressed()) {
+				if (currentFragment.onHomePressed()) {
 					return true;
 				}
 				drawerLayout.closeDrawers();
@@ -1296,10 +1363,11 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 					String newBoardName = page.boardName;
 					if (page.content == Page.Content.THREADS) {
 						// Up button must navigate to main page in threads list
-						newBoardName = Preferences.getDefaultBoardName(page.chanName);
-						if (Preferences.isMergeChans() && StringUtils.equals(page.boardName, newBoardName)) {
-							newChanName = ChanManager.getInstance().getDefaultChanName();
-							newBoardName = Preferences.getDefaultBoardName(newChanName);
+						newBoardName = Preferences.getDefaultBoardName(Chan.get(page.chanName));
+						if (Preferences.isMergeChans() && CommonUtils.equals(page.boardName, newBoardName)) {
+							Chan chan = ChanManager.getInstance().getDefaultChan();
+							newChanName = chan.name;
+							newBoardName = Preferences.getDefaultBoardName(chan);
 						}
 					}
 					clearStackAndCurrent();
@@ -1310,10 +1378,10 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 							break;
 						}
 					}
-					navigateIntentData(newChanName, newBoardName, null, null, null, null,
-							fromCache ? NavigationUtils.FLAG_FROM_CACHE : 0);
+					navigateData(newChanName, newBoardName, null, null, null, null,
+							FLAG_DATA_CLOSE_OVERLAYS | (fromCache ? FLAG_DATA_FROM_CACHE : 0));
 				} else {
-					onBackPressed(true, true);
+					onBackPressed(true, true, super::onBackPressed);
 				}
 				return true;
 			}
@@ -1322,20 +1390,11 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 			case R.id.menu_spoilers:
 			case R.id.menu_my_posts:
 			case R.id.menu_drawer:
-			case R.id.menu_threads_grid:
 			case R.id.menu_sfw_mode: {
 				try {
 					switch (item.getItemId()) {
 						case R.id.menu_change_theme: {
-							ThemeDialog.show(this, configurationLock, theme -> {
-								if (theme != null) {
-									Preferences.setTheme(theme.name);
-									recreate();
-								} else {
-									fragments.clear();
-									navigateFragment(new ThemesFragment(), null);
-								}
-							});
+							new ThemeDialog().show(getSupportFragmentManager(), ThemeDialog.class.getName());
 							return true;
 						}
 						case R.id.menu_expanded_screen: {
@@ -1356,10 +1415,6 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 							updateWideConfiguration(false);
 							return true;
 						}
-						case R.id.menu_threads_grid: {
-							Preferences.setThreadsGridMode(!item.isChecked());
-							return true;
-						}
 						case R.id.menu_sfw_mode: {
 							Preferences.setSfwMode(!item.isChecked());
 							return true;
@@ -1375,16 +1430,26 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 		return super.onOptionsItemSelected(item);
 	}
 
-	private final SharedPreferences.OnSharedPreferenceChangeListener preferencesListener = (p, key) -> {
-		drawerForm.updatePreferences();
-		watcherServiceClient.updatePreferences();
-	};
+	@Override
+	public void onThemeSelected(ThemeEngine.Theme theme) {
+		if (theme != null) {
+			Preferences.setTheme(theme.name);
+			recreate();
+		} else {
+			fragments.clear();
+			navigateFragment(new ThemesFragment(), null, true);
+		}
+	}
+
+	private final SharedPreferences.OnSharedPreferenceChangeListener preferencesListener
+			= (p, key) -> drawerForm.updatePreferences();
 
 	@Override
 	public void onSelectChan(String chanName) {
-		Fragment currentFragment = getCurrentFragment();
+		ContentFragment currentFragment = getCurrentFragment();
 		Page page = currentFragment instanceof PageFragment ? ((PageFragment) currentFragment).getPage() : null;
 		if (page == null || !page.chanName.equals(chanName)) {
+			Chan chan = Chan.get(chanName);
 			if (!Preferences.isMergeChans()) {
 				// Find chan page and open it. Open root page if nothing was found.
 				SavedPageItem lastSavedPageItem = null;
@@ -1402,52 +1467,51 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 								(PageFragment) currentFragment));
 						currentPageItem = null;
 					}
-					navigateSavedPage(lastSavedPageItem);
+					navigateSavedPage(lastSavedPageItem, true);
 				} else {
-					navigateBoardsOrThreads(chanName, Preferences.getDefaultBoardName(chanName), 0);
+					navigateBoardsOrThreads(chanName, Preferences.getDefaultBoardName(chan), false, false);
 				}
 			} else {
 				// Open root page. If page is already opened, load it from cache.
 				boolean fromCache = false;
-				String boardName = Preferences.getDefaultBoardName(chanName);
+				String boardName = Preferences.getDefaultBoardName(chan);
 				for (SavedPageItem savedPageItem : new ConcatIterable<>(preservedPageItems, stackPageItems)) {
 					if (getSavedPage(savedPageItem).is(Page.Content.THREADS, chanName, boardName, null)) {
 						fromCache = true;
 						break;
 					}
 				}
-				navigateBoardsOrThreads(chanName, boardName, fromCache ? NavigationUtils.FLAG_FROM_CACHE : 0);
+				navigateBoardsOrThreads(chanName, boardName, fromCache, false);
 			}
 			drawerForm.updateConfiguration(chanName);
-			drawerForm.invalidateItems(true, false);
-		}
-		if (!wideMode) {
-			drawerLayout.closeDrawers();
+		} else {
+			closeOverlaysForNavigation();
 		}
 	}
 
 	@Override
 	public void onSelectBoard(String chanName, String boardName, boolean fromCache) {
-		Fragment currentFragment = getCurrentFragment();
+		ContentFragment currentFragment = getCurrentFragment();
 		Page page = currentFragment instanceof PageFragment ? ((PageFragment) currentFragment).getPage() : null;
-		if (isSingleBoardMode(chanName)) {
-			boardName = getSingleBoardName(chanName);
+		Chan chan = Chan.get(chanName);
+		if (isSingleBoardMode(chan)) {
+			boardName = getSingleBoardName(chan);
 		}
 		if (page == null || !page.is(Page.Content.THREADS, chanName, boardName, null)) {
-			navigateBoardsOrThreads(chanName, boardName, fromCache ? NavigationUtils.FLAG_FROM_CACHE : 0);
-		}
-		if (!wideMode) {
-			drawerLayout.closeDrawers();
+			navigateBoardsOrThreads(chanName, boardName, fromCache, false);
+		} else {
+			closeOverlaysForNavigation();
 		}
 	}
 
 	@Override
-	public boolean onSelectThread(String chanName, String boardName, String threadNumber, String postNumber,
+	public boolean onSelectThread(String chanName, String boardName, String threadNumber, PostNumber postNumber,
 			String threadTitle, boolean fromCache) {
-		Fragment currentFragment = getCurrentFragment();
+		ContentFragment currentFragment = getCurrentFragment();
 		Page page = currentFragment instanceof PageFragment ? ((PageFragment) currentFragment).getPage() : null;
-		if (isSingleBoardMode(chanName)) {
-			boardName = getSingleBoardName(chanName);
+		Chan chan = Chan.get(chanName);
+		if (isSingleBoardMode(chan)) {
+			boardName = getSingleBoardName(chan);
 		} else if (boardName == null) {
 			if (page == null) {
 				return false;
@@ -1466,31 +1530,30 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 			}
 		}
 		if (page == null || !page.is(Page.Content.POSTS, chanName, boardName, threadNumber)) {
-			navigatePosts(chanName, boardName, threadNumber, postNumber, threadTitle,
-					fromCache ? NavigationUtils.FLAG_FROM_CACHE : 0);
-		}
-		if (!wideMode) {
-			drawerLayout.closeDrawers();
+			navigatePosts(chanName, boardName, threadNumber, postNumber, threadTitle, fromCache, false);
+		} else {
+			closeOverlaysForNavigation();
 		}
 		return true;
 	}
 
 	@Override
 	public void onClosePage(String chanName, String boardName, String threadNumber) {
-		Fragment currentFragment = getCurrentFragment();
+		ContentFragment currentFragment = getCurrentFragment();
 		Page page = currentFragment instanceof PageFragment ? ((PageFragment) currentFragment).getPage() : null;
 		if (page != null && page.isThreadsOrPosts(chanName, boardName, threadNumber)) {
 			SavedPageItem savedPageItem = prepareTargetPreviousPage(false);
 			currentPageItem = null;
 			if (savedPageItem != null) {
-				navigateSavedPage(savedPageItem);
+				navigateSavedPage(savedPageItem, false);
 			} else {
-				if (isSingleBoardMode(chanName)) {
+				Chan chan = Chan.get(chanName);
+				if (isSingleBoardMode(chan)) {
 					navigatePage(Page.Content.THREADS, chanName,
-							getSingleBoardName(chanName), null, null, null, null, true, false, false);
+							getSingleBoardName(chan), null, null, null, null, FLAG_PAGE_FROM_CACHE);
 				} else {
 					navigatePage(Page.Content.BOARDS, chanName,
-							null, null, null, null, null, true, false, false);
+							null, null, null, null, null, FLAG_PAGE_FROM_CACHE);
 				}
 			}
 		} else {
@@ -1508,7 +1571,7 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 					break;
 				}
 			}
-			drawerForm.invalidateItems(true, false);
+			drawerForm.updateItems(true, false);
 			invalidateHomeUpState();
 		}
 	}
@@ -1526,16 +1589,17 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 
 	@Override
 	public void onCloseAllPages() {
-		Fragment currentFragment = getCurrentFragment();
+		ContentFragment currentFragment = getCurrentFragment();
 		Page page = currentFragment instanceof PageFragment ? ((PageFragment) currentFragment).getPage() : null;
 		String chanName = page != null ? page.chanName : null;
 		if (chanName == null && !stackPageItems.isEmpty()) {
 			chanName = getSavedPage(stackPageItems.get(stackPageItems.size() - 1)).chanName;
 		}
 		if (chanName != null) {
-			String boardName = Preferences.getDefaultBoardName(chanName);
-			boolean singleBoardMode = isSingleBoardMode(chanName);
-			String singleBoardName = getSingleBoardName(chanName);
+			Chan chan = Chan.get(chanName);
+			String boardName = Preferences.getDefaultBoardName(chan);
+			boolean singleBoardMode = isSingleBoardMode(chan);
+			String singleBoardName = getSingleBoardName(chan);
 			boolean cached = page != null && isCloseAllTarget(page,
 					chanName, boardName, singleBoardMode, singleBoardName);
 			boolean mergeChans = Preferences.isMergeChans();
@@ -1559,7 +1623,7 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 							(PageFragment) currentFragment));
 				}
 				currentPageItem = null;
-				navigateBoardsOrThreads(chanName, boardName, cached ? NavigationUtils.FLAG_FROM_CACHE : 0);
+				navigateData(chanName, boardName, null, null, null, null, cached ? FLAG_DATA_FROM_CACHE : 0);
 			}
 		} else {
 			ArrayList<SavedPageItem> addPreserved = new ArrayList<>();
@@ -1574,14 +1638,14 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 			}
 			preservedPageItems.addAll(addPreserved);
 		}
-		drawerForm.invalidateItems(true, false);
+		drawerForm.updateItems(true, false);
 		invalidateHomeUpState();
 	}
 
 	@Override
 	public int onEnterNumber(int number) {
 		int result = 0;
-		Fragment currentFragment = getCurrentFragment();
+		ContentFragment currentFragment = getCurrentFragment();
 		if (currentFragment instanceof PageFragment) {
 			result = ((PageFragment) currentFragment).onDrawerNumberEntered(number);
 		}
@@ -1610,13 +1674,14 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 			case DrawerForm.MENU_ITEM_PREFERENCES: {
 				if (!(getCurrentFragment() instanceof CategoriesFragment)) {
 					fragments.clear();
-					navigateFragment(new CategoriesFragment(), null);
+					navigateFragment(new CategoriesFragment(), null, true);
 				}
 				break;
 			}
 		}
+		boolean success = false;
 		if (content != null) {
-			Fragment currentFragment = getCurrentFragment();
+			ContentFragment currentFragment = getCurrentFragment();
 			Page page = currentFragment instanceof PageFragment ? ((PageFragment) currentFragment).getPage() : null;
 			if (page == null || page.content != content) {
 				if (page == null && !stackPageItems.isEmpty()) {
@@ -1625,24 +1690,27 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 				String chanName = page != null ? page.chanName : null;
 				String boardName = page != null ? page.boardName : null;
 				if (chanName == null) {
-					chanName = ChanManager.getInstance().getDefaultChanName();
-					boardName = Preferences.getDefaultBoardName(boardName);
+					Chan chan = ChanManager.getInstance().getDefaultChan();
+					chanName = chan.name;
+					boardName = Preferences.getDefaultBoardName(chan);
 				}
 				if (chanName != null) {
-					navigatePage(content, chanName, boardName, null, null, null, null, false, false, true);
+					navigatePage(content, chanName, boardName, null, null, null, null,
+							FLAG_PAGE_CLOSE_OVERLAYS | FLAG_PAGE_RESET_SCROLL);
+					success = true;
 				}
 			}
 		}
-		if (!wideMode) {
-			drawerLayout.closeDrawers();
+		if (!success) {
+			closeOverlaysForNavigation();
 		}
 	}
 
 	@Override
 	public void onDraggingStateChanged(boolean dragging) {
 		if (!wideMode) {
-			drawerLayout.setDrawerLockMode(dragging ? DrawerLayout.LOCK_MODE_LOCKED_OPEN
-					: DrawerLayout.LOCK_MODE_UNLOCKED);
+			drawerLayout.setDrawerLockMode(dragging ? CustomDrawerLayout.LOCK_MODE_LOCKED_OPEN
+					: CustomDrawerLayout.LOCK_MODE_UNLOCKED);
 		}
 	}
 
@@ -1657,7 +1725,7 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 						savedPageItem.threadTitle, savedPageItem.createdRealtime));
 			}
 		}
-		Fragment currentFragment = getCurrentFragment();
+		ContentFragment currentFragment = getCurrentFragment();
 		if (currentFragment instanceof PageFragment) {
 			Page page = ((PageFragment) currentFragment).getPage();
 			if (page.isThreadsOrPosts()) {
@@ -1668,16 +1736,81 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 		return drawerPages;
 	}
 
+	private final HashSet<String> changedChanNames = new HashSet<>();
+	private final HashSet<String> removedChanNames = new HashSet<>();
+
+	private void handleChansChangedDelayed() {
+		if (removedChanNames.isEmpty()) {
+			if (!changedChanNames.isEmpty()) {
+				ContentFragment currentFragment = getCurrentFragment();
+				if (currentFragment instanceof FragmentHandler.Callback) {
+					((FragmentHandler.Callback) currentFragment)
+							.onChansChanged(Collections.unmodifiableSet(changedChanNames), Collections.emptySet());
+				}
+			}
+		} else {
+			Iterator<SavedPageItem> iterator = new ConcatIterable<>(preservedPageItems, stackPageItems).iterator();
+			while (iterator.hasNext()) {
+				if (removedChanNames.contains(getSavedPage(iterator.next()).chanName)) {
+					iterator.remove();
+				}
+			}
+			ContentFragment currentFragment = getCurrentFragment();
+			if (currentFragment instanceof PageFragment &&
+					removedChanNames.contains(((PageFragment) currentFragment).getPage().chanName)) {
+				if (!stackPageItems.isEmpty()) {
+					currentPageItem = null;
+					navigateSavedPage(stackPageItems.remove(stackPageItems.size() - 1), true);
+				} else {
+					navigateInitial(true);
+				}
+			} else if (currentFragment instanceof FragmentHandler.Callback) {
+				((FragmentHandler.Callback) currentFragment)
+						.onChansChanged(Collections.unmodifiableSet(changedChanNames),
+								Collections.unmodifiableSet(removedChanNames));
+			}
+			String galleryTag = GalleryOverlay.class.getName();
+			GalleryOverlay currentGalleryOverlay = (GalleryOverlay) getSupportFragmentManager()
+					.findFragmentByTag(galleryTag);
+			if (currentGalleryOverlay != null && removedChanNames.contains(currentGalleryOverlay.getChanName())) {
+				currentGalleryOverlay.dismiss();
+			}
+		}
+		if (!changedChanNames.isEmpty() || !removedChanNames.isEmpty()) {
+			changedChanNames.clear();
+			removedChanNames.clear();
+			drawerForm.updateChans();
+			updatePostFragmentConfiguration();
+		}
+	}
+
 	private final ChanManager.Callback chanManagerCallback = new ChanManager.Callback() {
 		@Override
-		public void onExtensionInstalled() {
+		public void onRestartRequiredChanged() {
 			drawerForm.updateRestartViewVisibility();
 		}
 
 		@Override
-		public void onExtensionsChanged() {
-			drawerForm.updateChans();
-			updatePostFragmentConfiguration();
+		public void onUntrustedExtensionInstalled() {
+			ExtensionsTrustLoop.handleUntrustedExtensions(MainActivity.this, extensionsTrustLoopState);
+		}
+
+		@Override
+		public void onChanInstalled(Chan chan) {
+			changedChanNames.add(chan.name);
+			removedChanNames.remove(chan.name);
+			if (!getSupportFragmentManager().isStateSaved()) {
+				handleChansChangedDelayed();
+			}
+		}
+
+		@Override
+		public void onChanUninstalled(Chan chan) {
+			changedChanNames.remove(chan.name);
+			removedChanNames.add(chan.name);
+			if (!getSupportFragmentManager().isStateSaved()) {
+				handleChansChangedDelayed();
+			}
 		}
 	};
 
@@ -1709,7 +1842,7 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 	}
 
 	private final PostingService.GlobalCallback postingGlobalCallback = () -> {
-		Fragment currentFragment = getCurrentFragment();
+		ContentFragment currentFragment = getCurrentFragment();
 		if (currentFragment instanceof PageFragment) {
 			((PageFragment) currentFragment).handleNewPostDataListNow();
 		}
@@ -1791,13 +1924,18 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 				.setMessage(R.string.saf_instructions__sentence)
 				.setPositiveButton(R.string.proceed, (d, w) -> {
 					storageRequestState = StorageRequestState.PICKER;
+					Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+							.putExtra("android.provider.extra.SHOW_ADVANCED", true)
+							.putExtra("android.content.extra.SHOW_ADVANCED", true)
+							.putExtra(Intent.EXTRA_LOCAL_ONLY, true);
+					if (C.API_OREO) {
+						intent.putExtra(DocumentsContract.EXTRA_INITIAL_URI, DocumentsContract
+								.buildRootUri("com.android.externalstorage.documents", "primary"));
+					}
 					try {
-						startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
-								.putExtra("android.provider.extra.SHOW_ADVANCED", true)
-								.putExtra("android.content.extra.SHOW_ADVANCED", true),
-								C.REQUEST_CODE_OPEN_URI_TREE);
+						startActivityForResult(intent, C.REQUEST_CODE_OPEN_URI_TREE);
 					} catch (ActivityNotFoundException e) {
-						ToastUtils.show(this, R.string.unknown_address);
+						ClickableToast.show(R.string.unknown_address);
 						storageRequestState = StorageRequestState.NONE;
 						handleStorageRequestResult(true);
 					}
@@ -1815,9 +1953,9 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 
 	private void handleStorageRequestResult(boolean cancel) {
 		notifyDownloadServiceStorageRequestResult(cancel);
-		Fragment currentFragment = getCurrentFragment();
-		if (currentFragment instanceof ActivityHandler) {
-			((ActivityHandler) currentFragment).onStorageRequestResult();
+		ContentFragment currentFragment = getCurrentFragment();
+		if (currentFragment instanceof FragmentHandler.Callback) {
+			((FragmentHandler.Callback) currentFragment).onStorageRequestResult();
 		}
 	}
 
@@ -1831,27 +1969,29 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 		}
 	}
 
-	private void startUpdateTask() {
-		if (!Preferences.isCheckUpdatesOnStart() || System.currentTimeMillis()
-				- Preferences.getLastUpdateCheck() < 12 * 60 * 60 * 1000) {
-			// Check for updates ones per 12 hours
-			return;
+	public static class UpdateViewModel extends TaskViewModel.Proxy<ReadUpdateTask, ReadUpdateTask.Callback> {}
+
+	private void startUpdateTask(boolean allowStart) {
+		// Check for updates once per 12 hours
+		UpdateViewModel viewModel = new ViewModelProvider(this).get(UpdateViewModel.class);
+		if (allowStart && !viewModel.hasTaskOrValue() && Preferences.isCheckUpdatesOnStart() &&
+				System.currentTimeMillis() - Preferences.getLastUpdateCheck() >= 12 * 60 * 60 * 1000) {
+			ReadUpdateTask task = new ReadUpdateTask(this, viewModel.callback);
+			task.execute(ConcurrentUtils.PARALLEL_EXECUTOR);
+			viewModel.attach(task);
 		}
-		readUpdateTask = new ReadUpdateTask(this, this);
-		readUpdateTask.executeOnExecutor(ReadUpdateTask.THREAD_POOL_EXECUTOR);
+		viewModel.observe(this, (updateDataMap, errorItem) -> {
+			Preferences.setLastUpdateCheck(System.currentTimeMillis());
+			if (updateDataMap != null) {
+				int count = UpdateFragment.checkNewVersions(updateDataMap);
+				if (count > 0) {
+					handleUpdateData(updateDataMap, count);
+				}
+			}
+		});
 	}
 
-	@Override
-	public void onReadUpdateComplete(ReadUpdateTask.UpdateDataMap updateDataMap, ErrorItem errorItem) {
-		readUpdateTask = null;
-		if (updateDataMap == null) {
-			return;
-		}
-		Preferences.setLastUpdateCheck(System.currentTimeMillis());
-		int count = UpdateFragment.checkNewVersions(updateDataMap);
-		if (count <= 0) {
-			return;
-		}
+	private void handleUpdateData(ReadUpdateTask.UpdateDataMap updateDataMap, int count) {
 		NotificationManager notificationManager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
 		if (C.API_OREO) {
 			notificationManager.createNotificationChannel(AndroidUtils
@@ -1886,43 +2026,62 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 			case ADD:
 			case REMOVE:
 			case MODIFY_TITLE: {
-				drawerForm.invalidateItems(false, true);
+				drawerForm.updateItems(false, true);
 				break;
 			}
 		}
 	}
 
 	@Override
-	public void onWatcherUpdate(WatcherService.WatcherItem watcherItem, WatcherService.State state) {
-		drawerForm.onWatcherUpdate(watcherItem, state);
+	public boolean isWatcherClientForeground() {
+		return getLifecycle().getCurrentState().isAtLeast(Lifecycle.State.STARTED);
 	}
 
 	@Override
-	public void setPageTitle(String title) {
-		setTitleSubtitle(title, null);
+	public void onWatcherUpdate(String chanName, String boardName, String threadNumber,
+			WatcherService.Counter counter) {
+		drawerForm.onWatcherUpdate(chanName, boardName, threadNumber, counter);
+	}
+
+	@Override
+	public void setPageTitle(String title, String subtitle) {
+		setTitleSubtitle(title, subtitle);
 		if (((PageFragment) getCurrentFragment()).getPage().content == Page.Content.POSTS) {
 			currentPageItem.threadTitle = title;
 		}
-		drawerForm.invalidateItems(true, false);
+		drawerForm.updateItems(true, false);
 	}
 
 	@Override
-	public void handleRedirect(Page page, String chanName, String boardName, String threadNumber, String postNumber) {
+	public void handleRedirect(String chanName, String boardName, String threadNumber, PostNumber postNumber) {
+		PageFragment currentFragment = (PageFragment) getCurrentFragment();
+		Page page = currentFragment.getPage();
 		if (page.isThreadsOrPosts()) {
-			if (page.content == Page.Content.POSTS) {
-				FavoritesStorage.getInstance().move(page.chanName,
-						page.boardName, page.threadNumber, boardName, threadNumber);
-				CacheManager.getInstance().movePostsPage(page.chanName,
-						page.boardName, page.threadNumber, boardName, threadNumber);
-				DraftsStorage.getInstance().movePostDraft(page.chanName,
-						page.boardName, page.threadNumber, boardName, threadNumber);
-				drawerForm.invalidateItems(true, false);
-			}
 			currentPageItem = null;
 			if (threadNumber == null) {
-				navigateBoardsOrThreads(chanName, boardName, 0);
+				navigateBoardsOrThreads(chanName, boardName, false, false);
 			} else {
-				navigatePosts(chanName, boardName, threadNumber, postNumber, null, 0);
+				navigatePosts(chanName, boardName, threadNumber, postNumber, null, false, false);
+			}
+		}
+	}
+
+	@Override
+	public void closeCurrentPage() {
+		PageFragment currentFragment = (PageFragment) getCurrentFragment();
+		Page page = currentFragment.getPage();
+		SavedPageItem savedPageItem = prepareTargetPreviousPage(true);
+		currentPageItem = null;
+		if (savedPageItem != null) {
+			navigateSavedPage(savedPageItem, false);
+		} else {
+			Chan chan = Chan.get(page.chanName);
+			if (isSingleBoardMode(chan)) {
+				navigatePage(Page.Content.THREADS, page.chanName,
+						getSingleBoardName(chan), null, null, null, null, 0);
+			} else {
+				navigatePage(Page.Content.BOARDS, page.chanName,
+						null, null, null, null, null, FLAG_PAGE_FROM_CACHE);
 			}
 		}
 	}
@@ -1936,7 +2095,17 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 		}
 	}
 
-	private class ExpandedScreenDrawerLocker implements DrawerLayout.DrawerListener {
+	@Override
+	public void setNavigationAreaLocked(String locker, boolean locked) {
+		if (locked) {
+			navigationAreaLockers.add(locker);
+		} else {
+			navigationAreaLockers.remove(locker);
+		}
+		drawerLayout.setExpandableFromAnyPoint(navigationAreaLockers.isEmpty());
+	}
+
+	private class ExpandedScreenDrawerLocker implements CustomDrawerLayout.DrawerListener {
 		@Override
 		public void onDrawerSlide(@NonNull View drawerView, float slideOffset) {}
 
@@ -1954,13 +2123,17 @@ public class MainActivity extends StateActivity implements DrawerForm.Callback,
 		public void onDrawerStateChanged(int newState) {}
 	}
 
-	public static class RetainFragment extends Fragment {
-		private final HashMap<String, Object> extras = new HashMap<>();
+	public static class InstanceViewModel extends ViewModel {
+		private final HashMap<String, ListPage.Retainable> extras = new HashMap<>();
+		private final Runnable cookiesRequirement = ChanDatabase.getInstance().requireCookies();
 
 		@Override
-		public void onCreate(Bundle savedInstanceState) {
-			super.onCreate(savedInstanceState);
-			setRetainInstance(true);
+		protected void onCleared() {
+			for (ListPage.Retainable retainable : extras.values()) {
+				retainable.clear();
+			}
+			extras.clear();
+			cookiesRequirement.run();
 		}
 	}
 }

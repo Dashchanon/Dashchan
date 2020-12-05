@@ -3,7 +3,6 @@ package com.mishiranu.dashchan.content.service;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
-import android.app.Service;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.Context;
@@ -16,33 +15,40 @@ import android.os.PowerManager;
 import android.util.Pair;
 import androidx.core.app.NotificationCompat;
 import chan.content.ApiException;
-import chan.content.ChanConfiguration;
-import chan.content.ChanMarkup;
+import chan.content.Chan;
 import chan.content.ChanPerformer;
 import chan.text.CommentEditor;
+import chan.util.CommonUtils;
 import chan.util.StringUtils;
 import com.mishiranu.dashchan.C;
 import com.mishiranu.dashchan.R;
 import com.mishiranu.dashchan.content.LocaleManager;
 import com.mishiranu.dashchan.content.Preferences;
 import com.mishiranu.dashchan.content.async.SendPostTask;
+import com.mishiranu.dashchan.content.database.ChanDatabase;
+import com.mishiranu.dashchan.content.database.CommonDatabase;
 import com.mishiranu.dashchan.content.model.ErrorItem;
+import com.mishiranu.dashchan.content.model.PendingUserPost;
+import com.mishiranu.dashchan.content.model.PostItem;
+import com.mishiranu.dashchan.content.model.PostNumber;
 import com.mishiranu.dashchan.content.storage.DraftsStorage;
 import com.mishiranu.dashchan.content.storage.FavoritesStorage;
 import com.mishiranu.dashchan.content.storage.StatisticsStorage;
 import com.mishiranu.dashchan.ui.MainActivity;
 import com.mishiranu.dashchan.util.AndroidUtils;
-import com.mishiranu.dashchan.util.IOUtils;
-import com.mishiranu.dashchan.util.NavigationUtils;
+import com.mishiranu.dashchan.util.ConcurrentUtils;
+import com.mishiranu.dashchan.util.Hasher;
 import com.mishiranu.dashchan.util.WeakObservable;
 import com.mishiranu.dashchan.widget.ThemeEngine;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
-import java.util.List;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 
-public class PostingService extends Service implements SendPostTask.Callback<PostingService.Key> {
+public class PostingService extends BaseService implements SendPostTask.Callback<PostingService.Key> {
 	private static final String ACTION_CANCEL = "cancel";
 
 	private final HashMap<Key, ArrayList<Callback>> callbacks = new HashMap<>();
@@ -75,9 +81,9 @@ public class PostingService extends Service implements SendPostTask.Callback<Pos
 			}
 			if (o instanceof Key) {
 				Key key = (Key) o;
-				return StringUtils.equals(key.chanName, chanName) &&
-						StringUtils.equals(key.boardName, boardName) &&
-						StringUtils.equals(key.threadNumber, threadNumber);
+				return CommonUtils.equals(key.chanName, chanName) &&
+						CommonUtils.equals(key.boardName, boardName) &&
+						CommonUtils.equals(key.threadNumber, threadNumber);
 			}
 			return false;
 		}
@@ -104,12 +110,12 @@ public class PostingService extends Service implements SendPostTask.Callback<Pos
 		private long progress = 0;
 		private long progressMax = 0;
 
-		public TaskState(Key key, SendPostTask<Key> task, Context context, String chanName,
+		public TaskState(Key key, SendPostTask<Key> task, Context context, Chan chan,
 				ChanPerformer.SendPostData data) {
 			this.key = key;
 			this.task = task;
 			builder = new NotificationCompat.Builder(context, C.NOTIFICATION_CHANNEL_POSTING);
-			text = buildNotificationText(chanName, data.boardName, data.threadNumber, null);
+			text = buildNotificationText(chan, data.boardName, data.threadNumber, null);
 		}
 	}
 
@@ -127,12 +133,12 @@ public class PostingService extends Service implements SendPostTask.Callback<Pos
 		}
 	}
 
-	public static String buildNotificationText(String chanName, String boardName, String threadNumber,
-			String postNumber) {
-		ChanConfiguration configuration = ChanConfiguration.get(chanName);
-		StringBuilder builder = new StringBuilder(configuration.getTitle()).append(", ");
-		builder.append(StringUtils.formatThreadTitle(chanName, boardName, threadNumber != null ? threadNumber : "?"));
-		if (!StringUtils.isEmpty(postNumber)) {
+	public static String buildNotificationText(Chan chan, String boardName, String threadNumber,
+			PostNumber postNumber) {
+		StringBuilder builder = new StringBuilder(chan.configuration.getTitle()).append(", ");
+		builder.append(StringUtils.formatThreadTitle(chan.name,
+				boardName, threadNumber != null ? threadNumber : "?"));
+		if (postNumber != null) {
 			builder.append(", #").append(postNumber);
 		}
 		return builder.toString();
@@ -164,6 +170,7 @@ public class PostingService extends Service implements SendPostTask.Callback<Pos
 		PowerManager powerManager = (PowerManager) getSystemService(POWER_SERVICE);
 		wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, getPackageName() + ":PostingWakeLock");
 		wakeLock.setReferenceCounted(false);
+		addOnDestroyListener(ChanDatabase.getInstance().requireCookies());
 		notificationsWorker = new Thread(notificationsRunnable, "PostingServiceNotificationThread");
 		notificationsWorker.start();
 	}
@@ -213,7 +220,6 @@ public class PostingService extends Service implements SendPostTask.Callback<Pos
 				TaskState taskState = notificationData.taskState;
 				NotificationCompat.Builder builder = taskState.builder;
 				if (notificationData.type == NotificationData.Type.CREATE) {
-					builder.setOngoing(true);
 					builder.setSmallIcon(android.R.drawable.stat_sys_upload);
 					PendingIntent cancelIntent = PendingIntent.getBroadcast(this, 0, new Intent(this, Receiver.class)
 							.setAction(ACTION_CANCEL), PendingIntent.FLAG_UPDATE_CURRENT);
@@ -286,9 +292,10 @@ public class PostingService extends Service implements SendPostTask.Callback<Pos
 				Key key = new Key(chanName, data.boardName, data.threadNumber);
 				AndroidUtils.startAnyService(PostingService.this, new Intent(PostingService.this, PostingService.class));
 				wakeLock.acquire();
-				SendPostTask<Key> task = new SendPostTask<>(key, chanName, PostingService.this, data);
-				task.executeOnExecutor(SendPostTask.THREAD_POOL_EXECUTOR);
-				TaskState taskState = new TaskState(key, task, PostingService.this, chanName, data);
+				Chan chan = Chan.get(chanName);
+				SendPostTask<Key> task = new SendPostTask<>(key, PostingService.this, chan, data);
+				task.execute(ConcurrentUtils.PARALLEL_EXECUTOR);
+				TaskState taskState = new TaskState(key, task, PostingService.this, chan, data);
 				refreshNotification(NotificationData.Type.CREATE, taskState);
 				PostingService.this.taskState = taskState;
 				ArrayList<Callback> callbacks = PostingService.this.callbacks.get(key);
@@ -423,46 +430,67 @@ public class PostingService extends Service implements SendPostTask.Callback<Pos
 
 	@Override
 	public void onSendPostSuccess(Key key, ChanPerformer.SendPostData data,
-			String chanName, String threadNumber, String postNumber) {
+			String chanName, String threadNumber, PostNumber postNumber) {
 		if (performFinish(key, false)) {
+			Chan chan = Chan.get(chanName);
 			String targetThreadNumber = data.threadNumber != null ? data.threadNumber
 					: StringUtils.nullIfEmpty(threadNumber);
-			if (targetThreadNumber != null && Preferences.isFavoriteOnReply(data.optionSage)) {
-				FavoritesStorage.getInstance().add(chanName, data.boardName, targetThreadNumber, null, 0);
+			if (targetThreadNumber != null && Preferences.getFavoriteOnReply().isEnabled(data.optionSage)) {
+				FavoritesStorage.getInstance().add(chanName, data.boardName, targetThreadNumber, null);
 			}
 			StatisticsStorage.getInstance().incrementPostsSent(chanName, data.threadNumber == null);
 			DraftsStorage draftsStorage = DraftsStorage.getInstance();
 			draftsStorage.removeCaptchaDraft();
 			draftsStorage.removePostDraft(chanName, data.boardName, data.threadNumber);
 			if (targetThreadNumber != null) {
-				String password = Preferences.getPassword(chanName);
-				if (StringUtils.equals(password, data.password)) {
+				String password = Preferences.getPassword(chan);
+				if (CommonUtils.equals(password, data.password)) {
 					password = null;
 				}
 				draftsStorage.store(new DraftsStorage.PostDraft(chanName, data.boardName, targetThreadNumber,
 						data.name, data.email, password, data.optionSage, data.optionOriginalPoster, data.userIcon));
 			}
+
 			if (targetThreadNumber != null) {
-				postNumber = StringUtils.nullIfEmpty(postNumber);
 				String comment = data.comment;
 				if (comment != null) {
-					CommentEditor commentEditor = ChanMarkup.get(chanName).safe().obtainCommentEditor(data.boardName);
+					CommentEditor commentEditor = chan.markup.safe().obtainCommentEditor(data.boardName);
 					if (commentEditor != null) {
 						comment = commentEditor.removeTags(comment);
 					}
 				}
-				NewPostData newPostData = new NewPostData(chanName, data.boardName, targetThreadNumber, postNumber,
-						comment, data.threadNumber == null);
 				Key arrayKey = new Key(chanName, data.boardName, targetThreadNumber);
-				ArrayList<NewPostData> newPostDataList = NEW_POST_DATA_LIST.get(arrayKey);
+				boolean newThread = data.threadNumber == null;
+
+				PendingUserPost pendingUserPost = null;
+				if (postNumber != null) {
+					CommonDatabase.getInstance().getPosts().setFlags(true, chanName, data.boardName,
+							targetThreadNumber, postNumber, PostItem.HideState.UNDEFINED, true);
+				} else if (newThread) {
+					pendingUserPost = PendingUserPost.NewThread.INSTANCE;
+				} else {
+					pendingUserPost = new PendingUserPost.SimilarComment(comment);
+				}
+				if (pendingUserPost != null) {
+					HashSet<PendingUserPost> pendingUserPosts = PENDING_USER_POST_MAP.get(arrayKey);
+					if (pendingUserPosts == null) {
+						pendingUserPosts = new HashSet<>(1);
+						PENDING_USER_POST_MAP.put(arrayKey, pendingUserPosts);
+					}
+					pendingUserPosts.add(pendingUserPost);
+				}
+
+				NewPostData newPostData = new NewPostData(arrayKey, postNumber, comment, newThread);
+				ArrayList<NewPostData> newPostDataList = NEW_POST_DATA_MAP.get(arrayKey);
 				if (newPostDataList == null) {
 					newPostDataList = new ArrayList<>(1);
-					NEW_POST_DATA_LIST.put(arrayKey, newPostDataList);
+					NEW_POST_DATA_MAP.put(arrayKey, newPostDataList);
 				}
 				newPostDataList.add(newPostData);
-				if (newPostData.newThread) {
+				if (newThread) {
 					PostingService.newThreadData = new Pair<>(new Key(chanName, data.boardName, null), newPostData);
 				}
+
 				NotificationCompat.Builder builder = new NotificationCompat.Builder(this,
 						C.NOTIFICATION_CHANNEL_POSTING_COMPLETE);
 				builder.setSmallIcon(android.R.drawable.stat_sys_upload_done);
@@ -474,14 +502,19 @@ public class PostingService extends Service implements SendPostTask.Callback<Pos
 					builder.setTicker(getString(R.string.post_sent));
 				}
 				builder.setContentTitle(getString(R.string.post_sent));
-				builder.setContentText(buildNotificationText(chanName, data.boardName, targetThreadNumber, postNumber));
-				String tag = newPostData.getNotificationTag();
-				Intent intent = NavigationUtils.obtainPostsIntent(this, chanName, data.boardName, targetThreadNumber,
-						postNumber, 0);
-				builder.setContentIntent(PendingIntent.getActivity(this, tag.hashCode(), intent,
+				builder.setContentText(buildNotificationText(chan, data.boardName, targetThreadNumber, postNumber));
+				String tag = newPostData.tag;
+				Intent intent = new Intent(this, MainActivity.class).setAction(tag)
+						.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP)
+						.putExtra(C.EXTRA_CHAN_NAME, chanName)
+						.putExtra(C.EXTRA_BOARD_NAME, data.boardName)
+						.putExtra(C.EXTRA_THREAD_NUMBER, targetThreadNumber)
+						.putExtra(C.EXTRA_POST_NUMBER, postNumber != null ? postNumber.toString() : null);
+				builder.setContentIntent(PendingIntent.getActivity(this, 0, intent,
 						PendingIntent.FLAG_UPDATE_CURRENT));
 				notificationManager.notify(tag, 0, builder.build());
 			}
+
 			ArrayList<Callback> callbacks = this.callbacks.get(key);
 			if (callbacks != null) {
 				for (Callback callback : callbacks) {
@@ -582,59 +615,62 @@ public class PostingService extends Service implements SendPostTask.Callback<Pos
 	}
 
 	public static class NewPostData {
-		public final String chanName;
-		public final String boardName;
-		public final String threadNumber;
-		public final String postNumber;
-		public final String comment;
-		public final boolean newThread;
+		public final Key key;
+		private final String tag;
 
-		public NewPostData(String chanName, String boardName, String threadNumber, String postNumber,
-				String comment, boolean newThread) {
-			this.chanName = chanName;
-			this.boardName = boardName;
-			this.threadNumber = threadNumber;
-			this.postNumber = postNumber;
-			this.comment = comment;
-			this.newThread = newThread;
-		}
-
-		private String notificationTag;
-
-		private String getNotificationTag() {
-			if (notificationTag == null) {
-				notificationTag = "posting:" + IOUtils.calculateSha256(chanName + "/" + boardName + "/" +
-						threadNumber + "/" + postNumber + "/" + comment + "/" + newThread);
-			}
-			return notificationTag;
+		private NewPostData(Key key, PostNumber postNumber, String comment, boolean newThread) {
+			this.key = key;
+			this.tag = "posting:" + StringUtils.formatHex(Hasher.getInstanceSha256().calculate(key.chanName + "/" +
+					key.boardName + "/" + key.threadNumber + "/" + postNumber + "/" + comment + "/" + newThread));
 		}
 	}
 
-	private static final HashMap<Key, ArrayList<NewPostData>> NEW_POST_DATA_LIST = new HashMap<>();
+	private static final HashMap<Key, HashSet<PendingUserPost>> PENDING_USER_POST_MAP = new HashMap<>();
 
-	public static List<NewPostData> getNewPostDataList(Context context, String chanName, String boardName,
+	public static Set<PendingUserPost> getPendingUserPosts(String chanName, String boardName,
 			String threadNumber) {
-		ArrayList<NewPostData> newPostDataList = NEW_POST_DATA_LIST
+		return PENDING_USER_POST_MAP.get(new Key(chanName, boardName, threadNumber));
+	}
+
+	public static void consumePendingUserPosts(String chanName, String boardName, String threadNumber,
+			Collection<PendingUserPost> consumePendingUserPosts) {
+		Key key = new Key(chanName, boardName, threadNumber);
+		HashSet<PendingUserPost> pendingUserPosts = PENDING_USER_POST_MAP.remove(key);
+		if (pendingUserPosts != null) {
+			pendingUserPosts.removeAll(consumePendingUserPosts);
+			if (!pendingUserPosts.isEmpty()) {
+				PENDING_USER_POST_MAP.put(key, pendingUserPosts);
+			}
+		}
+	}
+
+	private static final HashMap<Key, ArrayList<NewPostData>> NEW_POST_DATA_MAP = new HashMap<>();
+
+	public static boolean consumeNewPostData(Context context, String chanName, String boardName,
+			String threadNumber) {
+		ArrayList<NewPostData> newPostDataList = NEW_POST_DATA_MAP
 				.remove(new Key(chanName, boardName, threadNumber));
 		if (newPostDataList != null) {
 			NotificationManager notificationManager = (NotificationManager) context
 					.getSystemService(NOTIFICATION_SERVICE);
 			for (NewPostData newPostData : newPostDataList) {
-				notificationManager.cancel(newPostData.getNotificationTag(), 0);
+				notificationManager.cancel(newPostData.tag, 0);
 			}
+			return !newPostDataList.isEmpty();
+		} else {
+			return false;
 		}
-		return newPostDataList;
 	}
 
 	private static Pair<Key, NewPostData> newThreadData;
 
-	public static NewPostData obtainNewThreadData(Context context, String chanName, String boardName) {
+	public static NewPostData consumeNewThreadData(Context context, String chanName, String boardName) {
 		Pair<Key, NewPostData> newThreadData = PostingService.newThreadData;
 		if (newThreadData != null && newThreadData.first.equals(new Key(chanName, boardName, null))) {
 			clearNewThreadData();
 			NotificationManager notificationManager = (NotificationManager) context
 					.getSystemService(NOTIFICATION_SERVICE);
-			notificationManager.cancel(newThreadData.second.getNotificationTag(), 0);
+			notificationManager.cancel(newThreadData.second.tag, 0);
 			return newThreadData.second;
 		}
 		return null;

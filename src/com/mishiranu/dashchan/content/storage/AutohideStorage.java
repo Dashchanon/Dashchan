@@ -14,7 +14,7 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
-public class AutohideStorage extends StorageManager.Storage<List<AutohideStorage.AutohideItem>> {
+public class AutohideStorage extends StorageManager.JsonOrgStorage<List<AutohideStorage.AutohideItem>> {
 	private static final String KEY_DATA = "data";
 	private static final String KEY_CHAN_NAMES = "chanNames";
 	private static final String KEY_BOARD_NAME = "boardName";
@@ -24,6 +24,7 @@ public class AutohideStorage extends StorageManager.Storage<List<AutohideStorage
 	private static final String KEY_OPTION_SUBJECT = "optionSubject";
 	private static final String KEY_OPTION_COMMENT = "optionComment";
 	private static final String KEY_OPTION_NAME = "optionName";
+	private static final String KEY_OPTION_FILE_NAME = "optionFileName";
 	private static final String KEY_VALUE = "value";
 
 	private static final AutohideStorage INSTANCE = new AutohideStorage();
@@ -36,40 +37,7 @@ public class AutohideStorage extends StorageManager.Storage<List<AutohideStorage
 
 	private AutohideStorage() {
 		super("autohide", 1000, 10000);
-		JSONObject jsonObject = read();
-		if (jsonObject != null) {
-			JSONArray jsonArray = jsonObject.optJSONArray(KEY_DATA);
-			if (jsonArray != null) {
-				for (int i = 0; i < jsonArray.length(); i++) {
-					jsonObject = jsonArray.optJSONObject(i);
-					if (jsonObject != null) {
-						HashSet<String> chanNames = null;
-						JSONArray chanNamesArray = jsonObject.optJSONArray(KEY_CHAN_NAMES);
-						if (chanNamesArray != null) {
-							for (int j = 0; j < chanNamesArray.length(); j++) {
-								String chanName = chanNamesArray.optString(j, null);
-								if (!StringUtils.isEmpty(chanName)) {
-									if (chanNames == null) {
-										chanNames = new HashSet<>();
-									}
-									chanNames.add(chanName);
-								}
-							}
-						}
-						String boardName = jsonObject.optString(KEY_BOARD_NAME, null);
-						String threadNumber = jsonObject.optString(KEY_THREAD_NUMBER, null);
-						boolean optionOriginalPost = jsonObject.optBoolean(KEY_OPTION_ORIGINAL_POST);
-						boolean optionSage = jsonObject.optBoolean(KEY_OPTION_SAGE);
-						boolean optionSubject = jsonObject.optBoolean(KEY_OPTION_SUBJECT);
-						boolean optionComment = jsonObject.optBoolean(KEY_OPTION_COMMENT);
-						boolean optionName = jsonObject.optBoolean(KEY_OPTION_NAME);
-						String value = jsonObject.optString(KEY_VALUE, null);
-						autohideItems.add(new AutohideItem(chanNames, boardName, threadNumber, optionOriginalPost,
-								optionSage, optionSubject, optionComment, optionName, value));
-					}
-				}
-			}
-		}
+		startRead();
 	}
 
 	public ArrayList<AutohideItem> getItems() {
@@ -83,6 +51,42 @@ public class AutohideStorage extends StorageManager.Storage<List<AutohideStorage
 			autohideItems.add(new AutohideItem(autohideItem));
 		}
 		return autohideItems;
+	}
+
+	@Override
+	public void onDeserialize(JSONObject jsonObject) {
+		JSONArray jsonArray = jsonObject.optJSONArray(KEY_DATA);
+		if (jsonArray != null) {
+			for (int i = 0; i < jsonArray.length(); i++) {
+				jsonObject = jsonArray.optJSONObject(i);
+				if (jsonObject != null) {
+					HashSet<String> chanNames = null;
+					JSONArray chanNamesArray = jsonObject.optJSONArray(KEY_CHAN_NAMES);
+					if (chanNamesArray != null) {
+						for (int j = 0; j < chanNamesArray.length(); j++) {
+							String chanName = chanNamesArray.optString(j, null);
+							if (!StringUtils.isEmpty(chanName)) {
+								if (chanNames == null) {
+									chanNames = new HashSet<>();
+								}
+								chanNames.add(chanName);
+							}
+						}
+					}
+					String boardName = jsonObject.optString(KEY_BOARD_NAME, null);
+					String threadNumber = jsonObject.optString(KEY_THREAD_NUMBER, null);
+					boolean optionOriginalPost = jsonObject.optBoolean(KEY_OPTION_ORIGINAL_POST);
+					boolean optionSage = jsonObject.optBoolean(KEY_OPTION_SAGE);
+					boolean optionSubject = jsonObject.optBoolean(KEY_OPTION_SUBJECT);
+					boolean optionComment = jsonObject.optBoolean(KEY_OPTION_COMMENT);
+					boolean optionName = jsonObject.optBoolean(KEY_OPTION_NAME);
+					boolean optionFileName = jsonObject.optBoolean(KEY_OPTION_FILE_NAME);
+					String value = jsonObject.optString(KEY_VALUE, null);
+					autohideItems.add(new AutohideItem(chanNames, boardName, threadNumber, optionOriginalPost,
+							optionSage, optionSubject, optionComment, optionName, optionFileName, value));
+				}
+			}
+		}
 	}
 
 	@Override
@@ -105,6 +109,7 @@ public class AutohideStorage extends StorageManager.Storage<List<AutohideStorage
 				putJson(jsonObject, KEY_OPTION_SUBJECT, autohideItem.optionSubject);
 				putJson(jsonObject, KEY_OPTION_COMMENT, autohideItem.optionComment);
 				putJson(jsonObject, KEY_OPTION_NAME, autohideItem.optionName);
+				putJson(jsonObject, KEY_OPTION_FILE_NAME, autohideItem.optionFileName);
 				putJson(jsonObject, KEY_VALUE, autohideItem.value);
 				jsonArray.put(jsonObject);
 			}
@@ -113,6 +118,18 @@ public class AutohideStorage extends StorageManager.Storage<List<AutohideStorage
 			return jsonObject;
 		}
 		return null;
+	}
+
+	public static void putJson(JSONObject jsonObject, String name, String value) throws JSONException {
+		if (!StringUtils.isEmpty(value)) {
+			jsonObject.put(name, value);
+		}
+	}
+
+	public static void putJson(JSONObject jsonObject, String name, boolean value) throws JSONException {
+		if (value) {
+			jsonObject.put(name, true);
+		}
 	}
 
 	public void add(AutohideItem autohideItem) {
@@ -142,6 +159,7 @@ public class AutohideStorage extends StorageManager.Storage<List<AutohideStorage
 		public boolean optionSubject;
 		public boolean optionComment;
 		public boolean optionName;
+		public boolean optionFileName;
 
 		public String value;
 
@@ -154,14 +172,15 @@ public class AutohideStorage extends StorageManager.Storage<List<AutohideStorage
 		public AutohideItem(AutohideItem autohideItem) {
 			this(autohideItem.chanNames, autohideItem.boardName, autohideItem.threadNumber,
 					autohideItem.optionOriginalPost, autohideItem.optionSage, autohideItem.optionSubject,
-					autohideItem.optionComment, autohideItem.optionName, autohideItem.value);
+					autohideItem.optionComment, autohideItem.optionName, autohideItem.optionFileName,
+					autohideItem.value);
 		}
 
 		public AutohideItem(HashSet<String> chanNames, String boardName, String threadNumber,
 				boolean optionOriginalPost, boolean optionSage, boolean optionSubject, boolean optionComment,
-				boolean optionName, String value) {
+				boolean optionName, boolean optionFileName, String value) {
 			update(chanNames, boardName, threadNumber, optionOriginalPost, optionSage,
-					optionSubject, optionComment, optionName, value);
+					optionSubject, optionComment, optionName, optionFileName, value);
 		}
 
 		public static Pattern makePattern(String value) {
@@ -170,7 +189,7 @@ public class AutohideStorage extends StorageManager.Storage<List<AutohideStorage
 
 		public void update(HashSet<String> chanNames, String boardName, String threadNumber,
 				boolean optionOriginalPost, boolean optionSage, boolean optionSubject,
-				boolean optionComment, boolean optionName, String value) {
+				boolean optionComment, boolean optionName, boolean optionFileName, String value) {
 			this.chanNames = chanNames;
 			this.boardName = boardName;
 			this.threadNumber = threadNumber;
@@ -179,6 +198,7 @@ public class AutohideStorage extends StorageManager.Storage<List<AutohideStorage
 			this.optionSubject = optionSubject;
 			this.optionComment = optionComment;
 			this.optionName = optionName;
+			this.optionFileName = optionFileName;
 			this.value = StringUtils.emptyIfNull(value);
 		}
 
@@ -210,7 +230,7 @@ public class AutohideStorage extends StorageManager.Storage<List<AutohideStorage
 			return null;
 		}
 
-		public enum ReasonSource {NAME, SUBJECT, COMMENT}
+		public enum ReasonSource {NAME, SUBJECT, COMMENT, FILE}
 
 		public String getReason(ReasonSource reasonSource, String text, String findResult) {
 			StringBuilder builder = new StringBuilder();
@@ -222,6 +242,9 @@ public class AutohideStorage extends StorageManager.Storage<List<AutohideStorage
 			}
 			if (optionName && reasonSource == ReasonSource.NAME) {
 				builder.append("name ");
+			}
+			if (optionFileName && reasonSource == ReasonSource.FILE) {
+				builder.append("file ");
 			}
 			if (!StringUtils.isEmpty(findResult)) {
 				builder.append(findResult);
@@ -241,11 +264,12 @@ public class AutohideStorage extends StorageManager.Storage<List<AutohideStorage
 			dest.writeStringArray(CommonUtils.toArray(chanNames, String.class));
 			dest.writeString(boardName);
 			dest.writeString(threadNumber);
-			dest.writeInt(optionOriginalPost ? 1 : 0);
-			dest.writeInt(optionSage ? 1 : 0);
-			dest.writeInt(optionSubject ? 1 : 0);
-			dest.writeInt(optionComment ? 1 : 0);
-			dest.writeInt(optionName ? 1 : 0);
+			dest.writeByte((byte) (optionOriginalPost ? 1 : 0));
+			dest.writeByte((byte) (optionSage ? 1 : 0));
+			dest.writeByte((byte) (optionSubject ? 1 : 0));
+			dest.writeByte((byte) (optionComment ? 1 : 0));
+			dest.writeByte((byte) (optionName ? 1 : 0));
+			dest.writeByte((byte) (optionFileName ? 1 : 0));
 			dest.writeString(value);
 		}
 
@@ -260,11 +284,12 @@ public class AutohideStorage extends StorageManager.Storage<List<AutohideStorage
 				}
 				autohideItem.boardName = source.readString();
 				autohideItem.threadNumber = source.readString();
-				autohideItem.optionOriginalPost = source.readInt() != 0;
-				autohideItem.optionSage = source.readInt() != 0;
-				autohideItem.optionSubject = source.readInt() != 0;
-				autohideItem.optionComment = source.readInt() != 0;
-				autohideItem.optionName = source.readInt() != 0;
+				autohideItem.optionOriginalPost = source.readByte() != 0;
+				autohideItem.optionSage = source.readByte() != 0;
+				autohideItem.optionSubject = source.readByte() != 0;
+				autohideItem.optionComment = source.readByte() != 0;
+				autohideItem.optionName = source.readByte() != 0;
+				autohideItem.optionFileName = source.readByte() != 0;
 				autohideItem.value = source.readString();
 				return autohideItem;
 			}

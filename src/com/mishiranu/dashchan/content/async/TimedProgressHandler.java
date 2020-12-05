@@ -1,13 +1,12 @@
 package com.mishiranu.dashchan.content.async;
 
 import android.os.SystemClock;
-import chan.http.HttpHolder;
 import chan.http.HttpRequest;
 import chan.http.MultipartEntity;
 
-public class TimedProgressHandler implements HttpHolder.InputListener, HttpRequest.OutputListener,
-		MultipartEntity.OpenableOutputListener {
+public class TimedProgressHandler implements HttpRequest.OutputListener, MultipartEntity.OpenableOutputListener {
 	private final long[] lastProgressUpdate = new long[3];
+	private long progressMax = -1;
 
 	private boolean checkNeedToUpdate(int index, long progress, long progressMax) {
 		long time = SystemClock.elapsedRealtime();
@@ -18,11 +17,14 @@ public class TimedProgressHandler implements HttpHolder.InputListener, HttpReque
 		return false;
 	}
 
-	@Override
-	public final void onInputProgressChange(long progress, long progressMax) {
-		if (checkNeedToUpdate(0, progress, progressMax)) {
-			onProgressChange(progress, progressMax);
+	public void updateProgress(long count) {
+		if (checkNeedToUpdate(0, count, progressMax)) {
+			onProgressChange(count, progressMax);
 		}
+	}
+
+	public void setInputProgressMax(long progressMax) {
+		this.progressMax = progressMax;
 	}
 
 	@Override

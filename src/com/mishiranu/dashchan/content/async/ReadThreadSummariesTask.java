@@ -1,99 +1,89 @@
-/*
- * Copyright 2014-2016 Fukurou Mishiranu
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package com.mishiranu.dashchan.content.async;
 
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashSet;
-
-import chan.content.ChanConfiguration;
+import chan.content.Chan;
 import chan.content.ChanPerformer;
 import chan.content.ExtensionException;
 import chan.content.InvalidResponseException;
 import chan.content.model.ThreadSummary;
 import chan.http.HttpException;
 import chan.http.HttpHolder;
-import chan.util.CommonUtils;
-
 import com.mishiranu.dashchan.content.model.ErrorItem;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
 
-public class ReadThreadSummariesTask extends HttpHolderTask<Void, Void, ThreadSummary[]> {
-	private final String chanName;
+public class ReadThreadSummariesTask extends HttpHolderTask<Void, List<ThreadSummary>> {
+	private final Callback callback;
+	private final Chan chan;
 	private final String boardName;
 	private final int pageNumber;
 	private final int type;
-	private final Callback callback;
 
 	private ErrorItem errorItem;
 
 	public interface Callback {
-		public void onReadThreadSummariesSuccess(ThreadSummary[] threadSummaries, int pageNumber);
-		public void onReadThreadSummariesFail(ErrorItem errorItem);
+		void onReadThreadSummariesSuccess(List<ThreadSummary> threadSummaries, int pageNumber);
+		void onReadThreadSummariesFail(ErrorItem errorItem);
 	}
 
-	public ReadThreadSummariesTask(String chanName, String boardName, int pageNumber, int type, Callback callback) {
-		this.chanName = chanName;
+	public ReadThreadSummariesTask(Callback callback, Chan chan, String boardName, int pageNumber, int type) {
+		super(chan);
+		this.callback = callback;
+		this.chan = chan;
 		this.boardName = boardName;
 		this.pageNumber = pageNumber;
 		this.type = type;
-		this.callback = callback;
+	}
+
+	public int getPageNumber() {
+		return pageNumber;
 	}
 
 	@Override
-	protected ThreadSummary[] doInBackground(HttpHolder holder, Void... params) {
+	protected List<ThreadSummary> run(HttpHolder holder) {
 		try {
-			ChanPerformer performer = ChanPerformer.get(chanName);
-			ChanPerformer.ReadThreadSummariesResult result = performer.safe().onReadThreadSummaries(new ChanPerformer
-					.ReadThreadSummariesData(boardName, pageNumber, type, holder));
+			ChanPerformer.ReadThreadSummariesResult result = chan.performer.safe()
+					.onReadThreadSummaries(new ChanPerformer
+							.ReadThreadSummariesData(boardName, pageNumber, type, holder));
 			ThreadSummary[] threadSummaries = result != null ? result.threadSummaries : null;
-			return threadSummaries != null && threadSummaries.length > 0 ? threadSummaries : null;
+			return threadSummaries != null && threadSummaries.length > 0
+					? Arrays.asList(threadSummaries) : Collections.emptyList();
 		} catch (ExtensionException | HttpException | InvalidResponseException e) {
 			errorItem = e.getErrorItemAndHandle();
 			return null;
 		} finally {
-			ChanConfiguration.get(chanName).commit();
+			chan.configuration.commit();
 		}
 	}
 
 	@Override
-	public void onPostExecute(ThreadSummary[] threadSummaries) {
-		if (errorItem == null) {
+	public void onComplete(List<ThreadSummary> threadSummaries) {
+		if (threadSummaries != null) {
 			callback.onReadThreadSummariesSuccess(threadSummaries, pageNumber);
 		} else {
 			callback.onReadThreadSummariesFail(errorItem);
 		}
 	}
 
-	public static ThreadSummary[] concatenate(ThreadSummary[] threadSummaries1, ThreadSummary[] threadSummaries2) {
-		ArrayList<ThreadSummary> threadSummaries = new ArrayList<>();
-		if (threadSummaries1 != null) {
-			Collections.addAll(threadSummaries, threadSummaries1);
+	public static List<ThreadSummary> concatenate(List<ThreadSummary> threadSummaries1,
+			List<ThreadSummary> threadSummaries2) {
+		if (threadSummaries1 == null) {
+			return threadSummaries2 != null ? threadSummaries2 : Collections.emptyList();
+		} else if (threadSummaries2 == null) {
+			return threadSummaries1;
 		}
+		ArrayList<ThreadSummary> threadSummaries = new ArrayList<>(threadSummaries1);
 		HashSet<String> identifiers = new HashSet<>();
 		for (ThreadSummary threadSummary : threadSummaries) {
 			identifiers.add(threadSummary.getBoardName() + '/' + threadSummary.getThreadNumber());
 		}
-		if (threadSummaries2 != null) {
-			for (ThreadSummary threadSummary : threadSummaries2) {
-				if (!identifiers.contains(threadSummary.getBoardName() + '/' + threadSummary.getThreadNumber())) {
-					threadSummaries.add(threadSummary);
-				}
+		for (ThreadSummary threadSummary : threadSummaries2) {
+			if (!identifiers.contains(threadSummary.getBoardName() + '/' + threadSummary.getThreadNumber())) {
+				threadSummaries.add(threadSummary);
 			}
 		}
-		return CommonUtils.toArray(threadSummaries, ThreadSummary.class);
+		return threadSummaries;
 	}
 }

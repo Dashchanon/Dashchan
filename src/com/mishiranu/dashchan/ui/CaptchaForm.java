@@ -12,10 +12,10 @@ import android.widget.EditText;
 import android.widget.ImageView;
 import android.widget.TextView;
 import chan.content.ChanConfiguration;
-import chan.content.ChanPerformer;
 import com.mishiranu.dashchan.C;
 import com.mishiranu.dashchan.R;
 import com.mishiranu.dashchan.content.Preferences;
+import com.mishiranu.dashchan.content.async.ReadCaptchaTask;
 import com.mishiranu.dashchan.util.GraphicsUtils;
 import com.mishiranu.dashchan.util.ResourceUtils;
 import com.mishiranu.dashchan.util.ViewUtils;
@@ -40,8 +40,8 @@ public class CaptchaForm implements View.OnClickListener, View.OnLongClickListen
 	private ChanConfiguration.Captcha.Input captchaInput;
 
 	public interface Callback {
-		public void onRefreshCaptcha(boolean forceRefresh);
-		public void onConfirmCaptcha();
+		void onRefreshCaptcha(boolean forceRefresh);
+		void onConfirmCaptcha();
 	}
 
 	public CaptchaForm(Callback callback, boolean hideInput, boolean applyHeight,
@@ -66,7 +66,7 @@ public class CaptchaForm implements View.OnClickListener, View.OnLongClickListen
 			cancelView.setImageTintList(ResourceUtils.getColorStateList(cancelView.getContext(),
 					android.R.attr.textColorPrimary));
 			skipTextView.setAllCaps(true);
-			skipTextView.setTypeface(GraphicsUtils.TYPEFACE_MEDIUM);
+			skipTextView.setTypeface(ResourceUtils.TYPEFACE_MEDIUM);
 			ViewUtils.setTextSizeScaled(skipTextView, 12);
 		}
 		updateCaptchaHeight(false);
@@ -145,7 +145,7 @@ public class CaptchaForm implements View.OnClickListener, View.OnLongClickListen
 		return true;
 	}
 
-	public void showCaptcha(ChanPerformer.CaptchaState captchaState, ChanConfiguration.Captcha.Input input,
+	public void showCaptcha(ReadCaptchaTask.CaptchaState captchaState, ChanConfiguration.Captcha.Input input,
 			Bitmap image, boolean large, boolean invertColors) {
 		switch (captchaState) {
 			case CAPTCHA: {
@@ -154,9 +154,12 @@ public class CaptchaForm implements View.OnClickListener, View.OnLongClickListen
 				switchToCaptchaView(CaptchaViewType.IMAGE, input, large);
 				break;
 			}
-			case NEED_LOAD: {
+			case NEED_LOAD:
+			case MAY_LOAD:
+			case MAY_LOAD_SOLVING: {
 				skipTextView.setText(R.string.load_captcha);
-				cancelView.setVisibility(View.GONE);
+				cancelView.setVisibility(captchaState == ReadCaptchaTask.CaptchaState.MAY_LOAD_SOLVING
+						? View.VISIBLE : View.GONE);
 				switchToCaptchaView(CaptchaViewType.SKIP, null, false);
 				break;
 			}

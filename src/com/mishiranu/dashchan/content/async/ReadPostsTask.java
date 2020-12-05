@@ -1,589 +1,317 @@
 package com.mishiranu.dashchan.content.async;
 
-import android.os.Parcel;
-import android.os.Parcelable;
+import android.net.Uri;
+import chan.content.Chan;
 import chan.content.ChanConfiguration;
 import chan.content.ChanPerformer;
 import chan.content.ExtensionException;
 import chan.content.InvalidResponseException;
 import chan.content.RedirectException;
 import chan.content.ThreadRedirectException;
-import chan.content.model.Post;
-import chan.content.model.Posts;
+import chan.content.model.SinglePost;
 import chan.http.HttpException;
 import chan.http.HttpHolder;
 import chan.http.HttpValidator;
 import chan.util.CommonUtils;
-import chan.util.StringUtils;
 import com.mishiranu.dashchan.content.Preferences;
+import com.mishiranu.dashchan.content.database.CommonDatabase;
+import com.mishiranu.dashchan.content.database.PagesDatabase;
 import com.mishiranu.dashchan.content.model.ErrorItem;
+import com.mishiranu.dashchan.content.model.PendingUserPost;
+import com.mishiranu.dashchan.content.model.Post;
 import com.mishiranu.dashchan.content.model.PostItem;
-import com.mishiranu.dashchan.text.HtmlParser;
-import com.mishiranu.dashchan.text.SimilarTextEstimator;
+import com.mishiranu.dashchan.content.model.PostNumber;
 import com.mishiranu.dashchan.util.Log;
+import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.util.ArrayList;
-import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Set;
+import java.util.TreeMap;
 
-public class ReadPostsTask extends HttpHolderTask<Void, Void, Boolean> {
+public class ReadPostsTask extends HttpHolderTask<Void, ReadPostsTask.Result> {
 	private final Callback callback;
-	private final String chanName;
+	private final Chan chan;
 	private final String boardName;
 	private final String threadNumber;
-	private final Posts cachedPosts;
-	private final HttpValidator validator;
-	private final boolean forceLoadFullThread;
-	private final String lastPostNumber;
-	private final ArrayList<UserPostPending> userPostPendings;
-
-	private Result result;
-	private boolean fullThread = false;
-
-	private ArrayList<UserPostPending> removedUserPostPendings;
-	private RedirectException.Target target;
-	private ErrorItem errorItem;
+	private final boolean loadFullThread;
+	private final HashSet<PendingUserPost> pendingUserPosts;
 
 	public interface Callback {
-		public void onRequestPreloadPosts(ArrayList<Patch> patches, int oldCount);
-		public void onReadPostsSuccess(Result result, boolean fullThread,
-				ArrayList<UserPostPending> removedUserPostPendings);
-		public void onReadPostsEmpty();
-		public void onReadPostsRedirect(RedirectException.Target target);
-		public void onReadPostsFail(ErrorItem errorItem);
+		void onPendingUserPostsConsumed(Set<PendingUserPost> pendingUserPosts);
+		void onReadPostsSuccess(PagesDatabase.Cache.State cacheState,
+				List<PagesDatabase.InsertResult.Reply> replies, Integer newCount);
+		void onReadPostsRedirect(RedirectException.Target target);
+		void onReadPostsFail(ErrorItem errorItem);
 	}
 
-	public ReadPostsTask(Callback callback, String chanName, String boardName, String threadNumber, Posts cachedPosts,
-			boolean useValidator, boolean forceLoadFullThread, String lastPostNumber,
-			ArrayList<UserPostPending> userPostPendings) {
+	public interface Result {
+		class Success implements Result {
+			public final PagesDatabase.Cache.State cacheState;
+			public final Set<PendingUserPost> removedPendingUserPosts;
+			public final List<PagesDatabase.InsertResult.Reply> replies;
+			public final Integer newCount;
+
+			public Success(PagesDatabase.Cache.State cacheState, Set<PendingUserPost> removedPendingUserPosts,
+					List<PagesDatabase.InsertResult.Reply> replies, Integer newCount) {
+				this.cacheState = cacheState;
+				this.removedPendingUserPosts = removedPendingUserPosts;
+				this.replies = replies;
+				this.newCount = newCount;
+			}
+		}
+
+		class Redirect implements Result {
+			public final RedirectException.Target target;
+
+			public Redirect(RedirectException.Target target) {
+				this.target = target;
+			}
+		}
+
+		class Fail implements Result {
+			public final ErrorItem errorItem;
+
+			public Fail(ErrorItem errorItem) {
+				this.errorItem = errorItem;
+			}
+		}
+	}
+
+	private static class UpdateMeta {
+		public final boolean deleted;
+		public final boolean error;
+
+		private UpdateMeta(boolean deleted, boolean error) {
+			this.deleted = deleted;
+			this.error = error;
+		}
+
+		public boolean isChanged(PagesDatabase.Meta meta) {
+			return meta != null && (meta.deleted != deleted || meta.error != error);
+		}
+	}
+
+	public ReadPostsTask(Callback callback, Chan chan, String boardName, String threadNumber,
+			boolean loadFullThread, Collection<PendingUserPost> pendingUserPosts) {
+		super(chan);
 		this.callback = callback;
-		this.chanName = chanName;
+		this.chan = chan;
 		this.boardName = boardName;
 		this.threadNumber = threadNumber;
-		this.cachedPosts = cachedPosts;
-		this.validator = useValidator && cachedPosts != null ? cachedPosts.getValidator() : null;
-		this.forceLoadFullThread = forceLoadFullThread;
-		this.lastPostNumber = lastPostNumber;
-		this.userPostPendings = userPostPendings.size() > 0 ? userPostPendings : null;
-	}
-
-	public boolean isForceLoadFullThread() {
-		return forceLoadFullThread;
+		this.loadFullThread = loadFullThread;
+		this.pendingUserPosts = pendingUserPosts != null ? new HashSet<>(pendingUserPosts) : null;
 	}
 
 	@Override
-	protected Boolean doInBackground(HttpHolder holder, Void... params) {
-		String lastPostNumber = forceLoadFullThread ? null : this.lastPostNumber;
-		boolean partialThreadLoading = Preferences.isPartialThreadLoading(chanName) && !forceLoadFullThread;
-		ChanPerformer performer = ChanPerformer.get(chanName);
+	protected Result run(HttpHolder holder) {
+		boolean temporary = chan.configuration.getOption(ChanConfiguration.OPTION_LOCAL_MODE);
+		PagesDatabase.ThreadKey threadKey = new PagesDatabase.ThreadKey(chan.name, boardName, threadNumber);
+		PagesDatabase.Meta meta = PagesDatabase.getInstance().getMeta(threadKey, temporary);
+		UpdateMeta updateMeta = null;
+		PostNumber originalPostNumber;
+		PostNumber lastExistingPostNumber;
+		boolean allowPartialThreadLoading;
+		if (loadFullThread) {
+			originalPostNumber = null;
+			lastExistingPostNumber = null;
+			allowPartialThreadLoading = false;
+		} else {
+			PagesDatabase.ThreadSummary threadSummary = PagesDatabase.getInstance().getThreadSummary(threadKey);
+			originalPostNumber = threadSummary.originalPostNumber;
+			lastExistingPostNumber = threadSummary.lastExistingPostNumber;
+			allowPartialThreadLoading = !threadSummary.cyclical ||
+					Preferences.getCyclicalRefreshMode() == Preferences.CyclicalRefreshMode.DEFAULT;
+		}
+		boolean partial = !loadFullThread && allowPartialThreadLoading && Preferences.isPartialThreadLoading(chan);
+		HttpValidator useValidator = !loadFullThread && meta != null ? meta.validator : null;
 		try {
 			ChanPerformer.ReadPostsResult result;
 			try {
-				result = performer.safe().onReadPosts(new ChanPerformer.ReadPostsData(boardName, threadNumber,
-						lastPostNumber, partialThreadLoading, cachedPosts, holder, validator));
+				String lastPostNumber = lastExistingPostNumber != null ? lastExistingPostNumber.toString() : null;
+				result = chan.performer.safe().onReadPosts(new ChanPerformer.ReadPostsData(chan.name, boardName,
+						threadNumber, lastPostNumber, partial, lastPostNumber != null, holder, useValidator));
 			} catch (ThreadRedirectException e) {
-				RedirectException.Target target = e.obtainTarget(chanName, boardName);
+				RedirectException.Target target = e.obtainTarget(chan.name, boardName);
 				if (target == null) {
 					throw HttpException.createNotFoundException();
 				}
-				this.target = target;
-				return true;
+				updateMeta = new UpdateMeta(true, false);
+				return new Result.Redirect(target);
 			} catch (RedirectException e) {
-				RedirectException.Target target = e.obtainTarget(chanName);
+				RedirectException.Target target = e.obtainTarget(chan.name);
 				if (target == null) {
 					throw HttpException.createNotFoundException();
 				}
-				if (!chanName.equals(target.chanName) || target.threadNumber == null) {
+				if (!chan.name.equals(target.chanName) || target.threadNumber == null) {
 					Log.persistent().write(Log.TYPE_ERROR, Log.DISABLE_QUOTES,
-							"Only local thread redirects available there");
-					errorItem = new ErrorItem(ErrorItem.Type.INVALID_DATA_FORMAT);
-					return false;
-				} else if (StringUtils.equals(boardName, target.boardName) &&
+							"Only local thread redirects allowed");
+					updateMeta = new UpdateMeta(false, true);
+					return new Result.Fail(new ErrorItem(ErrorItem.Type.INVALID_DATA_FORMAT));
+				} else if (CommonUtils.equals(boardName, target.boardName) &&
 						threadNumber.equals(target.threadNumber)) {
 					throw HttpException.createNotFoundException();
 				} else {
-					this.target = target;
-					return true;
+					updateMeta = new UpdateMeta(true, false);
+					return new Result.Redirect(target);
 				}
 			}
-			Posts readPosts = result != null ? result.posts : null;
 			HttpValidator validator = result != null ? result.validator : null;
-			if (result != null && result.fullThread) {
-				partialThreadLoading = false;
+			if (validator == null) {
+				validator = holder.extractValidator();
+			}
+			if (validator == null) {
+				validator = useValidator;
+			}
+			if (result != null && !result.posts.isEmpty() && result.fullThread) {
+				partial = false;
 			}
 
-			if (readPosts != null && readPosts.length() > 0) {
-				// Remove repeatings and sort
-				Post[] posts = readPosts.getPosts();
-				LinkedHashMap<String, Post> postsMap = new LinkedHashMap<>();
-				for (Post post : readPosts.getPosts()) {
-					String postNumber = post.getPostNumber();
-					postsMap.put(postNumber, post);
+			List<Post> posts;
+			if (result != null && !result.posts.isEmpty()) {
+				// Remove repeats and sort
+				TreeMap<PostNumber, Post> postsMap = new TreeMap<>();
+				for (Post post : result.posts) {
+					postsMap.put(post.number, post);
 				}
-				if (postsMap.size() != posts.length) {
-					posts = CommonUtils.toArray(postsMap.values(), Post.class);
+				if (originalPostNumber == null && !postsMap.isEmpty()) {
+					originalPostNumber = postsMap.firstKey();
 				}
-				Arrays.sort(posts);
-				readPosts.setPosts(posts);
-
-				// Validate model data format
-				Post firstPost = cachedPosts != null ? cachedPosts.getPosts()[0] : posts[0];
-				String firstPostNumber = firstPost.getPostNumber();
-				if (firstPostNumber == null) {
-					Log.persistent().write(Log.TYPE_ERROR, Log.DISABLE_QUOTES, "The getPostNumber() method of",
-							"original post returned null.");
-					errorItem = new ErrorItem(ErrorItem.Type.INVALID_DATA_FORMAT);
-					return false;
-				}
-				if (firstPost.getParentPostNumberOrNull() != null) {
-					Log.persistent().write(Log.TYPE_ERROR, Log.DISABLE_QUOTES, "The getParentPostNumber() method of",
-							"original post must return null, \"0\" or post number.");
-					errorItem = new ErrorItem(ErrorItem.Type.INVALID_DATA_FORMAT);
-					return false;
-				}
-				boolean resultWithOriginalPost = posts[0].getPostNumber().equals(firstPostNumber);
-				for (int i = 0; i < posts.length; i++) {
-					Post post = posts[i];
-					String postNumber = post.getPostNumber();
-					if (postNumber == null) {
-						Log.persistent().write(Log.TYPE_ERROR, Log.DISABLE_QUOTES, "The getPostNumber() method of", i,
-								"post returned null.");
-						errorItem = new ErrorItem(ErrorItem.Type.INVALID_DATA_FORMAT);
-						return false;
-					}
-					if (!threadNumber.equals(post.getThreadNumberOrOriginalPostNumber())) {
-						Log.persistent().write(Log.TYPE_ERROR, Log.DISABLE_QUOTES, "The number of requested thread and",
-								"number of thread in post", postNumber, "are not equal.");
-						errorItem = new ErrorItem(ErrorItem.Type.INVALID_DATA_FORMAT);
-						return false;
-					}
-					if (!resultWithOriginalPost || i > 0) {
-						if (!firstPostNumber.equals(post.getParentPostNumberOrNull())) {
-							Log.persistent().write(Log.TYPE_ERROR, Log.DISABLE_QUOTES, "The getParentPostNumber()",
-									"method of post", postNumber, "is not equal to original post's number.");
-							errorItem = new ErrorItem(ErrorItem.Type.INVALID_DATA_FORMAT);
-							return false;
-						}
-					}
+				posts = new ArrayList<>(postsMap.values());
+			} else {
+				posts = Collections.emptyList();
+			}
+			if (posts.isEmpty()) {
+				if (partial) {
+					updateMeta = new UpdateMeta(false, false);
+					return new Result.Success(PagesDatabase.getInstance().getCacheState(threadKey),
+							null, Collections.emptyList(), null);
+				} else {
+					updateMeta = new UpdateMeta(false, true);
+					return new Result.Fail(new ErrorItem(ErrorItem.Type.EMPTY_RESPONSE));
 				}
 			}
 
-			Result handleResult = null;
-			boolean fullThread = false;
-			if (cachedPosts != null) {
-				boolean partial = partialThreadLoading && lastPostNumber != null;
-				handleResult = mergePosts(cachedPosts, readPosts, partial);
-			} else if (readPosts != null && readPosts.length() > 0) {
-				Post[] readPostsArray = readPosts.getPosts();
-				ArrayList<Patch> patches = new ArrayList<>();
-				for (int i = 0; i < readPostsArray.length; i++) {
-					patches.add(new Patch(readPostsArray[i], null, i, false, true));
-				}
-				handleResult = new Result(readPostsArray.length, 0, false, readPosts, patches, false);
-				fullThread = true;
-			}
-			if (handleResult != null) {
-				if (!handleResult.patches.isEmpty()) {
-					if (userPostPendings != null) {
-						ArrayList<UserPostPending> workUserPostPendings = new ArrayList<>(userPostPendings);
-						OUTER: for (int i = handleResult.patches.size() - 1; i >= 0; i--) {
-							Post post = handleResult.patches.get(i).newPost;
-							for (int j = workUserPostPendings.size() - 1; j >= 0; j--) {
-								UserPostPending userPostPending = workUserPostPendings.get(j);
-								if (userPostPending.isUserPost(post)) {
-									post.setUserPost(true);
-									workUserPostPendings.remove(j);
-									if (removedUserPostPendings == null) {
-										removedUserPostPendings = new ArrayList<>();
-									}
-									removedUserPostPendings.add(userPostPending);
-									if (workUserPostPendings.isEmpty()) {
-										break OUTER;
-									}
-								}
+			HashSet<PendingUserPost> pendingUserPosts = this.pendingUserPosts;
+			HashSet<PendingUserPost> removedPendingUserPosts = null;
+			if (pendingUserPosts != null && !pendingUserPosts.isEmpty()) {
+				for (Post post : posts) {
+					if (pendingUserPosts.isEmpty()) {
+						break;
+					}
+					Iterator<PendingUserPost> iterator = pendingUserPosts.iterator();
+					while (iterator.hasNext()) {
+						PendingUserPost pendingUserPost = iterator.next();
+						if (pendingUserPost.isUserPost(post, post.number.equals(originalPostNumber))) {
+							iterator.remove();
+							if (removedPendingUserPosts == null) {
+								removedPendingUserPosts = new HashSet<>();
 							}
+							removedPendingUserPosts.add(pendingUserPost);
+							CommonDatabase.getInstance().getPosts().setFlags(false, chan.name,
+									boardName, threadNumber, post.number, PostItem.HideState.UNDEFINED, true);
+							break;
 						}
 					}
 				}
-				for (Patch patch : handleResult.patches) {
-					patch.postItem = PostItem.createPost(patch.newPost, chanName, boardName);
-				}
-				callback.onRequestPreloadPosts(handleResult.patches, cachedPosts != null ? cachedPosts.length() : 0);
-				if (validator == null) {
-					validator = holder.getValidator();
-				}
-				if (validator == null && cachedPosts != null) {
-					validator = cachedPosts.getValidator();
-				}
-				handleResult.posts.setValidator(validator);
-				this.result = handleResult;
-				this.fullThread = fullThread;
 			}
-			return true;
+
+			PagesDatabase.InsertResult insertResult;
+			boolean newThread = meta == null;
+			try {
+				Uri archivedThreadUri = result.archivedThreadUri;
+				if (archivedThreadUri == null && meta != null) {
+					archivedThreadUri = meta.archivedThreadUri;
+				}
+				int uniquePosters = result.uniquePosters;
+				if (uniquePosters <= 0 && meta != null) {
+					uniquePosters = meta.uniquePosters;
+				}
+				meta = new PagesDatabase.Meta(validator, archivedThreadUri, uniquePosters, false, false);
+				insertResult = PagesDatabase.getInstance().insertNewPosts(threadKey,
+						posts, meta, temporary, newThread, partial);
+			} catch (IOException e) {
+				updateMeta = new UpdateMeta(false, true);
+				return new Result.Fail(new ErrorItem(ErrorItem.Type.NO_ACCESS_TO_MEMORY));
+			}
+			return new Result.Success(insertResult.cacheState, removedPendingUserPosts,
+					insertResult.replies, insertResult.newCount);
 		} catch (HttpException e) {
 			int responseCode = e.getResponseCode();
 			if (responseCode == HttpURLConnection.HTTP_NOT_MODIFIED) {
-				return true;
+				updateMeta = new UpdateMeta(false, false);
+				return new Result.Success(PagesDatabase.getInstance().getCacheState(threadKey),
+						null, Collections.emptyList(), null);
 			}
 			if (responseCode == HttpURLConnection.HTTP_NOT_FOUND ||
 					responseCode == HttpURLConnection.HTTP_GONE) {
-				if (ChanConfiguration.get(chanName).getOption(ChanConfiguration.OPTION_READ_SINGLE_POST)) {
+				PagesDatabase.getInstance().setMetaFlags(threadKey, true, false);
+				if (chan.configuration.getOption(ChanConfiguration.OPTION_READ_SINGLE_POST)) {
 					try {
-						ChanPerformer.ReadSinglePostResult result = performer.safe().onReadSinglePost
+						// Check the post belongs to another thread
+						ChanPerformer.ReadSinglePostResult result = chan.performer.safe().onReadSinglePost
 								(new ChanPerformer.ReadSinglePostData(boardName, threadNumber, holder));
-						Post post = result != null ? result.post : null;
-						String threadNumber = post.getThreadNumberOrOriginalPostNumber();
-						if (threadNumber != null && !threadNumber.equals(this.threadNumber)) {
-							// noinspection ThrowableResultOfMethodCallIgnored
-							target = RedirectException.toThread(boardName, threadNumber, post.getPostNumber())
-									.obtainTarget(chanName);
-							return true;
+						SinglePost post = result != null ? result.post : null;
+						if (post != null) {
+							String threadNumber = post.threadNumber;
+							if (!this.threadNumber.equals(threadNumber)) {
+								RedirectException.Target target = RedirectException.toThread(boardName,
+										threadNumber, post.post.number).obtainTarget(chan.name);
+								updateMeta = new UpdateMeta(true, false);
+								return new Result.Redirect(target);
+							}
 						}
 					} catch (ExtensionException | HttpException | InvalidResponseException e2) {
-						// Ignore exception
+						e2.getErrorItemAndHandle();
 					}
 				}
-				errorItem = new ErrorItem(ErrorItem.Type.THREAD_NOT_EXISTS);
+				updateMeta = new UpdateMeta(true, false);
+				return new Result.Fail(new ErrorItem(ErrorItem.Type.THREAD_NOT_EXISTS));
 			} else {
-				errorItem = e.getErrorItemAndHandle();
+				updateMeta = new UpdateMeta(false, true);
+				return new Result.Fail(e.getErrorItemAndHandle());
 			}
-			return false;
 		} catch (ExtensionException | InvalidResponseException e) {
-			errorItem = e.getErrorItemAndHandle();
-			return false;
+			updateMeta = new UpdateMeta(false, true);
+			return new Result.Fail(e.getErrorItemAndHandle());
 		} finally {
-			ChanConfiguration.get(chanName).commit();
+			if (updateMeta != null && updateMeta.isChanged(meta)) {
+				PagesDatabase.getInstance().setMetaFlags(threadKey, updateMeta.deleted, updateMeta.error);
+			}
+			chan.configuration.commit();
 		}
 	}
 
 	@Override
-	public void onPostExecute(Boolean success) {
-		if (success) {
-			if (result != null) {
-				callback.onReadPostsSuccess(result, fullThread, removedUserPostPendings);
-			} else if (target != null) {
-				callback.onReadPostsRedirect(target);
-			} else {
-				callback.onReadPostsEmpty();
+	protected void onCancel(Result result) {
+		if (result instanceof Result.Success) {
+			Result.Success success = (Result.Success) result;
+			if (success.removedPendingUserPosts != null) {
+				callback.onPendingUserPostsConsumed(success.removedPendingUserPosts);
 			}
+		}
+	}
+
+	@Override
+	protected void onComplete(Result result) {
+		if (result instanceof Result.Success) {
+			Result.Success success = (Result.Success) result;
+			if (success.removedPendingUserPosts != null) {
+				callback.onPendingUserPostsConsumed(success.removedPendingUserPosts);
+			}
+			callback.onReadPostsSuccess(success.cacheState, success.replies, success.newCount);
+		} else if (result instanceof Result.Redirect) {
+			Result.Redirect redirect = (Result.Redirect) result;
+			callback.onReadPostsRedirect(redirect.target);
+		} else if (result instanceof Result.Fail) {
+			Result.Fail fail = (Result.Fail) result;
+			callback.onReadPostsFail(fail.errorItem);
 		} else {
-			callback.onReadPostsFail(errorItem);
+			throw new IllegalStateException();
 		}
-	}
-
-	public static class Patch {
-		public final Post newPost;
-		public final Post oldPost;
-		public PostItem postItem;
-
-		public final int index;
-		public final boolean replaceAtIndex;
-		public final boolean newPostAddedToEnd;
-
-		public Patch(Post newPost, Post oldPost, int index, boolean replaceAtIndex, boolean newPostAddedToEnd) {
-			this.newPost = newPost;
-			this.oldPost = oldPost;
-			this.index = index;
-			this.replaceAtIndex = replaceAtIndex;
-			this.newPostAddedToEnd = newPostAddedToEnd;
-		}
-
-		public Patch(PostItem postItem, int index) {
-			newPost = postItem.getPost();
-			oldPost = null;
-			this.postItem = postItem;
-			this.index = index;
-			replaceAtIndex = false;
-			newPostAddedToEnd = true;
-		}
-	}
-
-	public static class Result {
-		public final int newCount, deletedCount;
-		public final boolean hasEdited;
-
-		public final Posts posts;
-		public final ArrayList<Patch> patches;
-		public final boolean fieldsUpdated;
-
-		public Result(int newCount, int deletedCount, boolean hasEdited, Posts posts,
-				ArrayList<Patch> patches, boolean fieldsUpdated) {
-			this.newCount = newCount;
-			this.deletedCount = deletedCount;
-			this.hasEdited = hasEdited;
-			this.posts = posts;
-			this.patches = patches;
-			this.fieldsUpdated = fieldsUpdated;
-		}
-	}
-
-	private static Result mergePosts(Posts cachedPosts, Posts loadedPosts, boolean partial) {
-		int newCount = 0;
-		int deletedCount = 0;
-		boolean hasEdited = false;
-		ArrayList<Patch> patches = new ArrayList<>();
-		if (loadedPosts != null && loadedPosts.length() > 0) {
-			Post[] cachedPostsArray = cachedPosts.getPosts();
-			Post[] loadedPostsArray = loadedPosts.getPosts();
-			int resultSize = 0;
-			int i = 0, j = 0;
-			int ic = cachedPostsArray.length, jc = loadedPostsArray.length;
-			while (i < ic || j < jc) {
-				Post oldPost = i < ic ? cachedPostsArray[i] : null;
-				Post newPost = j < jc ? loadedPostsArray[j] : null;
-				int result;
-				if (oldPost == null) {
-					result = 1;
-				} else if (newPost == null) {
-					result = -1;
-				} else {
-					result = oldPost.compareTo(newPost);
-				}
-				if (result < 0) {
-					// Number of new post is greater
-					// So add old post to array and mark it as deleted, if downloading was not partial
-					if (!partial && !oldPost.isDeleted()) {
-						Post postBeforeCopy = oldPost;
-						// Copying will reset client internal flags in model
-						oldPost = oldPost.copy().setDeleted(true);
-						deletedCount++;
-						patches.add(new Patch(oldPost, postBeforeCopy, resultSize, true, false));
-						hasEdited = true;
-					}
-					resultSize++;
-					i++;
-				} else if (result > 0) {
-					// Number of old post is greater
-					// It's a new post. May be it will be inserted in center of list.
-					boolean addToEnd = oldPost == null;
-					patches.add(new Patch(newPost, null, resultSize, false, addToEnd));
-					resultSize++;
-					if (addToEnd) {
-						newCount++;
-					} else {
-						hasEdited = true;
-					}
-					j++;
-				} else {
-					// Post numbers are equal
-					// noinspection IfStatementWithIdenticalBranches
-					if (!oldPost.contentEquals(newPost) || oldPost.isDeleted()) {
-						hasEdited = true;
-						patches.add(new Patch(newPost, oldPost, resultSize, true, false));
-						resultSize++;
-					} else {
-						// Keep old model if no changes, because PostItem bound to old PostModel
-						resultSize++;
-					}
-					i++;
-					j++;
-				}
-			}
-		}
-		Post[] postsArray = cachedPosts.getPosts();
-		if (!patches.isEmpty()) {
-			ArrayList<Post> newPosts = new ArrayList<>();
-			if (postsArray != null) {
-				Collections.addAll(newPosts, postsArray);
-			}
-			for (int i = 0; i < patches.size(); i++) {
-				Patch patch = patches.get(i);
-				if (patch.replaceAtIndex) {
-					newPosts.set(patch.index, patch.newPost);
-				} else {
-					newPosts.add(patch.index, patch.newPost);
-				}
-			}
-			postsArray = CommonUtils.toArray(newPosts, Post.class);
-		}
-		Posts resultPosts = new Posts(postsArray);
-		resultPosts.setArchivedThreadUriString(cachedPosts.getArchivedThreadUriString());
-		resultPosts.setUniquePosters(cachedPosts.getUniquePosters());
-		// The rest model fields must be updated in main thread
-		boolean fieldsUpdated = false;
-		if (loadedPosts != null) {
-			String archivedThreadUriString = loadedPosts.getArchivedThreadUriString();
-			if (archivedThreadUriString != null && !archivedThreadUriString
-					.equals(resultPosts.getArchivedThreadUriString())) {
-				resultPosts.setArchivedThreadUriString(archivedThreadUriString);
-				fieldsUpdated = true;
-			}
-			int uniquePosters = loadedPosts.getUniquePosters();
-			if (uniquePosters > 0 && uniquePosters != resultPosts.getUniquePosters()) {
-				resultPosts.setUniquePosters(uniquePosters);
-				fieldsUpdated = true;
-			}
-		}
-		if (patches.isEmpty() && !fieldsUpdated) {
-			return null;
-		}
-		return new Result(newCount, deletedCount, hasEdited, resultPosts, patches, fieldsUpdated);
-	}
-
-	public interface UserPostPending extends Parcelable {
-		public boolean isUserPost(Post post);
-	}
-
-	public static class PostNumberUserPostPending implements UserPostPending {
-		private final String postNumber;
-
-		public PostNumberUserPostPending(String postNumber) {
-			this.postNumber = postNumber;
-		}
-
-		@Override
-		public boolean isUserPost(Post post) {
-			return postNumber.equals(post.getPostNumber());
-		}
-
-		@Override
-		public boolean equals(Object o) {
-			if (o == this) {
-				return true;
-			}
-			if (o instanceof PostNumberUserPostPending) {
-				return ((PostNumberUserPostPending) o).postNumber.equals(postNumber);
-			}
-			return false;
-		}
-
-		@Override
-		public int hashCode() {
-			return postNumber.hashCode();
-		}
-
-		@Override
-		public int describeContents() {
-			return 0;
-		}
-
-		@Override
-		public void writeToParcel(Parcel dest, int flags) {
-			dest.writeString(postNumber);
-		}
-
-		public static final Creator<PostNumberUserPostPending> CREATOR = new Creator<PostNumberUserPostPending>() {
-			@Override
-			public PostNumberUserPostPending[] newArray(int size) {
-				return new PostNumberUserPostPending[size];
-			}
-
-			@Override
-			public PostNumberUserPostPending createFromParcel(Parcel source) {
-				String postNumber = source.readString();
-				return new PostNumberUserPostPending(postNumber);
-			}
-		};
-	}
-
-	public static class NewThreadUserPostPending implements UserPostPending {
-		@Override
-		public boolean isUserPost(Post post) {
-			return post.getParentPostNumberOrNull() == null;
-		}
-
-		@Override
-		public boolean equals(Object o) {
-			return o instanceof NewThreadUserPostPending;
-		}
-
-		@Override
-		public int hashCode() {
-			return 1;
-		}
-
-		@Override
-		public int describeContents() {
-			return 0;
-		}
-
-		@Override
-		public void writeToParcel(Parcel dest, int flags) {}
-
-		public static final Creator<NewThreadUserPostPending> CREATOR = new Creator<NewThreadUserPostPending>() {
-			@Override
-			public NewThreadUserPostPending[] newArray(int size) {
-				return new NewThreadUserPostPending[size];
-			}
-
-			@Override
-			public NewThreadUserPostPending createFromParcel(Parcel source) {
-				return new NewThreadUserPostPending();
-			}
-		};
-	}
-
-	public static class CommentUserPostPending implements UserPostPending {
-		private static final SimilarTextEstimator ESTIMATOR = new SimilarTextEstimator(Integer.MAX_VALUE, true);
-
-		private final SimilarTextEstimator.WordsData wordsData;
-
-		public CommentUserPostPending(String comment) {
-			this(ESTIMATOR.getWords(comment));
-		}
-
-		private CommentUserPostPending(SimilarTextEstimator.WordsData wordsData) {
-			this.wordsData = wordsData;
-		}
-
-		@Override
-		public boolean isUserPost(Post post) {
-			String comment = HtmlParser.clear(post.getComment());
-			SimilarTextEstimator.WordsData wordsData = ESTIMATOR.getWords(comment);
-			return ESTIMATOR.checkSimiliar(this.wordsData, wordsData) || this.wordsData == null && wordsData == null;
-		}
-
-		@Override
-		public boolean equals(Object o) {
-			if (o == this) {
-				return true;
-			}
-			if (o instanceof CommentUserPostPending) {
-				CommentUserPostPending co = (CommentUserPostPending) o;
-				return co.wordsData == wordsData || co.wordsData != null && wordsData != null
-						&& co.wordsData.count == wordsData.count && co.wordsData.words.equals(wordsData.words);
-			}
-			return false;
-		}
-
-		@Override
-		public int hashCode() {
-			int prime = 31;
-			int result = 1;
-			if (wordsData != null) {
-				result = prime * result + wordsData.words.hashCode();
-				result = prime * result + wordsData.count;
-			}
-			return result;
-		}
-
-		@Override
-		public int describeContents() {
-			return 0;
-		}
-
-		@Override
-		public void writeToParcel(Parcel dest, int flags) {
-			dest.writeSerializable(wordsData != null ? wordsData.words : null);
-			dest.writeInt(wordsData != null ? wordsData.count : 0);
-		}
-
-		public static final Creator<CommentUserPostPending> CREATOR = new Creator<CommentUserPostPending>() {
-			@Override
-			public CommentUserPostPending[] newArray(int size) {
-				return new CommentUserPostPending[size];
-			}
-
-			@Override
-			public CommentUserPostPending createFromParcel(Parcel source) {
-				@SuppressWarnings("unchecked")
-				HashSet<String> words = (HashSet<String>) source.readSerializable();
-				int count = source.readInt();
-				return new CommentUserPostPending(words != null && count > 0
-						? new SimilarTextEstimator.WordsData(words, count) : null);
-			}
-		};
 	}
 }

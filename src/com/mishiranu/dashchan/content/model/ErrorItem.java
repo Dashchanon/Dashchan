@@ -2,6 +2,7 @@ package com.mishiranu.dashchan.content.model;
 
 import android.os.Parcel;
 import android.os.Parcelable;
+import androidx.annotation.NonNull;
 import chan.content.ApiException;
 import chan.util.StringUtils;
 import com.mishiranu.dashchan.R;
@@ -30,28 +31,31 @@ public final class ErrorItem implements Parcelable {
 		INSUFFICIENT_SPACE,
 		EXTENSION,
 		RELAY_BLOCK,
+		UNSUPPORTED_SERVICE,
+		INVALID_AUTHORIZATION_DATA,
 		UNSUPPORTED_RECAPTCHA
 	}
 
 	public final Type type;
 	public final int specialType;
-
 	public final int httpResponseCode;
 	public final String message;
+	public final int resId;
 
 	public interface Holder {
-		public ErrorItem getErrorItemAndHandle();
+		@NonNull ErrorItem getErrorItemAndHandle();
 	}
 
-	private ErrorItem(Type type, int specialType, int httpResponseCode, String message) {
+	private ErrorItem(Type type, int specialType, int httpResponseCode, String message, int resId) {
 		this.type = type;
 		this.specialType = specialType;
 		this.httpResponseCode = httpResponseCode;
 		this.message = message;
+		this.resId = resId;
 	}
 
 	public ErrorItem(Type type, int specialType) {
-		this(type, specialType, 0, null);
+		this(type, specialType, 0, null, 0);
 	}
 
 	public ErrorItem(Type type) {
@@ -59,13 +63,25 @@ public final class ErrorItem implements Parcelable {
 	}
 
 	public ErrorItem(int httpResponseCode, String message) {
-		this(null, 0, httpResponseCode, StringUtils.removeSingleDot(message));
+		this(null, 0, httpResponseCode, StringUtils.removeSingleDot(message), 0);
 	}
 
+	public ErrorItem(String message) {
+		this(0, message);
+	}
+
+	public ErrorItem(int resId) {
+		this(null, 0, 0, null, resId);
+	}
+
+	@NonNull
 	@Override
 	public String toString() {
 		if (!StringUtils.isEmpty(message)) {
 			return httpResponseCode != 0 ? "HTTP " + httpResponseCode + ": " + message : message;
+		}
+		if (resId != 0) {
+			return MainApplication.getInstance().getLocalizedContext().getString(resId);
 		}
 		int resId = 0;
 		switch (type != null ? type : Type.UNKNOWN) {
@@ -149,6 +165,14 @@ public final class ErrorItem implements Parcelable {
 				resId = R.string.ddos_protection_bypass_failed;
 				break;
 			}
+			case UNSUPPORTED_SERVICE: {
+				resId = R.string.unsupported_service;
+				break;
+			}
+			case INVALID_AUTHORIZATION_DATA: {
+				resId = R.string.invalid_authorization_data;
+				break;
+			}
 			case UNSUPPORTED_RECAPTCHA: {
 				resId = R.string.this_recaptcha_is_not_supported;
 				break;
@@ -171,6 +195,7 @@ public final class ErrorItem implements Parcelable {
 		dest.writeInt(specialType);
 		dest.writeInt(httpResponseCode);
 		dest.writeString(message);
+		dest.writeInt(resId);
 	}
 
 	public static final Creator<ErrorItem> CREATOR = new Creator<ErrorItem>() {
@@ -181,7 +206,8 @@ public final class ErrorItem implements Parcelable {
 			int specialType = in.readInt();
 			int httpResponseCode = in.readInt();
 			String message = in.readString();
-			return new ErrorItem(type, specialType, httpResponseCode, message);
+			int resId = in.readInt();
+			return new ErrorItem(type, specialType, httpResponseCode, message, resId);
 		}
 
 		@Override
